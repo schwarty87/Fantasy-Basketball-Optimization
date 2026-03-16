@@ -1,0 +1,1 @@
+PROJECT_NAME = 'fantasy_basketball_predictions'
