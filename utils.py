@@ -1,4 +1,5 @@
 import os
+
 import logging
 import datetime
 import json
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Optional, Union, Tuple, Type, Callable, List
 from pandas.api.types import is_datetime64_any_dtype, is_string_dtype
-from constants import FIX_PLAYER_NAMES, URLS, START_POSITIONS, SCORING, NY_TZ
+from constants import FIX_PLAYER_NAMES, URLS, START_POSITIONS, SCORING, NY_TZ, DATA_DIR
 from requests.exceptions import ConnectionError, ReadTimeout, RequestException
 from enums import Sites
 
@@ -109,6 +110,9 @@ def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[st
     if os.path.isfile(cache_path):
         return pd.DataFrame(pd.read_feather(cache_path).to_dict())
     df = func(**func_params)
+    cache_dir = os.path.dirname(cache_path)
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir, exist_ok=True)
     df.to_feather(cache_path)
     return df
 
@@ -434,7 +438,7 @@ def define_logger(filename: Optional[str] = None, level=logging.INFO,
     logging.basicConfig(**vars)
 
 
-def load_schedule(schedules_dir: str = 'season_schedules/', drop_ppd: bool = True) -> pd.DataFrame:
+def load_schedule(schedules_dir: str = 'season_schedules', drop_ppd: bool = True) -> pd.DataFrame:
     schedules_dir = update_dir_name(schedules_dir)
     schedule_names = sorted(os.listdir(schedules_dir))
     schedule = pd.concat([pd.read_feather(os.path.join(schedules_dir, s)) for s in schedule_names], axis=0)
@@ -588,16 +592,15 @@ def timeit(method):
 
 
 def update_dir_name(dir_name: str):
-    if os.path.isdir(dir_name):
-        return dir_name
-    dir_name2 = os.path.join('..', dir_name)
-    if os.path.isdir(dir_name2):
-        return dir_name2
-    raise ValueError(f'Directory {dir_name} does not exist')
+    """Resolve a data subdirectory name to an absolute path under DATA_DIR."""
+    dir_name = dir_name.strip('/')
+    full_path = os.path.join(DATA_DIR, dir_name)
+    os.makedirs(full_path, exist_ok=True)
+    return full_path
 
 if __name__ == '__main__':
     load_lineups_from_nbacom()
     for curr_season in range(2014, 2023):
         curr_season=2023
-        scrape_season_schedules(curr_season, save_dir='season_schedules/')
+        scrape_season_schedules(curr_season, save_dir=update_dir_name('season_schedules'))
         break

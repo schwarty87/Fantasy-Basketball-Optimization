@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from typing import Optional, Type, Tuple
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
-from utils import add_missing_points_columns_to_predictions, sharpe
+from utils import add_missing_points_columns_to_predictions, sharpe, DATA_DIR
 from machine_learning.constants import IGNORE
 from machine_learning.enums import DataSplitType
 from machine_learning.run_model import RunModel
@@ -37,7 +37,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
     @staticmethod
     def _load_contests_df() -> pd.DataFrame:
-        contests_df = pd.read_feather("dfs_contests/dfs_contest_results2.feather")
+        contests_df = pd.read_feather(os.path.join(DATA_DIR, "dfs_contests", "dfs_contest_results2.feather"))
         contests_df = contests_df.loc[contests_df['score'] > 150]
         contests_df.rename(columns={'date': 'DATE'}, inplace=True)
         contests_df['DATE'] = pd.to_datetime(contests_df['DATE']).dt.date

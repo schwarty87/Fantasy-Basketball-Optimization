@@ -1,5 +1,8 @@
 import datetime
+import os
 import pytz
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 from typing import Union
 from enums import Browsers, Sites
 

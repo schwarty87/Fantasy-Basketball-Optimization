@@ -10,7 +10,7 @@ from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
 from calc_features import CalcFeatures
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
 from utils import add_missing_points_columns_to_predictions, get_current_time, define_logger, load_schedule, \
-    get_current_date, load_and_cache_players_list, scrape_season_schedules, get_next_game_time
+    get_current_date, load_and_cache_players_list, scrape_season_schedules, get_next_game_time, update_dir_name, DATA_DIR
 from submit_dfs_team import SubmitDFSTeamYahooByCSV
 from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM
 from enums import Browsers
@@ -37,7 +37,7 @@ class RunFullPipeline:
         :param params_update_dict: data to update params with
         """
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
-                      filename=f"logs/logs_{get_current_date()}.txt", print_to_console=True, filemode='a')
+                      filename=os.path.join(DATA_DIR, 'logs', f"logs_{get_current_date()}.txt"), print_to_console=True, filemode='a')
 
         self.season = season
         self.headless = headless
@@ -79,7 +79,7 @@ class RunFullPipeline:
             logging.error('run_date has to be either a datetime.date or "today"!!!')
 
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
-                      filename=f"logs/logs_{self._run_date}.txt", print_to_console=True, filemode='a')
+                      filename=os.path.join(DATA_DIR, 'logs', f"logs_{self._run_date}.txt"), print_to_console=True, filemode='a')
 
         today_8am = datetime.datetime(year=self._run_date.year, month=self._run_date.month, day=self._run_date.day,
                                       hour=8, minute=0, second=0)
@@ -99,7 +99,7 @@ class RunFullPipeline:
 
     @staticmethod
     def _todays_model_already_trained() -> bool:
-        return os.path.isfile(os.path.join('machine_learning_fantasy_basketball_predictions', 'models',
+        return os.path.isfile(os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
                                            'model_' + str(get_current_date()).replace('-', '_'), 'model.pt'))
 
     def _has_games_today(self):
@@ -107,7 +107,7 @@ class RunFullPipeline:
 
     @staticmethod
     def _add_game_times_to_df(df: pd.DataFrame) -> pd.DataFrame:
-        schedules_dir = 'season_schedules/'
+        schedules_dir = update_dir_name('season_schedules')
         schedule_names = sorted(os.listdir(schedules_dir))
         schedules = pd.concat([pd.read_feather(os.path.join(schedules_dir, s)) for s in schedule_names], axis=0)
         df = df.merge(schedules, how='left', left_on=['GAME_ID', 'TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID_HOME'])
@@ -178,7 +178,7 @@ class RunFullPipeline:
         return predictions
 
     def run_once_per_day(self):
-        scrape_season_schedules(self.season, save_dir='season_schedules/')
+        scrape_season_schedules(self.season, save_dir=update_dir_name('season_schedules'))
 
         self.dates_to_game_times = self._get_game_times_by_day_dict()
 
@@ -196,7 +196,7 @@ class RunFullPipeline:
         self.calc_features.call(players_list=self.players_list, add_upcoming_games=False)
 
         # training/loading model
-        params_path = f'machine_learning_fantasy_basketball_predictions/models/{self._load_params_from_model_id}/params.json'
+        params_path = os.path.join(DATA_DIR, f'machine_learning_fantasy_basketball_predictions/models/{self._load_params_from_model_id}/params.json')
         params = MachineLearningParamsFantasyBasketballPredictions.load_params(params_path)
         # params.features_params.extra_weight_on_certain_date = self._run_date
         params.features_params.last_month_in_train = True

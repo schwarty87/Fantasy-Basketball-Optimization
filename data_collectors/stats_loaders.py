@@ -287,7 +287,7 @@ class StatsLoaderPlayers(StatsLoader):
 
         # if we're running on a past season then we should have a file with all the information for the entire season,
         # otherwise we have a file for each game
-        full_season_comments_path = f'comments_nbacom/{self.season}.feather'
+        full_season_comments_path = os.path.join(update_dir_name('comments_nbacom'), f'{self.season}.feather')
         if os.path.isfile(full_season_comments_path):
             all_dfs = pd.read_feather(full_season_comments_path)
             all_dfs = all_dfs.loc[all_dfs['GAME_ID'].isin(game_ids)]

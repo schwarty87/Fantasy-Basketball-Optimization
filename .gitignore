@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+.gemini/
+*.swp
+*.swo
+
+# Data directories (safety net - data lives outside repo at ../data/)
+stats/
+cached_data/
+logs/
+season_schedules/
+comments_nbacom/
+dfs_contests/
+nbacom_single_game_boxscores/
+machine_learning_fantasy_basketball_predictions/models/
+
+# OS files
+.DS_Store
+Thumbs.db

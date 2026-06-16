@@ -6,6 +6,7 @@ import torch
 from scipy.signal import convolve
 from sklearn.preprocessing import OrdinalEncoder
 from typing import List, Dict, Union, Callable, Optional
+from constants import DATA_DIR
 
 RANDOM_SEED = 42
 
@@ -91,7 +92,7 @@ def convert_time_to_previous_hour_datetime(profits_df: pd.DataFrame) -> pd.DataF
 
 
 def models_dir(project_name: str) -> str:
-    return os.path.join(f'machine_learning_{project_name}', 'models')
+    return os.path.join(DATA_DIR, f'machine_learning_{project_name}', 'models')
 
 
 def get_next_model_id(prpject_name: str) -> int:
