@@ -301,15 +301,20 @@ class CalcFeatures:
         # self.updates_df.loc[starter_inds, 'SITE_POSITION_ROUNDED'] = \
         #     self.updates_df.loc[starter_inds, 'START_POSITION'].replace(POSITION_TO_NUM).values
         self.updates_df['EXPECTED_ORDER_BY_POSITION'] = np.nan
+        all_results = []
         for position_num, group_df in self.updates_df.groupby('SITE_POSITION_ROUNDED'):
             use_ids = group_df['PLAYER_ID'].unique()
             expected_order = self._calc_expected_order(player_stats=self.player_stats, updates_df=self.updates_df,
                                                        use_ids=use_ids)
-            self.updates_df = self.updates_df.merge(expected_order, left_on='index_in_stats_df', right_index=True,
-                                                    how='left', suffixes=(None, '_x'))
-            self.updates_df['EXPECTED_ORDER_BY_POSITION'] = \
-                self.updates_df['EXPECTED_ORDER_BY_POSITION'].fillna(self.updates_df['EXPECTED_ORDER_x'])
-            self.updates_df.drop(columns=['EXPECTED_ORDER_x'], inplace=True)
+            all_results.append(expected_order)
+
+        if all_results:
+            combined = pd.concat(all_results)
+            # Handle duplicate indices from players having multiple positions on different dates
+            combined = combined[~combined.index.duplicated(keep='first')]
+            combined = combined.rename(columns={'EXPECTED_ORDER': 'EXPECTED_ORDER_BY_POSITION'})
+            self.updates_df = self.updates_df.merge(combined, left_on='index_in_stats_df', right_index=True, how='left')
+
         self.updates_df.loc[starter_inds, 'EXPECTED_ORDER_BY_POSITION'] = \
             self.updates_df.loc[starter_inds, 'EXPECTED_ORDER_BY_POSITION'].fillna(1)
 
@@ -402,7 +407,9 @@ class CalcFeatures:
         self._assert_valid_df(self.df)
 
         logging.info(f'saving features to {self.filepath}')
-        self.df.to_feather(self.filepath)
+        tmp_path = self.filepath + '.tmp'
+        self.df.to_feather(tmp_path)
+        os.replace(tmp_path, self.filepath)
 
     def call(self, players_list: Optional[pd.DataFrame] = None, add_upcoming_games: bool = True):
         """this is where we call all the methods to calculate features"""
@@ -447,13 +454,9 @@ class CalcFeatures:
     def _filter_stats_dfs(self):
         """remove players who we could've known that they would be out before the game started"""
 
-        null_name_ids = self.player_stats.query('NAME.isnull()')['PLAYER_ID'].unique()
-        remove_player_ids = list()
-        for player_id in null_name_ids:
-            if self.player_stats.query(f'PLAYER_ID=={player_id}')['NAME'].isnull().all():
-                remove_player_ids.append(player_id)
-        self.player_stats = \
-            self.player_stats.loc[~self.player_stats['PLAYER_ID'].isin(remove_player_ids)].reset_index(drop=True)
+        # Keep only players who have a non-null NAME in at least one row (vectorized, avoids per-player .query())
+        has_any_name = self.player_stats.groupby('PLAYER_ID')['NAME'].transform(lambda s: s.notnull().any())
+        self.player_stats = self.player_stats.loc[has_any_name].reset_index(drop=True)
 
         self.player_stats = self.player_stats.loc[~self.player_stats['IS_OUT'].fillna(False)]
         self.player_stats.drop_duplicates(['PLAYER_ID', 'GAME_ID'], inplace=True)

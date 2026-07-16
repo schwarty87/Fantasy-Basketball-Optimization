@@ -612,6 +612,7 @@ class Timer:
 
 
 def timeit(method):
+    @wraps(method)
     def timed(*args, **kwargs):
         logging.info(f'starting {method.__name__}...')
         ts = time.perf_counter()

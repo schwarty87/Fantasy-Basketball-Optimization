@@ -172,7 +172,9 @@ class StatsLoader:
             if 'VIDEO_AVAILABLE' in self.df.columns:
                 self.df.drop(columns=['VIDEO_AVAILABLE'], inplace=True)
 
-            self.df.to_feather(self.filepath)
+            tmp_path = self.filepath + '.tmp'
+            self.df.to_feather(tmp_path)
+            os.replace(tmp_path, self.filepath)
 
 
 class StatsLoaderPlayers(StatsLoader):
