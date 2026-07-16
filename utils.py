@@ -102,7 +102,8 @@ def downcast_df(df: pd.DataFrame, df_name: Optional[str] = None, print_usage: bo
     return df
 
 
-def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[str] = None):
+def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[str] = None, 
+                   sleep_time_after_reading_from_web: int = 0):
     cached_data_dir = update_dir_name('cached_data')
     cache_path = os.path.join(cached_data_dir, cache_name)
     if suffix is not None:
@@ -110,10 +111,13 @@ def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[st
     if os.path.isfile(cache_path):
         return pd.DataFrame(pd.read_feather(cache_path).to_dict())
     df = func(**func_params)
+    if df.empty:
+        raise ValueError(f'no data returned from {func.__name__}')
     cache_dir = os.path.dirname(cache_path)
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir, exist_ok=True)
     df.to_feather(cache_path)
+    time.sleep(sleep_time_after_reading_from_web)
     return df
 
 
@@ -162,7 +166,7 @@ def load_and_cache_players_list(print_usage: bool = True, season: int = 2025):
     return players_list
 
 
-def get_header(player_or_team: bool = True):
+def get_header(player_or_team: bool = True, url: Optional[str] = None):
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -175,7 +179,7 @@ def get_header(player_or_team: bool = True):
     else:
         referrers.append('https://www.nba.com/stats/teams/traditional')
 
-    return {
+    headers = {
         'User-Agent': random.choice(user_agents),
         'Referer': random.choice(referrers),
         'Origin': 'https://www.nba.com',
@@ -194,14 +198,31 @@ def get_header(player_or_team: bool = True):
         'Sec-Fetch-Dest': 'empty',
     }
 
+    if url and 'cdn.nba.com' in url:
+        headers = {k: v for k, v in headers.items() if k not in (
+            'Host', 'Origin', 'x-nba-stats-origin', 'x-nba-stats-token',
+            'Sec-Fetch-Site', 'Sec-Fetch-Mode', 'Sec-Fetch-Dest'
+        )}
 
-@retry(exceptions=(requests.exceptions.ReadTimeout, UnableToLoadWebsiteException, requests.exceptions.ConnectionError, KeyError), max_retries=3, delay_seconds=2)
+    return headers
+
+
+@retry(exceptions=(requests.exceptions.ReadTimeout, UnableToLoadWebsiteException, requests.exceptions.ConnectionError, KeyError, requests.exceptions.HTTPError), max_retries=3, delay_seconds=2)
 def load_nbacom_data(url: str, use_key: str = 'resultSets', player_or_team: bool = True,
                      use_header: bool = True) -> Optional[Union[pd.DataFrame, dict]]:
     headers = None
     if use_header:
-        headers = get_header(player_or_team=player_or_team)
-    html = requests.get(url, headers=headers, timeout=30).content
+        headers = get_header(player_or_team=player_or_team, url=url)
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()  # Raises HTTPError if status is 4xx or 5xx
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            logging.error("Access Denied! The server blocked the request.")
+            raise requests.exceptions.HTTPError("Access Denied! The server blocked the request.")
+        else:
+            raise requests.exceptions.HTTPError(e)
+    html = response.content
     if len(html) == 0:
         raise UnableToLoadWebsiteException(site=url)
     html_dict = json.loads(html)
@@ -367,10 +388,23 @@ def add_missing_points_columns_to_predictions(predictions_df: pd.DataFrame):
                                                               SCORING[Sites.YAHOO].items()], axis=1).sum(axis=1)
 
 
-def scrape_season_schedules(season: Union[int, str], save_dir: Optional[str] = None):
+def scrape_season_schedules(season: Union[int, str], save_dir: Optional[str] = None) -> None:
+    if save_dir:
+        if isinstance(season, str):
+            season = int(season.split('-')[0])
+        save_path = os.path.join(save_dir, f'{season}.feather')
+
+        if os.path.isfile(save_path):
+            file_mtime = os.path.getmtime(save_path)
+            current_time = time.time()
+            age_seconds = current_time - file_mtime
+            if age_seconds < 30 * 60:
+                logging.info(f'found valid file for schedule for {season}, returning cached data')
+                return
+
     logging.info(f'scraping season schedule {season}')
     season_schedule = load_nbacom_data(url=URLS().season_schedule(season=season),
-                                       use_header=False,
+                                       use_header=True,
                                        use_key='leagueSchedule')
     season_schedule = season_schedule['gameDates']
     season_schedule = sum([date_schedule['games'] for date_schedule in season_schedule], [])
@@ -389,9 +423,6 @@ def scrape_season_schedules(season: Union[int, str], save_dir: Optional[str] = N
     season_schedule['GAME_ID'] = season_schedule['gameId'].astype(int)
     season_schedule.drop(columns=['homeTeam', 'awayTeam', 'gameDateTimeUTC', 'gameId'], inplace=True)
     if save_dir is not None:
-        if isinstance(season, str):
-            season = int(season.split('-')[0])
-        save_path = os.path.join(save_dir, f'{season}.feather')
         season_schedule.to_feather(save_path)
         logging.info(f'saved season schedule to {save_path}')
 

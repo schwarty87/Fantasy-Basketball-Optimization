@@ -88,8 +88,8 @@ class URLS:
         return self.LINEUPS_ROTOGRINDERS.format(date=date, site=site.name.lower())
 
     def season_schedule(self, season: Union[int, str]):
-        # return self.SEASON_SCHEDULE.format(season_str=self._season_int_to_str(season))
-        return self.SEASON_SCHEDULE2
+        return self.SEASON_SCHEDULE.format(season_str=self._season_int_to_str(season))
+        # return self.SEASON_SCHEDULE2
 
     def games_lineups_nbacom(self, datestr: str):
         return self.NBACOM_GAMES_LINEUPS.format(datestr=datestr.replace('-', '').replace('/', ''))
@@ -195,7 +195,8 @@ FIX_PLAYER_NAMES = {
     "Lindy Waters": "Lindy Waters III",
     "Scotty Pippen": "Scotty Pippen Jr.",
     "Vince Williams": "Vince Williams Jr.",
-    "Vince WIlliams": "Vince Williams Jr.",
+    "Vincent Williams": "Vince Williams Jr.",
+    "Vincent Williams Jr.": "Vince Williams Jr.",
     "Kenneth Lofton": "Kenneth Lofton Jr.",
     "Herb Jones": "Herbert Jones",
     "OG Anunoby": "O.G. Anunoby",
@@ -287,7 +288,8 @@ FIX_PLAYER_NAMES = {
     'Hansen Yang': 'Yang Hansen',
     'Ronald Holland': 'Ronald Holland II',
     'L.J. Cryer': 'LJ Cryer',
-    "Eli N'Diaye": 'Eli John Ndiaye'
+    "Eli N'Diaye": 'Eli John Ndiaye',
+    'Bobby Portis Jr.': 'Bobby Portis'
 }
 
 FIX_TEAM_NAMES = {'NOR': 'NOP',

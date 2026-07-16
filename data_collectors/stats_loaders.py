@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Dict
 from tqdm import tqdm
-from nba_api.stats.endpoints import boxscoretraditionalv2, playergamelogs, teamgamelogs
+from nba_api.stats.endpoints import playergamelogs, teamgamelogs, boxscoretraditionalv3
 from constants import URLS, SCORING, TEAM_NAME_TO_ID, TEAM_ID_TO_NAME
 from enums import StatsTypes, BoxscoreTypes, Sites
 from utils import downcast_df, load_and_cache_players_list, season_int_to_str, load_nbacom_data, read_and_cache, \
@@ -293,6 +293,7 @@ class StatsLoaderPlayers(StatsLoader):
             all_dfs = all_dfs.loc[all_dfs['GAME_ID'].isin(game_ids)]
         else:
             keep_cols = ['GAME_ID', 'TEAM_ID', 'PLAYER_ID', 'START_POSITION', 'COMMENT']
+            rename_cols = {'gameId': 'GAME_ID', 'teamId': 'TEAM_ID', 'personId': 'PLAYER_ID', 'position': 'START_POSITION', 'comment': 'COMMENT'}
             all_dfs = list()
             for count, gid in tqdm(enumerate(sorted(game_ids)), desc='getting boxscore comments from nba.com',
                                    total=len(game_ids)):
@@ -300,21 +301,20 @@ class StatsLoaderPlayers(StatsLoader):
                 gid_str = str(gid)
                 if len(gid_str) < 10:
                     gid_str = '0' * (10 - len(gid_str)) + gid_str
-
                 try:
-                    boxscore = boxscoretraditionalv2.BoxScoreTraditionalV2
+                    boxscore = boxscoretraditionalv3.BoxScoreTraditionalV3
                     tmp_df = read_and_cache(
-                        func=lambda x: boxscore(game_id=x, headers=get_header(), timeout=10).get_data_frames()[0][
-                            keep_cols],
+                        func=lambda x: boxscore(game_id=x, headers=get_header(), timeout=10).player_stats.get_data_frame().rename(columns=rename_cols)[keep_cols],
                         func_params={'x': gid_str},
-                        cache_name=cache_name
+                        cache_name=cache_name,
+                        sleep_time_after_reading_from_web=0.6
                     )
                 except (requests.exceptions.ReadTimeout, IndexError, json.decoder.JSONDecodeError):
                     curr_url = URLS().single_boxscores_nbacom(gid=gid_str)
                     tmp_df = read_and_cache(lambda x: load_nbacom_data(url=x)[keep_cols], func_params={'x': curr_url},
-                                            cache_name=cache_name)
+                                            cache_name=cache_name,
+                                            sleep_time_after_reading_from_web=0.6)
                 all_dfs.append(tmp_df)
-                time.sleep(0.6)
             all_dfs = pd.concat(all_dfs, axis=0).reset_index(drop=True)
 
         # # changing the starters positions from G/F/C to PG/SG/SF/PF/C
