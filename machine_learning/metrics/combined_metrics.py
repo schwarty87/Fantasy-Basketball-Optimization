@@ -108,9 +108,10 @@ class MetricsCombined(torch.nn.Module, ABC):
         for metric_instance in self._get_all_metric_instances():
             metric_instance.set_reduction_dim(reduction_dim)
 
-    def to(self,  *args, **kwargs):
-        for metric_class in self.all_classes:
-            metric_class.to(*args, **kwargs)
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        for metric_instance in self._get_all_metric_instances():
+            metric_instance.to(*args, **kwargs)
 
 
 class LossesCombined(MetricsCombined):
@@ -135,7 +136,7 @@ class LossesCombined(MetricsCombined):
             tensors_for_loss_calculation = self._get_tensors_for_metric_calculation(all_tensors, loss_function.params)
             loss_val = loss_function(**tensors_for_loss_calculation)
             total_loss.append(loss_val * weight)
-        return torch.sum(torch.stack(total_loss, dim=0), dim=0, dtype=torch.float64)
+        return torch.sum(torch.stack(total_loss, dim=0).float(), dim=0)
 
     def _get_all_metric_instances(self) -> List[AbstractMetric]:
         return [loss_function_and_weight.loss_function for loss_function_and_weight in self.all_classes]

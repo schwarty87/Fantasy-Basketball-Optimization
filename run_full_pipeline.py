@@ -98,8 +98,15 @@ class RunFullPipeline:
 
     @staticmethod
     def _todays_model_already_trained() -> bool:
-        return os.path.isfile(os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
-                                           'model_' + str(get_current_date()).replace('-', '_'), 'model.pt'))
+        todays_model_dir = os.path.join(
+            DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
+            'model_' + str(get_current_date()).replace('-', '_')
+        )
+        if not os.path.isdir(todays_model_dir):
+            return False
+        return os.path.isfile(os.path.join(todays_model_dir, 'model.pt')) or any(
+            f.endswith('.ckpt') for f in os.listdir(todays_model_dir)
+        )
 
     def _has_games_today(self):
         return self._run_date in self.dates_to_game_times.keys()
@@ -210,8 +217,7 @@ class RunFullPipeline:
                       os.path.join(os.path.dirname(model_dir), todays_model_name)
                       )
 
-            import sys
-            sys.exit(0)
+
         params.continue_model_id = todays_model_name
         self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
 

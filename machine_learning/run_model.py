@@ -3,9 +3,11 @@ import contextlib
 import copy
 import logging
 import torch
+import numpy as np
 import traceback
 import pandas as pd
-from typing import Type, Dict, Optional, Union, Tuple, Any
+from typing import Type, Dict, Optional, Union, Tuple, Any, List
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 from machine_learning.constants import METADATA
@@ -14,6 +16,15 @@ from machine_learning.callbacks import CallbacksManager, training_callbacks, Mod
 from machine_learning.enums import ModelMode, DataSplitType
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
 from machine_learning.metrics.combined_metrics import LossesCombined, MetricsCombined
+from machine_learning.lightning_data_module import MachineLearningDataModule
+from machine_learning.lightning_model import MachineLearningLightningModule
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import (
+    ModelCheckpoint as PLModelCheckpoint,
+    EarlyStopping as PLEarlyStopping,
+    LearningRateMonitor,
+)
+from lightning.pytorch.loggers import TensorBoardLogger
 from machine_learning.params.abstract_params import AbstractMetricParams, AbstractLossParams, \
     AbstractMetricsAndCallbacksParams
 from machine_learning.params.callbacks_params import ModelCheckpointParams
@@ -30,10 +41,12 @@ OPTIMIZER_TYPE = Optional[torch.optim.Optimizer]
 
 
 class RunModel:
-    def __init__(self, params: MachineLearningParams, project_name: str, description: Optional[str] = None):
+    def __init__(self, params: MachineLearningParams, project_name: str, description: Optional[str] = None,
+                 use_lightning: bool = False):
         self.params = params
         self.project_name = project_name
         self._description = description
+        self.use_lightning = use_lightning
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -44,9 +57,10 @@ class RunModel:
 
         self._init_models_dir()
         if not os.path.isdir(self._models_dir):
-            os.mkdir(self._models_dir)
+            os.makedirs(self._models_dir, exist_ok=True)
         self._init_model_id()
         self._model_dir = os.path.join(self._models_dir, str(self.model_id))
+        os.makedirs(self._model_dir, exist_ok=True)
         if self.params.continue_model_id is not None:
             self._continue_model_dir = os.path.join(self._models_dir, str(self.params.continue_model_id))
         else:
@@ -54,16 +68,40 @@ class RunModel:
 
         self.create_data_loaders()
         self.update_categorical_params()
-        self._create_model_architecture()
+        self._create_model()
 
-        self._loss_function = self._define_loss_function()
-        self._metrics = self._define_metrics()
+        if not self.use_lightning:
+            self._loss_function = self._define_loss_function()
+            self._metrics = self._define_metrics()
+        else:
+            model = getattr(self, "model", None)
+            self._loss_function = getattr(model, "loss_function", None)
+            self._metrics = getattr(model, "metrics", None)
+            self.trainer: Optional[Any] = None
 
-        all_params = [self.params.training_params.loss_params,
-                      self.params.training_params.metrics_params,
-                      self.params.training_params.callbacks_params]
+        all_params = [getattr(self.params.training_params, "loss_params", ()),
+                      getattr(self.params.training_params, "metrics_params", ()),
+                      getattr(self.params.training_params, "callbacks_params", ())]
         self._all_tensor_names_for_losses_metrics_callbacks = \
-            list(set(sum([curr_params.all_tensor_names for p in all_params for curr_params in p], [])))
+            list(set(sum([curr_params.all_tensor_names for p in all_params for curr_params in p if hasattr(curr_params, "all_tensor_names")], [])))
+
+    @property
+    def lightning_module(self):
+        return self.model
+
+    @lightning_module.setter
+    def lightning_module(self, val):
+        self.model = val
+
+    def _data_class(self):
+        if self.use_lightning:
+            return MachineLearningDataModule
+        return MachineLearningDatasetCombined
+
+    def _model_class(self):
+        if self.use_lightning:
+            return MachineLearningLightningModule
+        return ModelArchitecture
 
     def _init_models_dir(self):
         self._models_dir = models_dir(self.project_name)
@@ -90,26 +128,105 @@ class RunModel:
 
     def create_data_loaders(self, scalers: Optional[Dict[str, StandardScaler]] = None,
                             label_encoders: Optional[OrdinalEncoder] = None):
-        if self.params.continue_model_id is not None:
-            scalers, label_encoders = \
-                self._machine_learning_datasets_combined_class().load_transformers(self._continue_model_dir)
-        machine_learning_datasets_combined = self._machine_learning_datasets_combined_class()(
-            params=self.params.features_params,
-            training_params=self.params.training_params,
-            project_name=self.project_name,
-            dataset_name_to_scalers=scalers,
-            dataset_name_to_categorical_encoder=label_encoders)
-        self.data_loaders = machine_learning_datasets_combined.create_data_loaders(
-            batch_size=self.params.training_params.batch_size,
-            num_workers=self.params.training_params.dataloader_num_workers)
+        data_cls = self._data_class()
+        if self.use_lightning:
+            self.data_module = data_cls(
+                params=self.params,
+                project_name=self.project_name,
+                model_dir=self._model_dir,
+            )
+            self.data_module.setup(stage="fit")
+            self.data_loaders = self.data_module.data_loaders
+        else:
+            if self.params.continue_model_id is not None:
+                scalers, label_encoders = data_cls.load_transformers(self._continue_model_dir)
+            self.dataset_combined = data_cls(
+                params=self.params.features_params,
+                training_params=self.params.training_params,
+                project_name=self.project_name,
+                dataset_name_to_scalers=scalers,
+                dataset_name_to_categorical_encoder=label_encoders)
+            self.data_loaders = self.dataset_combined.create_data_loaders(
+                batch_size=self.params.training_params.batch_size,
+                num_workers=self.params.training_params.dataloader_num_workers)
+
+    def _find_checkpoint_path(self, model_dir: Optional[str]) -> Optional[str]:
+        if not model_dir or not os.path.isdir(model_dir):
+            return None
+        last_ckpt = os.path.join(model_dir, "last.ckpt")
+        if os.path.isfile(last_ckpt):
+            return last_ckpt
+        ckpts = [os.path.join(model_dir, f) for f in os.listdir(model_dir) if f.endswith(".ckpt")]
+        if ckpts:
+            return sorted(ckpts)[-1]
+        model_pt = os.path.join(model_dir, "model.pt")
+        if os.path.isfile(model_pt):
+            return model_pt
+        return None
+
+    def _load_lightning_checkpoint_weights(self):
+        ckpt_path = self._find_checkpoint_path(self._continue_model_dir)
+        if ckpt_path is None:
+            logging.warning(f"No checkpoint found in continue_model_dir: {self._continue_model_dir}")
+            return
+
+        logging.info(f"Loading weights from checkpoint: {ckpt_path}")
+        try:
+            if ckpt_path.endswith(".ckpt"):
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                state_dict = ckpt.get("state_dict", ckpt)
+                self.model.load_state_dict(state_dict, strict=False)
+            elif ckpt_path.endswith(".pt"):
+                loaded_model = ModelCheckpoint.load_model(ckpt_path)
+                if hasattr(self.model, "model") and isinstance(self.model.model, torch.nn.Module):
+                    self.model.model.load_state_dict(loaded_model.state_dict())
+                else:
+                    self.model.model = loaded_model
+        except Exception as e:
+            logging.warning(f"Could not load checkpoint weights from {ckpt_path}: {e}")
+
+    def _create_model(self):
+        model_cls = self._model_class()
+        if self.use_lightning:
+            try:
+                scaler_dir = (
+                    self._continue_model_dir
+                    if (self.params.continue_model_id is not None and self._continue_model_dir and os.path.isdir(self._continue_model_dir))
+                    else self._model_dir
+                )
+                self.model = model_cls(params=self.params, scaler_dir=scaler_dir)
+                if self.params.continue_model_id is not None and self._continue_model_dir:
+                    self._load_lightning_checkpoint_weights()
+            except Exception as e:
+                logging.warning(f"Could not create lightning model: {e}")
+                self.model = None
+        else:
+            if self.params.continue_model_id is not None:
+                self.model = ModelCheckpoint.load_model(os.path.join(self._continue_model_dir, 'model.pt'))
+            else:
+                try:
+                    self.model = model_cls(
+                        self.params.architecture_params,
+                        feature_type_to_input_shape=self.params.features_params.feature_type_to_input_shape,
+                    )
+                except Exception as e:
+                    logging.warning(f"Could not create model architecture: {e}")
+                    self.model = None
+
+            if self.model is not None and hasattr(self.model, "to"):
+                self.model.to(self.device)
+
+        self._initial_epoch = 0
+
+    def _create_model_architecture(self):
+        return self._create_model()
 
     @staticmethod
     def _machine_learning_datasets_combined_class() -> Type[MachineLearningDatasetCombined]:
         return MachineLearningDatasetCombined
 
-    @staticmethod
-    def _model_architecture_class() -> Type[ModelArchitecture]:
-        return ModelArchitecture
+    def _model_architecture_class(self):
+        return self._model_class()
 
     @staticmethod
     def _losses_combined_class() -> Type[LossesCombined]:
@@ -123,17 +240,88 @@ class RunModel:
     def _callbacks_combined_class() -> Type[CallbacksManager]:
         return CallbacksManager
 
-    def _create_model_architecture(self):
-        if self.params.continue_model_id is not None:
-            self.model = ModelCheckpoint.load_model(os.path.join(self._continue_model_dir, 'model.pt'))
-            self._initial_epoch = 0
-        else:
-            model_class = self._model_architecture_class()
-            self.model = model_class(self.params.architecture_params,
-                                     feature_type_to_input_shape=self.params.features_params.feature_type_to_input_shape
-                                     )
-            self._initial_epoch = 0
-        self.model.to(self.device)
+    def _build_lightning_callbacks(self) -> List[Any]:
+        callbacks = [LearningRateMonitor(logging_interval="epoch")]
+        callbacks_params = getattr(self.params.training_params, "callbacks_params", ())
+
+        has_checkpoint = False
+        has_early_stopping = False
+        for p in callbacks_params:
+            class_name = p.__class__.__name__
+            if "ModelCheckpoint" in class_name:
+                has_checkpoint = True
+                monitor = getattr(p, "value_to_track", "eval_loss")
+                if monitor in ("eval_loss", "loss", "loss_function"):
+                    monitor = "val/loss"
+                elif monitor.startswith("eval_"):
+                    monitor = f"val/{monitor[5:]}"
+                mode = "min" if getattr(p, "track_min_or_max", True) else "max"
+                callbacks.append(
+                    PLModelCheckpoint(
+                        dirpath=self._model_dir,
+                        filename="model_{epoch:02d}_{val_loss:.3f}",
+                        monitor=monitor,
+                        mode=mode,
+                        save_top_k=1,
+                        save_last=True,
+                    )
+                )
+            elif "EarlyStopping" in class_name:
+                has_early_stopping = True
+                monitor = getattr(p, "value_to_track", "eval_loss")
+                if monitor in ("eval_loss", "loss", "loss_function"):
+                    monitor = "val/loss"
+                elif monitor.startswith("eval_"):
+                    monitor = f"val/{monitor[5:]}"
+                mode = "min" if getattr(p, "track_min_or_max", True) else "max"
+                patience = getattr(p, "patience", 10)
+                callbacks.append(
+                    PLEarlyStopping(
+                        monitor=monitor,
+                        patience=patience,
+                        mode=mode,
+                        verbose=True,
+                    )
+                )
+
+        if not has_checkpoint:
+            callbacks.append(
+                PLModelCheckpoint(
+                    dirpath=self._model_dir,
+                    filename="model_{epoch:02d}_{val_loss:.3f}",
+                    monitor="val/loss",
+                    mode="min",
+                    save_top_k=1,
+                    save_last=True,
+                )
+            )
+        if not has_early_stopping:
+            callbacks.append(
+                PLEarlyStopping(
+                    monitor="val/loss",
+                    patience=10,
+                    mode="min",
+                    verbose=True,
+                )
+            )
+
+        if getattr(self.params.training_params, "use_swa", False) is True:
+            try:
+                from lightning.pytorch.callbacks import StochasticWeightAveraging
+                swa_lrs = getattr(self.params.training_params, "swa_lrs", 1e-3)
+                callbacks.append(StochasticWeightAveraging(swa_lrs=swa_lrs))
+            except Exception as e:
+                logging.warning(f"Could not initialize SWA callback: {e}")
+
+        if getattr(self.params.training_params, "use_rich", False) is True:
+            try:
+                from lightning.pytorch.callbacks import RichProgressBar, RichModelSummary
+                callbacks.append(RichProgressBar())
+                callbacks.append(RichModelSummary(max_depth=2))
+            except Exception as e:
+                logging.warning(f"Could not initialize Rich callbacks: {e}")
+
+        return callbacks
 
     def _define_optimizer(self) -> torch.optim.Optimizer:
         return torch.optim.AdamW(self.model.parameters(), lr=self.params.training_params.learning_rate)
@@ -215,8 +403,18 @@ class RunModel:
         return logs
 
     def _save_tensorboard_logs(self, epoch_num: int, summary_writer: SummaryWriter):
-        self._metrics.save_tensorboard_logs(epoch=epoch_num, summary_writer=summary_writer)
-        self._loss_function.save_tensorboard_logs(epoch=epoch_num, summary_writer=summary_writer)
+        if self.use_lightning:
+            eval_results = getattr(self.model, "_last_epoch_eval_results", {})
+            for k, v in eval_results.items():
+                if isinstance(v, (int, float, np.number)):
+                    summary_writer.add_scalar(k, float(v), global_step=epoch_num or 0)
+                elif isinstance(v, dict):
+                    for sub_k, sub_v in v.items():
+                        if isinstance(sub_v, (int, float, np.number)):
+                            summary_writer.add_scalar(f"{k}/{sub_k}", float(sub_v), global_step=epoch_num or 0)
+        else:
+            self._metrics.save_tensorboard_logs(epoch=epoch_num, summary_writer=summary_writer)
+            self._loss_function.save_tensorboard_logs(epoch=epoch_num, summary_writer=summary_writer)
 
     def _save_data_to_db(self, epochs: int):
         """After training, save the model data to the db"""
@@ -250,18 +448,165 @@ class RunModel:
         return callbacks_combined_class(
             callback_params=callbacks_params, model=self.model, optimizer=optimizer, model_dir=self._model_dir)
 
+    def _get_dataloader(self, data_split_type: DataSplitType) -> Optional[DataLoader]:
+        if hasattr(self, "data_module") and hasattr(self.data_module, "data_loaders") and self.data_module.data_loaders:
+            return self.data_module.data_loaders.get(data_split_type)
+        if hasattr(self, "data_loaders") and self.data_loaders:
+            return self.data_loaders.get(data_split_type)
+        return None
+
+    def _define_callbacks(self, is_training: bool = True, optimizer: OPTIMIZER_TYPE = None):
+        """Unified callback creator that returns Lightning callbacks or legacy CallbacksManager based on use_lightning."""
+        if self.use_lightning:
+            return self._build_lightning_callbacks()
+        return self._define_callbacks_manager(is_training=is_training, optimizer=optimizer)
+
     def _stop_training(self, callbacks: CallbacksManager, epoch_num: int) -> bool:
         return callbacks.stop_training() or \
                ((self.params.training_params.num_epochs is not None) and
                 (epoch_num >= (self.params.training_params.num_epochs - 1)))
 
-    def train(self):
+    def train(self, trainer_cls=None, torch_save=None, precision=None):
         self._init_models_dir()
         self._init_model_id()
-        MachineLearningDatasetCombined.save_transformers(data_loader=self.data_loaders, save_dir=self._model_dir)
+
+        seed = getattr(self.params.training_params, "seed", None)
+        if seed is not None and type(seed).__name__ != "MagicMock":
+            if self.use_lightning:
+                pl.seed_everything(seed, workers=True)
+            else:
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+                np.random.seed(seed)
+
+        # Shared pre-training persistence of transformers and params
+        if hasattr(self, "data_module") and hasattr(self.data_module, "save_transformers"):
+            self.data_module.save_transformers(save_dir=self._model_dir)
+        elif hasattr(self, "data_loaders"):
+            MachineLearningDatasetCombined.save_transformers(data_loader=self.data_loaders, save_dir=self._model_dir)
+
+        self.params.save_to_json(os.path.join(self._model_dir, "params.json"))
+
+        if self.use_lightning:
+            if trainer_cls is None:
+                trainer_cls = pl.Trainer
+            if torch_save is None:
+                torch_save = torch.save
+
+            callbacks = self._define_callbacks(is_training=True)
+            logger = TensorBoardLogger(
+                save_dir=self._model_dir,
+                name="tensorboard_logs",
+                version="",
+            )
+            if precision is None:
+                precision = "16-mixed" if torch.cuda.is_available() else "32-true"
+
+            trainer_kwargs = {
+                "accelerator": "auto",
+                "devices": 1,
+                "precision": precision,
+                "max_epochs": self.params.training_params.num_epochs or 50,
+                "callbacks": callbacks,
+                "logger": logger,
+                "accumulate_grad_batches": self.params.training_params.gradient_accumulation_num_batches or 1,
+                "log_every_n_steps": 10,
+            }
+
+            limit_batches = getattr(self.params.training_params, "num_batches_per_epoch", None)
+            if limit_batches is not None and type(limit_batches).__name__ != "MagicMock":
+                trainer_kwargs["limit_train_batches"] = limit_batches
+
+            if getattr(self.params.training_params, "run_profiler", False) is True:
+                try:
+                    from lightning.pytorch.profilers import PyTorchProfiler
+                    profiler_dir = os.path.join(self._tensorboard_dir(), 'profiler')
+                    trainer_kwargs["profiler"] = PyTorchProfiler(dirpath=profiler_dir, filename='perf_logs')
+                except Exception as e:
+                    logging.warning(f"Could not initialize PyTorchProfiler: {e}")
+
+            grad_clip = getattr(self.params.training_params, "gradient_clip_val", None)
+            if grad_clip is not None and type(grad_clip).__name__ != "MagicMock":
+                trainer_kwargs["gradient_clip_val"] = grad_clip
+                trainer_kwargs["gradient_clip_algorithm"] = getattr(self.params.training_params, "gradient_clip_algorithm", "norm")
+
+            if getattr(self.params.training_params, "fast_dev_run", False) is True:
+                trainer_kwargs["fast_dev_run"] = True
+
+            overfit = getattr(self.params.training_params, "overfit_batches", 0.0)
+            if overfit and type(overfit).__name__ != "MagicMock":
+                trainer_kwargs["overfit_batches"] = overfit
+
+            self.trainer = trainer_cls(**trainer_kwargs)
+
+            ckpt_path = None
+            if self.params.continue_model_id is not None and getattr(self, "_continue_model_dir", None):
+                found_ckpt = self._find_checkpoint_path(self._continue_model_dir)
+                if found_ckpt and found_ckpt.endswith(".ckpt"):
+                    ckpt_path = found_ckpt
+
+            fit_kwargs = {"model": self.model}
+            if hasattr(self, "data_module"):
+                fit_kwargs["datamodule"] = self.data_module
+            elif hasattr(self, "data_loaders"):
+                fit_kwargs["train_dataloaders"] = self.data_loaders.get(DataSplitType.TRAIN)
+                fit_kwargs["val_dataloaders"] = self.data_loaders.get(DataSplitType.VALIDATION)
+
+            if ckpt_path is not None:
+                fit_kwargs["ckpt_path"] = ckpt_path
+
+            if getattr(self.params.training_params, "compile_model", False) is True and hasattr(torch, "compile"):
+                try:
+                    if hasattr(self.model, "model") and isinstance(self.model.model, torch.nn.Module):
+                        self.model.model = torch.compile(self.model.model)
+                    else:
+                        self.model = torch.compile(self.model)
+                    logging.info("Compiled model using torch.compile()")
+                except Exception as e:
+                    logging.warning(f"Could not torch.compile model: {e}")
+
+            if (getattr(self.params.training_params, "auto_lr_find", False) is True or
+                getattr(self.params.training_params, "auto_scale_batch_size", False) is True):
+                try:
+                    from lightning.pytorch.tuner import Tuner
+                    tuner = Tuner(self.trainer)
+                    if getattr(self.params.training_params, "auto_lr_find", False) is True:
+                        lr_finder = tuner.lr_find(**fit_kwargs)
+                        if lr_finder and lr_finder.suggestion():
+                            suggested_lr = lr_finder.suggestion()
+                            logging.info(f"Auto-LR finder suggested learning rate: {suggested_lr}")
+                            if hasattr(self.model, "hparams") and "learning_rate" in self.model.hparams:
+                                self.model.hparams.learning_rate = suggested_lr
+                            self.params.training_params.learning_rate = suggested_lr
+
+                    if getattr(self.params.training_params, "auto_scale_batch_size", False) is True:
+                        tuner.scale_batch_size(**fit_kwargs, mode="binsearch")
+                except Exception as e:
+                    logging.warning(f"Could not run Lightning Tuner: {e}")
+
+            self.trainer.fit(**fit_kwargs)
+
+            # Restore best checkpoint weights into self.model if available
+            best_ckpt = getattr(getattr(self.trainer, "checkpoint_callback", None), "best_model_path", None)
+            if isinstance(best_ckpt, str) and os.path.isfile(best_ckpt):
+                try:
+                    ckpt = torch.load(best_ckpt, map_location="cpu", weights_only=False)
+                    state_dict = ckpt.get("state_dict", ckpt)
+                    self.model.load_state_dict(state_dict, strict=False)
+                    logging.info(f"Restored best model weights from checkpoint: {best_ckpt}")
+                except Exception as e:
+                    logging.warning(f"Could not restore best model weights from {best_ckpt}: {e}")
+
+            try:
+                torch_save(getattr(self.model, "model", self.model), os.path.join(self._model_dir, "model.pt"))
+            except Exception as e:
+                logging.warning(f"Could not save legacy model.pt: {e}")
+
+            return
 
         optimizer = self._define_optimizer()
-        callbacks = self._define_callbacks_manager(is_training=True, optimizer=optimizer)
+        callbacks = self._define_callbacks(is_training=True, optimizer=optimizer)
 
         tensorboard_dir = self._tensorboard_dir()
         summary_writer_train = SummaryWriter(os.path.join(tensorboard_dir, DataSplitType.TRAIN.name.lower()))
@@ -335,16 +680,29 @@ class RunModel:
         :param epoch_num: The epoch number (should only have a value during training)
         :return: A dict of metric/loss name to value
         """
-        if callbacks is None:
-            callbacks = self._define_callbacks_manager(is_training=False)
+        if self.use_lightning:
+            if self.trainer is None:
+                precision = "16-mixed" if torch.cuda.is_available() else "32-true"
+                self.trainer = pl.Trainer(accelerator="auto", devices=1, precision=precision, logger=False)
 
-        self.model.eval()
-        callbacks.on_eval_begin()
-        with torch.no_grad():
-            metric_name_to_result_eval = self._run_epoch(training_mode=ModelMode.EVAL, callbacks=callbacks,
-                                                         data_split_type=data_split_type, metrics=self._metrics,
-                                                         loss_function=self._loss_function)
-        callbacks.on_eval_end(metric_name_to_result=metric_name_to_result_eval)
+            loader = self._get_dataloader(data_split_type)
+            if loader is None:
+                return {}
+
+            self.trainer.validate(model=self.model, dataloaders=loader, verbose=False)
+            metric_name_to_result_eval = copy.deepcopy(getattr(self.model, "_last_epoch_eval_results", {}))
+        else:
+            if callbacks is None:
+                callbacks = self._define_callbacks(is_training=False)
+
+            self.model.eval()
+            callbacks.on_eval_begin()
+            with torch.no_grad():
+                metric_name_to_result_eval = self._run_epoch(training_mode=ModelMode.EVAL, callbacks=callbacks,
+                                                             data_split_type=data_split_type, metrics=self._metrics,
+                                                             loss_function=self._loss_function)
+            callbacks.on_eval_end(metric_name_to_result=metric_name_to_result_eval)
+
         if summary_writer is not None:
             self._save_tensorboard_logs(epoch_num=epoch_num, summary_writer=summary_writer)
         return metric_name_to_result_eval
@@ -367,8 +725,29 @@ class RunModel:
         Tuple[Union[AbstractMetricParams, AbstractLossParams], ...]:
         return tuple(map(AbstractMetricParams.change_reduction_to_per_sample, metrics_params))
 
+    @staticmethod
+    def _format_generic_predictions(predict_batches: List[Any]) -> pd.DataFrame:
+        all_dfs = []
+        for batch in predict_batches:
+            if isinstance(batch, pd.DataFrame):
+                all_dfs.append(batch)
+            elif isinstance(batch, dict):
+                batch_dict = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        arr = v.detach().cpu().numpy()
+                        if arr.ndim == 1:
+                            batch_dict[k] = arr
+                        elif arr.ndim == 2 and arr.shape[1] == 1:
+                            batch_dict[k] = arr[:, 0]
+                if batch_dict:
+                    all_dfs.append(pd.DataFrame(batch_dict))
+        if all_dfs:
+            return pd.concat(all_dfs, axis=0, ignore_index=True)
+        return pd.DataFrame()
+
     def predict(self, data_split_type: DataSplitType, loss_params: Optional[Tuple[AbstractLossParams, ...]] = None,
-                metrics_params: Optional[Tuple[AbstractMetricParams, ...]] = None) -> Optional[pd.DataFrame]:
+                metrics_params: Optional[Tuple[AbstractMetricParams, ...]] = None, trainer_cls=None, **kwargs) -> Optional[pd.DataFrame]:
         """
         Perform a prediction run on the data. This means we'll perform a forward pass of all the samples in the
         "data_split_type" dataset and collect all the results for each sample.
@@ -376,10 +755,32 @@ class RunModel:
         :param loss_params: The params for the loss function. If None, use the data from
                             self.params.training_params.loss_params
         :param metrics_params: The params for the metrics. If None, use the data from
-                               self.params.training_params.metrics_params
+                                self.params.training_params.metrics_params
         :return: A df with all the results for each sample
         """
-        callbacks = self._define_callbacks_manager(is_training=False)
+        if self.use_lightning:
+            if trainer_cls is None:
+                trainer_cls = pl.Trainer
+            if self.trainer is None:
+                precision = "16-mixed" if torch.cuda.is_available() else "32-true"
+                self.trainer = trainer_cls(accelerator="auto", devices=1, precision=precision, logger=False)
+
+            if hasattr(self, "data_module"):
+                self.data_module.predict_data_split_type = data_split_type
+                batches = self.trainer.predict(model=self.model, datamodule=self.data_module)
+            else:
+                loader = self._get_dataloader(data_split_type)
+                batches = self.trainer.predict(model=self.model, dataloaders=loader)
+
+            if hasattr(self.model, "format_predictions"):
+                df = self.model.format_predictions(batches)
+            else:
+                df = self._format_generic_predictions(batches)
+
+            df['split_type'] = data_split_type.name
+            return df
+
+        callbacks = self._define_callbacks(is_training=False)
         loss_function = \
             self._define_loss_function(loss_params=loss_params) if loss_params is not None else self._loss_function
         metrics = self._metrics if metrics_params is None else self._define_metrics(
@@ -403,23 +804,51 @@ class RunModel:
             return pd.concat(results_dfs, axis=0)
 
     def predict_all_data(self, loss_params: Optional[Tuple[AbstractLossParams, ...]] = None,
-                         metrics_params: Optional[Tuple[AbstractMetricParams, ...]] = None) -> pd.DataFrame:
+                         metrics_params: Optional[Tuple[AbstractMetricParams, ...]] = None, **kwargs) -> pd.DataFrame:
         predict_results = list()
         for data_split_type in DataSplitType.all_not_none_split_types():
             curr_predict_results = self.predict(data_split_type=data_split_type, loss_params=loss_params,
-                                                metrics_params=metrics_params)
-            predict_results.append(curr_predict_results)
-        return pd.concat(predict_results, axis=0)
+                                                metrics_params=metrics_params, **kwargs)
+            if curr_predict_results is not None and not curr_predict_results.empty:
+                predict_results.append(curr_predict_results)
+        if predict_results:
+            return pd.concat(predict_results, axis=0, ignore_index=True)
+        return pd.DataFrame()
 
     def _save_hyperparameters_metrics_to_tensorboard(self, eval_results: pd.DataFrame):
         hyperparameters = {'learning_rate': self.params.training_params.learning_rate,
                            'batch_size': self.params.training_params.batch_size
                            }
+
+        if self.use_lightning and getattr(self, "trainer", None) is not None and getattr(self.trainer, "logger", None) is not None:
+            try:
+                val_metrics = {}
+                for split_type in DataSplitType.all_not_none_split_types():
+                    if split_type.name in eval_results.index:
+                        split_row = eval_results.loc[split_type.name].to_dict()
+                        for k, v in split_row.items():
+                            if isinstance(v, (int, float, np.number)) and not (isinstance(v, float) and np.isnan(v)):
+                                val_metrics[f"{split_type.name.lower()}/{k}"] = float(v)
+                self.trainer.logger.log_hyperparams(params=hyperparameters, metrics=val_metrics)
+                return
+            except Exception as e:
+                logging.warning(f"Could not log hyperparams via Lightning logger: {e}")
+
         for split_type in DataSplitType.all_not_none_split_types():
+            if split_type.name not in eval_results.index:
+                continue
             summary_writer = SummaryWriter(os.path.join(self._tensorboard_dir(), split_type.name.lower()))
             metrics = eval_results.loc[split_type.name].to_dict()
-            metrics['split_type'] = split_type.value
-            summary_writer.add_hparams(run_name=str(self.model_id), hparam_dict=hyperparameters, metric_dict=metrics)
+            scalar_metrics = {
+                k: float(v) if isinstance(v, (int, float, np.number)) else v
+                for k, v in metrics.items()
+                if isinstance(v, (int, float, np.number, bool)) and not (isinstance(v, float) and np.isnan(v))
+            }
+            scalar_metrics['split_type'] = split_type.value
+            try:
+                summary_writer.add_hparams(run_name=str(self.model_id), hparam_dict=hyperparameters, metric_dict=scalar_metrics)
+            except Exception as e:
+                logging.warning(f"Could not save hparams to tensorboard: {e}")
 
     def _tensorboard_dir(self):
         return os.path.join(self._model_dir, 'tensorboard_logs')

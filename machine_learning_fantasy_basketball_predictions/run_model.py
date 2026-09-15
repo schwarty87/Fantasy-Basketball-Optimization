@@ -1,18 +1,32 @@
 import os
 import time
+import logging
 import datetime
 import numpy as np
 import pandas as pd
+import torch
+import lightning.pytorch as pl
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from typing import Optional, Type, Tuple
+from lightning.pytorch.callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    LearningRateMonitor,
+)
+from lightning.pytorch.loggers import TensorBoardLogger
+
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
 from utils import add_missing_points_columns_to_predictions, sharpe, DATA_DIR
 from machine_learning.constants import IGNORE
 from machine_learning.enums import DataSplitType
 from machine_learning.run_model import RunModel
+from machine_learning.architecture import ModelArchitecture
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
+from machine_learning.lightning_data_module import MachineLearningDataModule
+from machine_learning.lightning_model import MachineLearningLightningModule
+from machine_learning.utils import models_dir, get_next_model_id
 from machine_learning_fantasy_basketball_predictions.constants import PROJECT_NAME
 from machine_learning_fantasy_basketball_predictions.params.params import \
     MachineLearningParamsFantasyBasketballPredictions
@@ -20,24 +34,46 @@ from machine_learning_fantasy_basketball_predictions.machine_learning_datasets i
     MachineLearningDatasetCombinedFantasyBasketballPredictions
 from machine_learning.callbacks import CallbacksManager
 from machine_learning_fantasy_basketball_predictions.callbacks import CallbacksManagerFantasyBasketballPredictions
+from machine_learning_fantasy_basketball_predictions.lightning_data_module import (
+    FantasyBasketballDataModule,
+)
+from machine_learning_fantasy_basketball_predictions.lightning_model import (
+    FantasyBasketballLightningModule,
+)
 
 
 class RunModelFantasyBasketballPredictions(RunModel):
     def __init__(self, params: MachineLearningParamsFantasyBasketballPredictions, project_name: str = PROJECT_NAME,
-                 description: Optional[str] = None):
-        super().__init__(params=params, project_name=project_name, description=description)
+                 description: Optional[str] = None, use_lightning: bool = False):
+        super().__init__(params=params, project_name=project_name, description=description, use_lightning=use_lightning)
 
-    @staticmethod
-    def _callbacks_combined_class() -> Type[CallbacksManager]:
-        return CallbacksManagerFantasyBasketballPredictions
+    def _data_class(self):
+        if self.use_lightning:
+            return FantasyBasketballDataModule
+        return MachineLearningDatasetCombinedFantasyBasketballPredictions
+
+    def _model_class(self):
+        if self.use_lightning:
+            return FantasyBasketballLightningModule
+        return ModelArchitecture
 
     @staticmethod
     def _machine_learning_datasets_combined_class() -> Type[MachineLearningDatasetCombined]:
         return MachineLearningDatasetCombinedFantasyBasketballPredictions
 
     @staticmethod
+    def _callbacks_combined_class() -> Type[CallbacksManager]:
+        return CallbacksManagerFantasyBasketballPredictions
+
+    @staticmethod
     def _load_contests_df() -> pd.DataFrame:
-        contests_df = pd.read_feather(os.path.join(DATA_DIR, "dfs_contests", "dfs_contest_results2.feather"))
+        contests_path = os.path.join(DATA_DIR, "dfs_contests", "dfs_contest_results2.feather")
+        if not os.path.isfile(contests_path):
+            raise FileNotFoundError(
+                f"DFS contest results file not found at: '{contests_path}'. "
+                f"Please ensure 'dfs_contest_results2.feather' exists in '{os.path.join(DATA_DIR, 'dfs_contests')}'."
+            )
+        contests_df = pd.read_feather(contests_path)
         contests_df = contests_df.loc[contests_df['score'] > 150]
         contests_df.rename(columns={'date': 'DATE'}, inplace=True)
         contests_df['DATE'] = pd.to_datetime(contests_df['DATE']).dt.date
@@ -48,8 +84,10 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
     @staticmethod
     def _process_predictions_df(predictions_df: pd.DataFrame, contests_df: pd.DataFrame) -> pd.DataFrame:
-        predictions_df = predictions_df[[c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]]
-        predictions_df.rename(columns={c: '_'.join(c.split('_')[1:]) for c in predictions_df.columns}, inplace=True)
+        collect_cols = [c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]
+        if collect_cols:
+            predictions_df = predictions_df[collect_cols]
+            predictions_df.rename(columns={c: '_'.join(c.split('_')[1:]) for c in predictions_df.columns}, inplace=True)
 
         if 'NOT_IGNORE' in predictions_df.columns:
             predictions_df = predictions_df.loc[predictions_df['NOT_IGNORE'].astype(bool)].drop(columns='NOT_IGNORE')
@@ -77,9 +115,26 @@ class RunModelFantasyBasketballPredictions(RunModel):
         
         return predictions_df
 
+
+    def train(self) -> None:
+        precision = "16-mixed" if torch.cuda.is_available() else "32-true"
+        return super().train(
+            trainer_cls=pl.Trainer,
+            torch_save=torch.save,
+            precision=precision,
+        )
+
+    def predict(self, data_split_type: DataSplitType = DataSplitType.TRAIN, **kwargs) -> pd.DataFrame:
+        return super().predict(data_split_type=data_split_type, trainer_cls=pl.Trainer, **kwargs)
+
     def _add_extra_metrics_to_eval_results(self, eval_results: pd.DataFrame, predict_results: pd.DataFrame
                                            ) -> pd.DataFrame:
-        contests_df = self._load_contests_df()
+        try:
+            contests_df = self._load_contests_df()
+        except FileNotFoundError as e:
+            logging.warning(f"Could not load DFS contest results: {e}. Skipping extra DFS contest metrics.")
+            return eval_results
+
         predict_results = self._process_predictions_df(predictions_df=predict_results, contests_df=contests_df)
 
         find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(points_col='YAHOO_POINTS_pred',
@@ -136,23 +191,30 @@ class RunModelFantasyBasketballPredictions(RunModel):
         eval_results, predict_results = super().run_full_training_session()
 
         # saving dfs results to tensorboard
-        summary_writer = SummaryWriter(os.path.join(self._tensorboard_dir(), DataSplitType.TRAIN.name.lower()))
-        for global_step, split_type in enumerate(DataSplitType.all_not_none_split_types()):
-            for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050']:
-                for c in [cc for cc in eval_results.columns if cc.startswith(m)]:
-                    summary_writer.add_scalar(tag=f'DFS_Results/{c}',
-                                              scalar_value=eval_results.loc[split_type.name, c],
-                                              global_step=global_step)
-                    time.sleep(0.01)
+        try:
+            summary_writer = SummaryWriter(os.path.join(self._tensorboard_dir(), DataSplitType.TRAIN.name.lower()))
+            for global_step, split_type in enumerate(DataSplitType.all_not_none_split_types()):
+                for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050']:
+                    for c in [cc for cc in eval_results.columns if cc.startswith(m)]:
+                        summary_writer.add_scalar(tag=f'DFS_Results/{c}',
+                                                  scalar_value=eval_results.loc[split_type.name, c],
+                                                  global_step=global_step)
+                        time.sleep(0.01)
 
-            summary_writer2 = SummaryWriter(os.path.join(self._tensorboard_dir(), split_type.name.lower()))
-            for suffix in ['all', 'paid']:
-                portfolio_value_5050 = eval_results.loc[split_type.name, f'portfolio_value_5050_{suffix}']
-                portfolio_value_top10 = eval_results.loc[split_type.name, f'portfolio_value_top10_{suffix}']
-                for global_step2, (curr_5050, curr_top10) in enumerate(zip(portfolio_value_5050, portfolio_value_top10)):
-                    summary_writer2.add_scalar(tag=f'DFS_Results/portfolio_value_5050_{split_type.name.lower()}_{suffix}',
-                                               scalar_value=curr_5050, global_step=global_step2)
-                    summary_writer2.add_scalar(tag=f'DFS_Results/portfolio_value_top10_{split_type.name.lower()}_{suffix}',
-                                               scalar_value=curr_top10, global_step=global_step2)
+                summary_writer2 = SummaryWriter(os.path.join(self._tensorboard_dir(), split_type.name.lower()))
+                for suffix in ['all', 'paid']:
+                    col_5050 = f'portfolio_value_5050_{suffix}'
+                    col_top10 = f'portfolio_value_top10_{suffix}'
+                    if col_5050 in eval_results.columns and col_top10 in eval_results.columns:
+                        portfolio_value_5050 = eval_results.loc[split_type.name, col_5050]
+                        portfolio_value_top10 = eval_results.loc[split_type.name, col_top10]
+                        if isinstance(portfolio_value_5050, list) and isinstance(portfolio_value_top10, list):
+                            for global_step2, (curr_5050, curr_top10) in enumerate(zip(portfolio_value_5050, portfolio_value_top10)):
+                                summary_writer2.add_scalar(tag=f'DFS_Results/portfolio_value_5050_{split_type.name.lower()}_{suffix}',
+                                                           scalar_value=curr_5050, global_step=global_step2)
+                                summary_writer2.add_scalar(tag=f'DFS_Results/portfolio_value_top10_{split_type.name.lower()}_{suffix}',
+                                                           scalar_value=curr_top10, global_step=global_step2)
+        except Exception as e:
+            logging.warning(f"Could not save DFS results to tensorboard: {e}")
 
         return eval_results, predict_results
