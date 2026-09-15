@@ -1,8 +1,8 @@
 import os
+import data_collectors
 import datetime
 import logging
 import json
-import time
 import requests
 import numpy as np
 import pandas as pd
@@ -14,10 +14,6 @@ from enums import StatsTypes, BoxscoreTypes, Sites
 from utils import downcast_df, load_and_cache_players_list, season_int_to_str, load_nbacom_data, read_and_cache, \
     get_latest_date_with_data, assert_valid_df_all, assert_valid_df_players, load_schedule, get_current_time, \
     get_current_date, FixPlayerNames, get_header, update_dir_name
-from data_collectors.fantasy_data import LoadFantasyData
-from data_collectors.injuries import Injuries
-from data_collectors.starters import Starters
-from data_collectors.ejections import Ejections
 
 FILL_ZEROS_COLS = ['MIN', 'FGM', 'FGA', '3PM', '3PA', 'FTM', 'FTA', 'OREB', 'DREB', 'REB', 'AST', 'TOV', 'STL',
                    'BLK', 'BLKA', 'PF', 'PFD', 'PTS', 'PLUS_MINUS', 'FG_PCT', '3P_PCT', 'FT_PCT']
@@ -236,6 +232,9 @@ class StatsLoaderPlayers(StatsLoader):
         if 'VIDEO_AVAILABLE' in self.df.columns:
             self.df.drop(columns=['VIDEO_AVAILABLE'], inplace=True)
 
+        self.df = self.df.loc[self.df['DATE'] < datetime.date(2025, 8, 1)]  # TODO REMOVE!!!
+        self.latest_date_with_data = get_latest_date_with_data(self.df)
+
         return self.df
 
     def scrape_boxscores_from_nbacom(self):
@@ -364,166 +363,6 @@ class StatsLoaderPlayers(StatsLoader):
         downcast_df(self.updates_df)
         self.assert_valid_df(self.updates_df)
 
-    # def _read_salaries_data_rotogrinders(self, add_upcoming_games: bool = True):
-    #     full_season_data_path = glob.glob(f'*_data/{self.season}.feather')
-    #     if len(full_season_data_path) > 0:
-    #         full_season_data_path = full_season_data_path[0]
-    #         rotogrinders_df = pd.read_feather(full_season_data_path)
-    #         self.updates_df = self.updates_df.merge(rotogrinders_df, on=['NAME', 'DATE'], how='left',
-    #                                                 suffixes=(None, '_ROTOGRINDERS'))
-    #         self.updates_df.sort_values(self.SORT_COLS, inplace=True)
-    #         downcast_df(self.updates_df)
-    #         self.assert_valid_df(self.updates_df)
-    #         return
-    #     elif self.season < 2022:
-    #         copy_cols = ['GAME_ID', 'PLAYER_ID', 'YAHOO_POSITION', 'YAHOO_SALARY', 'DRAFTKINGS_POSITION',
-    #                      'DRAFTKINGS_SALARY', 'FANDUEL_POSITION', 'FANDUEL_SALARY']
-    #         old_boxscores = pd.read_csv(f'/home/danieli/DFS/stats/player_boxscores_{self.season}_{self.season+1}.csv')
-    #         old_boxscores.columns = [c.upper() for c in old_boxscores.columns]
-    #         for c in [cc + '_POSITION' for cc in ALL_SITES]:
-    #             old_boxscores.loc[old_boxscores[c] <= 0, c] = np.nan
-    #         old_boxscores['YAHOO_POSITION'] = old_boxscores['YAHOO_POSITION'].replace(NUM_TO_POSITION)
-    #         not_nan = old_boxscores['FANDUEL_POSITION'].notnull()
-    #         old_boxscores.loc[not_nan, 'FANDUEL_POSITION'] = \
-    #             old_boxscores.loc[not_nan, 'FANDUEL_POSITION'].astype(int).apply(
-    #                 lambda x: '/'.join([NUM_TO_POSITION[int(xx)] for xx in str(x)]))
-    #         not_nan = old_boxscores['DRAFTKINGS_POSITION'].notnull()
-    #         old_boxscores.loc[not_nan, 'DRAFTKINGS_POSITION'] = \
-    #             old_boxscores.loc[not_nan, 'DRAFTKINGS_POSITION'].astype(int).apply(
-    #                 lambda x: '/'.join([NUM_TO_POSITION[int(xx)] for xx in str(x)]))
-    #         self.updates_df = self.updates_df.merge(old_boxscores[copy_cols], on=['GAME_ID', 'PLAYER_ID'], how='left')
-    #         self.updates_df.sort_values(self.SORT_COLS, inplace=True)
-    #         downcast_df(self.updates_df)
-    #         self.assert_valid_df(self.updates_df)
-    #         return
-    #
-    #     dates_to_run = list()
-    #     if add_upcoming_games:
-    #         dates_to_run.append(get_current_date())
-    #     if not self.updates_df.empty:
-    #         dates_to_run = sorted(set(self.updates_df['DATE'].unique()).union(dates_to_run))
-    #
-    #     rotogrinders_lineup = RotoGrindersLineup(add_date_column=True, add_id_columns=False)
-    #     salary_df = rotogrinders_lineup.run(dates_to_run, out_players=self.out_players)
-    #     if not salary_df.empty:
-    #         compare_names = self._players_list.query(f'TO_YEAR>={self.season}')['NAME']
-    #         salary_df['NAME'] = FixPlayerNames(compare_names=compare_names).fix_names(salary_df['NAME'])
-    #
-    #     salary_df = salary_df.loc[salary_df['NAME'] != '']
-    #     if salary_df.empty:
-    #         return
-    #
-    #     salary_df['PLAYER_ID'] = salary_df['NAME'].replace(self._player_name_to_id)
-    #
-    #     # filling nan team names
-    #     salary_df = salary_df.merge(self._players_list[['PLAYER_ID', 'TEAM_ABBREVIATION']], on='PLAYER_ID', how='left')
-    #     salary_df['TEAM'] = salary_df['TEAM'].fillna(salary_df['TEAM_ABBREVIATION'])
-    #     salary_df.drop(columns=['TEAM_ABBREVIATION', 'PLAYER_ID'], inplace=True)
-    #
-    #     if 'GAME_ID' in salary_df.columns:
-    #         salary_df.drop(columns='GAME_ID', inplace=True)
-    #     salary_df['TEAM'] = salary_df['TEAM'].replace(FIX_TEAM_NAMES)
-    #     if 'OPPONENT' in salary_df.columns:
-    #         salary_df['OPPONENT'] = salary_df['OPPONENT'].replace(FIX_TEAM_NAMES)
-    #     salary_df['TEAM_ID'] = salary_df['TEAM'].replace(TEAM_IDS)
-    #
-    #     # removing postponed games
-    #     schedule = load_schedule(drop_ppd=False)
-    #     postponed_games = schedule.query('gameStatusText == "PPD"')
-    #     salary_df = salary_df.merge(postponed_games[['DATE', 'TEAM_ID']], on=['DATE', 'TEAM_ID'], how='left',
-    #                                 indicator='xxx')
-    #     salary_df = salary_df.loc[salary_df['xxx'] == "left_only"].reset_index(drop=True).drop(columns='xxx')
-    #
-    #     salary_df.loc[salary_df['STARTER'].isnull(), 'STARTER'] = np.nan
-    #     salary_df.rename(columns={'STARTER': 'START_POSITION'}, inplace=True)
-    #     salary_df['SEASON_YEAR'] = self.season
-    #
-    #     # removing players who don't have an id and aren't starters
-    #     remove_inds = (salary_df['PLAYER_ID'] == salary_df['NAME']) & salary_df['START_POSITION'].isnull()
-    #     if remove_inds.any():
-    #         remove_names = salary_df.loc[remove_inds, 'NAME'].unique()
-    #         logging.info(f"#####################################################################\n"
-    #                      f"removing the following players since they don't have a PLAYER_ID:\n{remove_names}\n"
-    #                      f"#####################################################################")
-    #         salary_df = salary_df.loc[~remove_inds].reset_index(drop=True)
-    #
-    #     if self.updates_df.empty:
-    #         self.updates_df = salary_df
-    #         for c in FILL_ZEROS_COLS + ['DOUBLE_DOUBLE', 'TRIPLE_DOUBLE']:
-    #             if c not in self.updates_df.columns:
-    #                 self.updates_df[c] = 0 if c in FILL_ZEROS_COLS else False
-    #     else:
-    #         todays_date = get_current_date()
-    #         self.updates_df = self.updates_df.merge(salary_df, on=['PLAYER_ID', 'DATE'], how='left',
-    #                                                 suffixes=(None, '_ROTOGRINDERS'))
-    #         salary_df_today = salary_df.loc[salary_df['DATE'] == todays_date]
-    #         if not salary_df_today.empty:
-    #             self.updates_df = pd.concat([self.updates_df, salary_df_today], axis=0)
-    #             self.updates_df.loc[self.updates_df['DATE'] == todays_date, FILL_ZEROS_COLS] = 0
-    #
-    #     # filling nans for today's games
-    #     if not self.updates_df.empty:
-    #         rotogrinders_cols = [c for c in self.updates_df if c.endswith('_ROTOGRINDERS')]
-    #         today_inds = self.updates_df['DATE'] == get_current_date()
-    #         for c in rotogrinders_cols:
-    #             c_stripped = c.replace('_ROTOGRINDERS', '')
-    #             if c_stripped in self.updates_df.columns:
-    #                 self.updates_df.loc[today_inds, c_stripped] = \
-    #                     self.updates_df.loc[today_inds, c_stripped].fillna(self.updates_df.loc[today_inds, c])
-    #         self.updates_df.drop(columns=rotogrinders_cols, inplace=True)
-    #
-    #     # adding GAME_ID/HOME
-    #     self.updates_df = self.updates_df.merge(self._schedule[['TEAM_ID', 'DATE', 'GAME_ID', 'HOME']],
-    #                                             on=['TEAM_ID', 'DATE'], how='left', suffixes=(None, '_x'))
-    #     if 'GAME_ID_x' in self.updates_df.columns:
-    #         self.updates_df['GAME_ID'] = self.updates_df['GAME_ID'].fillna(self.updates_df['GAME_ID_x'])
-    #         self.updates_df.drop(columns=['GAME_ID_x'], inplace=True)
-    #     if 'HOME_x' in self.updates_df.columns:
-    #         self.updates_df['HOME'] = self.updates_df['HOME'].fillna(self.updates_df['HOME_x'])
-    #         self.updates_df.drop(columns=['HOME_x'], inplace=True)
-    #
-    #     downcast_df(self.updates_df)
-    #     self.assert_valid_df(self.updates_df)
-
-    # def _remove_injured_players(self, add_upcoming_games: bool = True):
-    #     if add_upcoming_games and get_current_date() in self.updates_df['DATE'].values:
-    #         injured_players = Injuries(nbacom_players_list=self._players_list['NAME'])
-    #         injured_players.collect_data()
-    #         out_player_names = injured_players.out_players()
-    #
-    #         # dealing with starters who are listed as injured
-    #         drop_starters = (self.updates_df['DATE'].values == get_current_date()) & \
-    #                         self.updates_df['NAME'].isin(out_player_names).values & \
-    #                         self.updates_df['START_POSITION'].notnull().values
-    #         if drop_starters.any():
-    #             logging.warning('There is an injured starter!!!!')
-    #             for i, injured_starter_row in self.updates_df.loc[drop_starters].iterrows():
-    #                 possible_replacements = \
-    #                     self.updates_df.loc[(self.updates_df['DATE'] == injured_starter_row['DATE']) &
-    #                                         (self.updates_df['TEAM_ID'] == injured_starter_row['TEAM_ID']) &
-    #                                         self.updates_df['START_POSITION'].isnull() &
-    #                                         (self.updates_df['YAHOO_POSITION'] == injured_starter_row['START_POSITION'])]
-    #                 if len(possible_replacements) > 0:
-    #                     replacement_ind = possible_replacements['YAHOO_SALARY'].idxmax()
-    #                     self.updates_df.loc[replacement_ind, 'START_POSITION'] = injured_starter_row['START_POSITION']
-    #                     self.updates_df.drop(index=i, inplace=True)
-    #                     logging.info(f'replacing injured starter {injured_starter_row["NAME"]} with '
-    #                                  f'{self.updates_df.loc[replacement_ind, "NAME"]}')
-    #                 else:
-    #                     logging.info(f'replacing injured starter {injured_starter_row["NAME"]} with fake name/id...')
-    #                     self.updates_df.loc[i, 'NAME'] = 'Injured Starter'
-    #                     self.updates_df.loc[i, 'PLAYER_NAME'] = self._players_list['PLAYER_ID'].max() + 1
-    #
-    #         # removing bench players
-    #         drop_bench = (self.updates_df['DATE'].values == get_current_date()) & \
-    #                      self.updates_df['NAME'].isin(out_player_names).values & \
-    #                      (~self.updates_df['START_POSITION'].notnull()).values
-    #         if drop_bench.any():
-    #             logging.info(f'dropping injured bench players: {self.updates_df.loc[drop_bench, "NAME"].to_list()}')
-    #             self.updates_df = self.updates_df.loc[~drop_bench]
-    #
-    #         self.updates_df.reset_index(drop=True, inplace=True)
-
     def _add_extra_data_to_updates_df(self, add_upcoming_games: bool = True):
         if (not add_upcoming_games) and (self.updates_df is None or self.updates_df.empty):
             return
@@ -531,27 +370,39 @@ class StatsLoaderPlayers(StatsLoader):
         self._read_single_game_boxscores_comments()
 
         players_list_names = self._players_list['NAME'].to_list()
-        ejections = Ejections(nbacom_players_list=players_list_names)
+        ejections = data_collectors.ejections.Ejections(nbacom_players_list=players_list_names)
         ejections_df = ejections.collect_data()
 
         update_dates = self.updates_df['DATE'].unique().tolist()
         if add_upcoming_games:
             update_dates.append(get_current_date())
         extra_data = list()
-        injuries = Injuries(nbacom_players_list=players_list_names, player_id_to_name=self._player_id_to_name)
-        load_fantasy_data = LoadFantasyData(nbacom_players_list=players_list_names)
-        load_starters = Starters(nbacom_players_list=players_list_names, player_name_to_id=self._player_name_to_id)
+        injuries = data_collectors.injuries.Injuries(nbacom_players_list=players_list_names,
+                                     player_id_to_name=self._player_id_to_name
+                                     )
+        load_fantasy_data = data_collectors.fantasy_data.LoadFantasyData(nbacom_players_list=players_list_names)
+        load_starters = data_collectors.starters.Starters(nbacom_players_list=players_list_names,
+                                          player_name_to_id=self._player_name_to_id
+                                          )
+        left_midgame_collector = data_collectors.left_midgame.LeftMidgame(nbacom_players_list=players_list_names,
+                                                          player_id_to_name=self._player_id_to_name,
+                                                          player_name_to_id=self._player_name_to_id
+                                                          )
         for date in tqdm(update_dates, desc='loading extra data per date'):
             # loading injuries data
             injuries.collect_data(date=date)
             injured_players = injuries.out_players()
+
+            # loading left midgame data using play-by-play
+            pbp_left_midgame = left_midgame_collector.collect_data(date=date)
 
             # removing players who played that day
             # TODO this should be added to Injuries!
             if not self.updates_df.empty:
                 players_played_today = self.updates_df.loc[(self.updates_df['DATE'] == date) &
                                                            (self.updates_df['MIN'] > 0), 'NAME']
-                left_midgame = set(players_played_today) & set(injured_players)
+                heuristic_left_midgame = set(players_played_today) & set(injured_players)
+                left_midgame = (pbp_left_midgame | heuristic_left_midgame) & set(players_played_today)
                 injured_players = [p for p in injured_players if p not in left_midgame]
             else:
                 left_midgame = list()
