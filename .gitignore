@@ -31,3 +31,5 @@ machine_learning_fantasy_basketball_predictions/models/
 # OS files
 .DS_Store
 Thumbs.db
+
+debug_view.html

@@ -6,7 +6,7 @@ import torch
 from scipy.signal import convolve
 from sklearn.preprocessing import OrdinalEncoder
 from typing import List, Dict, Union, Callable, Optional
-from constants import DATA_DIR
+from machine_learning.constants import DATA_DIR
 
 RANDOM_SEED = 42
 
@@ -95,10 +95,14 @@ def models_dir(project_name: str) -> str:
     return os.path.join(DATA_DIR, f'machine_learning_{project_name}', 'models')
 
 
-def get_next_model_id(prpject_name: str) -> int:
-    previous_models = os.listdir(models_dir(prpject_name))
-    if len(previous_models) > 0:
-        return max([int(m) for m in previous_models if m.isdigit()]) + 1
+def get_next_model_id(project_name: str) -> int:
+    d = models_dir(project_name)
+    if not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    previous_models = os.listdir(d)
+    digits = [int(m) for m in previous_models if m.isdigit()]
+    if len(digits) > 0:
+        return max(digits) + 1
     return 0
 
 

@@ -1,9 +1,9 @@
 import datetime
 import os
+from typing import Union
 import pytz
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
-from typing import Union
+from machine_learning.constants import DATA_DIR
 from enums import Browsers, Sites
 
 IGNORE_VAL = -999

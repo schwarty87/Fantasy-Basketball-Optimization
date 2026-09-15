@@ -126,6 +126,18 @@ class TrainingParams(AbstractParams):
         field(default_factory=lambda: (ModelCheckpointParams(), EarlyStoppingParams()))
 
     num_batches_per_epoch: Optional[int] = None
+    gradient_clip_val: Optional[float] = None
+    gradient_clip_algorithm: str = "norm"
+    fast_dev_run: bool = False
+    overfit_batches: Union[int, float] = 0.0
+    auto_lr_find: bool = False
+    auto_scale_batch_size: bool = False
+    use_swa: bool = False
+    swa_lrs: float = 1e-3
+    use_rich: bool = False
+    compile_model: bool = False
+    seed: Optional[int] = 42
+    track_grad_norm: Optional[Union[int, float, str]] = None
 
     def __post_init__(self):
         if isinstance(self.loss_params, AbstractLossParams):

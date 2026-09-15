@@ -1,10 +1,12 @@
 import os
 import shutil
+import argparse
 import logging
 import torch
 import numpy as np
 from dataclasses import dataclass, is_dataclass, fields
-from typing import Dict
+from typing import Dict, Tuple, Optional
+import pandas as pd
 from enums import Sites
 from utils import define_logger, update_dir_name
 from machine_learning.enums import SampleWeightType, ImputationType, ActivationFunction, FeatureType
@@ -445,25 +447,108 @@ def test_params(params):
     os.remove(test_path)
 
 
-if __name__ == '__main__':
-    # remove directories with no model file
-    project_models_dir = models_dir(PROJECT_NAME)
+def clean_empty_model_dirs(project_name: str = PROJECT_NAME):
+    """Remove model directories that do not contain a trained model file."""
+    project_models_dir = models_dir(project_name)
+    if not os.path.isdir(project_models_dir):
+        return
     for d in os.listdir(project_models_dir):
         curr_model_dir = os.path.join(project_models_dir, d)
-        if not os.path.isfile(os.path.join(curr_model_dir, 'model.pt')):
-            shutil.rmtree(curr_model_dir)
+        if not os.path.isdir(curr_model_dir):
+            continue
+        has_pt = os.path.isfile(os.path.join(curr_model_dir, 'model.pt'))
+        has_ckpt = any(f.endswith('.ckpt') for f in os.listdir(curr_model_dir))
+        if not (has_pt or has_ckpt):
+            shutil.rmtree(curr_model_dir, ignore_errors=True)
 
-    define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
-                  filename=None, print_to_console=True, filemode=None)
-    
-    p1 = MachineLearningParamsFantasyBasketballPredictions.load_params('C:/Users/schwa/PycharmProjects/Fantasy-Basketball-Predictions/machine_learning_fantasy_basketball_predictions/models/71/params.json')
-    
-    params = create_params()
+
+def main(
+    use_lightning: bool = False,
+    params: Optional[MachineLearningParamsFantasyBasketballPredictions] = None,
+    clean_dirs: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if clean_dirs:
+        clean_empty_model_dirs(PROJECT_NAME)
+
+    define_logger(
+        format='%(asctime)s [%(levelname)s] - %(message)s',
+        level=logging.INFO,
+        filename=None,
+        print_to_console=True,
+        filemode=None,
+    )
+
+    if params is None:
+        params = create_params()
     test_params(params)
 
-    # aaa =  compare_dataclasses(params, p1)
-
-    run_model = RunModelFantasyBasketballPredictions(params=params, description=None)
+    run_model = RunModelFantasyBasketballPredictions(
+        params=params, description=None, use_lightning=use_lightning
+    )
     eval_results, predict_results = run_model.run_full_training_session()
 
-    predict_results.to_feather(os.path.join(models_dir(PROJECT_NAME), str(run_model.model_id), 'predict_results.feather'))
+    output_feather = os.path.join(
+        models_dir(PROJECT_NAME), str(run_model.model_id), 'predict_results.feather'
+    )
+    predict_results.to_feather(output_feather)
+
+    return eval_results, predict_results
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Train Fantasy Basketball Predictions Model")
+    parser.add_argument(
+        "--use-lightning",
+        action="store_true",
+        help="Use PyTorch Lightning training loop instead of legacy manual PyTorch loop",
+    )
+    parser.add_argument(
+        "--fast-dev-run",
+        action="store_true",
+        help="Run 1 train and 1 val batch to quickly verify code before full training",
+    )
+    parser.add_argument(
+        "--auto-lr-find",
+        action="store_true",
+        help="Run Lightning Tuner learning rate finder before training",
+    )
+    parser.add_argument(
+        "--swa",
+        action="store_true",
+        help="Enable Stochastic Weight Averaging callback",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable PyTorchProfiler during training",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for full reproducibility (default: 42)",
+    )
+    parser.add_argument(
+        "--track-grad-norm",
+        type=float,
+        default=None,
+        help="Track and log gradient norm (e.g. 2 for L2 norm)",
+    )
+    args = parser.parse_args()
+
+    use_lightning = args.use_lightning
+    params = create_params()
+    if args.fast_dev_run:
+        params.training_params.fast_dev_run = True
+    if args.auto_lr_find:
+        params.training_params.auto_lr_find = True
+    if args.swa:
+        params.training_params.use_swa = True
+    if args.profile:
+        params.training_params.run_profiler = True
+    if args.seed is not None:
+        params.training_params.seed = args.seed
+    if args.track_grad_norm is not None:
+        params.training_params.track_grad_norm = args.track_grad_norm
+
+    main(use_lightning=use_lightning, params=params)

@@ -5,7 +5,6 @@ all_values_in_enum = ClassThatInheritsFromEnum._membermap_
 """
 
 from enum import Enum, auto
-
 from machine_learning.registries import enums_registry
 
 
