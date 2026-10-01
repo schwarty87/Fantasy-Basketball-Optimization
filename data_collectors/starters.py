@@ -12,7 +12,7 @@ from typing import List, Optional, Union, Type, Dict
 from constants import URLS, FIX_TEAM_NAMES, NUM_TO_POSITION, TEAM_ID_TO_NAME, START_POSITIONS, UNKNOWN_PLAYER_ID
 from enums import Sites
 from utils import FixPlayerNames, retry, get_header, UnableToLoadWebsiteException, load_schedule, get_current_date, \
-    define_logger, update_dir_name
+    define_logger, update_dir_name, fetch_soup
 from data_collectors.scrape_rotogrinders_data import get_first_slate_id, \
     scrape_rotogrinders_lineups_data_from_all_sites_for_today, load_data_from_rotogrinders_lineups_hq, \
     load_fantasy_salaries_positions_lineups_hq
@@ -24,7 +24,7 @@ START_POSITIONS_SET = set(START_POSITIONS)
 
 class LoadStartersAbstract(ABC):
     def __init__(self, fix_player_names_instance: Optional[FixPlayerNames] = None):
-        self.fix_player_names = fix_player_names_instance
+        self.fix_player_names = fix_player_names_instance or FixPlayerNames()
         self.df = EMPTY_DF
     
     @abstractmethod
@@ -171,15 +171,32 @@ class LoadStartersBasketballMonster(LoadStartersAbstract):
     def _load_starters(self, date: datetime.date = get_current_date(), **kwargs):
         if date != get_current_date():
             return EMPTY_DF
-        dfs_list = pd.read_html(URLS.BASKETBALL_MONSTER_LINEUPS)
-        for i, df in enumerate(dfs_list):
-            team1, team2 = re.findall(self.TEAMS_STR_PATTERN, df.columns[0][0])[0]
-            df.columns = ["START_POSITION", team1, team2]
-            df = pd.concat([df[["START_POSITION", team1]].assign(TEAM=team1).rename(columns={team1: "NAME"}),
-                            df[["START_POSITION", team2]].assign(TEAM=team2).rename(columns={team2: "NAME"})],
-                           axis=0)
-            dfs_list[i] = df
-        all_dfs = pd.concat(dfs_list, axis=0)
+
+        soup = fetch_soup(URLS.BASKETBALL_MONSTER_LINEUPS)
+        if not soup:
+            return EMPTY_DF
+
+        tables = soup.find_all('table', class_='datatable')
+        if not tables:
+            return EMPTY_DF
+
+        rows = []
+        for t in tables:
+            m = re.search(self.TEAMS_STR_PATTERN, t.get_text())
+            if not m:
+                continue
+            team1, team2 = m.group(1), m.group(2)
+            for tr in t.find_all('tr'):
+                cells = [c.get_text(strip=True) for c in tr.find_all(['td', 'th'])]
+                if len(cells) >= 3 and cells[0] in START_POSITIONS:
+                    pos, p1, p2 = cells[0], cells[1], cells[2]
+                    rows.append({'NAME': p1, 'TEAM': team1, 'START_POSITION': pos})
+                    rows.append({'NAME': p2, 'TEAM': team2, 'START_POSITION': pos})
+
+        if not rows:
+            return EMPTY_DF
+
+        all_dfs = pd.DataFrame(rows)
 
         for suff in ('P', 'Q', 'Off Inj', 'In', 'S', 'LR', 'Ret', 'D'):
             suff_len = len(suff) + 1

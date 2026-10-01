@@ -232,7 +232,6 @@ class StatsLoaderPlayers(StatsLoader):
         if 'VIDEO_AVAILABLE' in self.df.columns:
             self.df.drop(columns=['VIDEO_AVAILABLE'], inplace=True)
 
-        self.df = self.df.loc[self.df['DATE'] < datetime.date(2025, 8, 1)]  # TODO REMOVE!!!
         self.latest_date_with_data = get_latest_date_with_data(self.df)
 
         return self.df

@@ -5,13 +5,12 @@ import logging
 import requests
 import numpy as np
 import pandas as pd
-from bs4 import BeautifulSoup
 from enums import Enum, auto
 from requests.exceptions import TooManyRedirects, ReadTimeout
 from typing import List, Optional, Union, Dict, Tuple
 from constants import URLS, FIX_TEAM_NAMES, TEAM_ID_TO_NAME
-from utils import FixPlayerNames, retry, get_header, UnableToLoadWebsiteException, load_schedule, get_current_date, \
-    date_to_game_ids, update_dir_name
+from utils import FixPlayerNames, retry, get_header, UnableToLoadWebsiteException, get_current_date, \
+    date_to_game_ids, update_dir_name, fetch_html_table
 
 
 INJURIES_DF_COLUMNS = ['NAME', 'TEAM', 'IS_OUT', 'IS_QUESTIONABLE']
@@ -72,8 +71,14 @@ class Injuries:
 
         self._fix_names(df=df)
 
-        df['IS_OUT'] = df['STATUS'].str.contains('Out')
-        df['IS_QUESTIONABLE'] = df['STATUS'].str.lower().str.contains('game time decision')
+        status_lower = df['STATUS'].astype(str).str.lower()
+        df['IS_OUT'] = status_lower.str.contains('out')
+        df['IS_QUESTIONABLE'] = (
+            status_lower.str.contains('questionable') |
+            status_lower.str.contains('doubtful') |
+            status_lower.str.contains('game time decision') |
+            status_lower.str.contains('gtd')
+        ) & (~df['IS_OUT'])
 
         logging.info('finished loading rotowire injuries data')
 
@@ -84,12 +89,11 @@ class Injuries:
         if date != get_current_date():
             return EMPTY_DF
 
-        df = pd.read_html(URLS.INJURIES_ROTOGRINDERS)[0]
-        df.dropna(subset=['PLAYER'], inplace=True)
+        df = fetch_html_table(URLS.INJURIES_ROTOGRINDERS, uppercase_headers=True)
+        if df.empty or not any(['PLAYER' in c for c in df.columns]):
+            return EMPTY_DF
 
-        if not any(['PLAYER' in c for c in df.columns]):
-            raise ValueError(f"PLAYER column not found in rotogrinders injuries df!\ncolumns in the df: {df.columns}\n"
-                             f"df shape: {df.shape}")
+        df.dropna(subset=['PLAYER'], inplace=True)
 
         # fixing column names
         rename_dict = {c: 'STATUS' for c in df.columns if c.startswith('STATUS') or c in ['KY']}
@@ -191,22 +195,40 @@ class Injuries:
         if date != get_current_date():
             return EMPTY_DF
 
-        page = requests.get('https://www.cbssports.com/nba/injuries/')
-        soup = BeautifulSoup(page.content, "html.parser")
-        dfs = pd.read_html(page.content)
-        team_names = [team_name.text for team_name in soup.find_all(class_='TeamName')]
-        for df, team_name in zip(dfs, team_names):
-            df['TEAM'] = team_name
-        df = pd.concat(dfs, axis=0).reset_index(drop=True)
-        df['IS_OUT'] = df['Injury Status'].str.lower().str.contains('out')
-        df['IS_QUESTIONABLE'] = df['Injury Status'] == 'Game Time Decision'
-        df['Player'] = df['Player'].str.split(' ', n=1).str[-1]
-        for i, player in df['Player'].items():
-            for letter_num in range(2, len(player) // 2):
-                if player[:letter_num] == player[-letter_num:]:
-                    df.loc[i, 'Player'] = player[letter_num:]
-                    break
-        df.rename(columns={'Player': 'NAME'}, inplace=True)
+        def parse_cbs_cell(cell):
+            long_name = cell.find(class_='CellPlayerName--long')
+            if long_name:
+                return long_name.get_text(strip=True)
+            a_tag = cell.find('a')
+            if a_tag:
+                return a_tag.get_text(strip=True)
+            return cell.get_text(strip=True)
+
+        def get_cbs_team(table):
+            team_el = table.find_previous(class_='TeamName')
+            return {'TEAM': team_el.get_text(strip=True) if team_el else ''}
+
+        df = fetch_html_table(
+            'https://www.cbssports.com/nba/injuries/',
+            all_tables=True,
+            concat_tables=True,
+            uppercase_headers=True,
+            cell_parser=parse_cbs_cell,
+            table_context_parser=get_cbs_team,
+            column_rename={'PLAYER': 'NAME'}
+        )
+        if df.empty or 'NAME' not in df.columns or 'STATUS' not in df.columns:
+            return EMPTY_DF
+
+        status_lower = df['STATUS'].str.lower()
+        df['IS_OUT'] = status_lower.str.contains('out')
+        df['IS_QUESTIONABLE'] = (
+            status_lower.str.contains('game time decision') |
+            status_lower.str.contains('questionable') |
+            status_lower.str.contains('doubtful') |
+            status_lower.str.contains('gtd')
+        ) & (~df['IS_OUT'])
+
         self._fix_names(df)
 
         logging.info('finished loading cbs injuries data')

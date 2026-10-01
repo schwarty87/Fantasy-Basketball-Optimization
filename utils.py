@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from functools import wraps
-from typing import Optional, Union, Tuple, Type, Callable, List
+from typing import Optional, Union, Tuple, Type, Callable, List, Dict, Any
+from bs4 import BeautifulSoup, Tag
 from pandas.api.types import is_datetime64_any_dtype, is_string_dtype
 from constants import FIX_PLAYER_NAMES, URLS, START_POSITIONS, SCORING, NY_TZ, DATA_DIR
 from requests.exceptions import ConnectionError, ReadTimeout, RequestException
@@ -29,14 +30,17 @@ class UnableToLoadWebsiteException(Exception):
         return f'unable to load site {self.site}'
 
 
+_NO_DEFAULT = object()
+
+
 def retry(exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exception, max_retries: int = 3,
-          delay_seconds: float = 60, return_on_fail: Optional = None):
+          delay_seconds: float = 60, return_on_fail: Any = _NO_DEFAULT):
     """
     Decorator function that retries a given function if specific exceptions occur.
     :param exceptions: Exception classes that trigger retries.
     :param max_retries: Retry this many times before failing
     :param delay_seconds: Time delay in seconds between retries.
-    :param return_on_fail: If not None, return this value if we failed the max amount of times. Could be a callable or
+    :param return_on_fail: If not _NO_DEFAULT, return this value if we failed the max amount of times. Could be a callable or
                            any value
     :return: Decorated function
     """
@@ -55,7 +59,7 @@ def retry(exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exce
                 except Exception as e:
                     raise e
             fail_str = f"Function {func.__name__} failed after {max_retries} attempts"
-            if return_on_fail is None:
+            if return_on_fail is _NO_DEFAULT:
                 logging.error(fail_str)
                 raise last_exception
             else:
@@ -109,7 +113,7 @@ def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[st
     if suffix is not None:
         cache_path += f'.{suffix}'
     if os.path.isfile(cache_path):
-        return pd.DataFrame(pd.read_feather(cache_path).to_dict())
+        return pd.read_feather(cache_path)
     df = func(**func_params)
     if df.empty:
         raise ValueError(f'no data returned from {func.__name__}')
@@ -240,6 +244,253 @@ def load_nbacom_data(url: str, use_key: str = 'resultSets', player_or_team: bool
         return
     else:
         return data_dict
+
+
+@retry(max_retries=3, delay_seconds=1, return_on_fail=None)
+def fetch_soup(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 15,
+    session: Optional[requests.Session] = None,
+    parser: str = 'html.parser',
+    raise_for_status: bool = True,
+    encoding: Optional[str] = None
+) -> Optional[BeautifulSoup]:
+    """
+    Fetches a webpage using an HTTP GET request with standard desktop headers and parses
+    its content using BeautifulSoup. Retries up to 3 times on network errors with a 1-second delay.
+
+    Handles network errors, non-200 HTTP status codes, and empty response bodies gracefully
+    by logging warnings and returning None if all retries fail.
+
+    :param url: The target web address to request and parse.
+    :param params: Optional dictionary of URL query parameters.
+    :param headers: Optional dictionary of HTTP request headers. If None, defaults to a modern
+                    desktop Chrome User-Agent header to avoid bot detection/403 blocks.
+    :param timeout: Maximum time in seconds to wait for the server response before timing out
+                    (defaults to 15 seconds).
+    :param session: Optional requests.Session instance to reuse connection pools / cookies.
+    :param parser: Parser library to use ('html.parser', 'lxml', 'xml', etc. Defaults to 'html.parser').
+    :param raise_for_status: If True, raises HTTPError for 4xx/5xx responses so @retry can catch them.
+    :param encoding: Optional explicit character encoding to decode response content.
+    :return: A parsed BeautifulSoup object if the request was successful and non-empty,
+             or None if all retry attempts failed or content was empty.
+    """
+    default_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    }
+    requester = session or requests
+    response = requester.get(url, params=params, headers=headers or default_headers, timeout=timeout)
+    if raise_for_status:
+        response.raise_for_status()
+    if not response.content:
+        return None
+    content = response.content.decode(encoding) if encoding else response.content
+    return BeautifulSoup(content, parser)
+
+
+def parse_html_table(
+    table: Optional[Union[BeautifulSoup, Tag]],
+    header_row: Optional[int] = 0,
+    uppercase_headers: bool = False,
+    header_transform: Optional[Callable[[str], str]] = None,
+    custom_headers: Optional[List[str]] = None,
+    strip_whitespace: bool = True,
+    cell_parser: Optional[Callable[[Tag], Any]] = None,
+    row_parser: Optional[Callable[[Tag], Optional[Union[Dict[str, Any], List[Any]]]]] = None,
+    skip_rows: int = 0,
+    column_rename: Optional[Dict[str, str]] = None,
+    context: Optional[Dict[str, Any]] = None,
+    drop_empty_rows: bool = True
+) -> pd.DataFrame:
+    """
+    Parses a BeautifulSoup <table> tag into a pandas DataFrame.
+    Highly configurable and pure-Python (no lxml or external C-libraries required).
+
+    :param table: BeautifulSoup Tag or soup element representing the <table> to parse.
+    :param header_row: 0-indexed row position for headers, or None for headerless tables.
+    :param uppercase_headers: If True, capitalizes all column header strings.
+    :param header_transform: Optional callable f(header_str) -> str to transform column headers.
+    :param custom_headers: Optional explicit list of column names to override extracted headers.
+    :param strip_whitespace: If True, strips leading/trailing whitespace from cell values.
+    :param cell_parser: Optional custom function f(cell_tag) -> Any to parse individual <td>/<th> cells.
+    :param row_parser: Optional custom function f(tr_tag) -> Optional[Union[Dict, List[Dict], List]]
+                       to parse entire rows. If it returns None, the row is omitted.
+    :param skip_rows: Number of body rows to skip at the top of the table.
+    :param column_rename: Optional mapping {old_col: new_col} to rename columns.
+    :param context: Optional dictionary of key-value pairs (e.g. {'TEAM': 'BOS'}) to inject
+                    into every row of the parsed DataFrame.
+    :param drop_empty_rows: If True, drops rows that contain only empty strings or nulls.
+    :return: A pandas DataFrame containing the parsed table data, or an empty DataFrame on failure.
+    """
+    if not table:
+        return pd.DataFrame()
+
+    parse_cell = cell_parser or (lambda el: el.get_text(strip=strip_whitespace))
+    all_trs = table.find_all('tr')
+    if not all_trs:
+        return pd.DataFrame()
+
+    # Separate thead / tfoot / tbody trs
+    thead = table.find('thead')
+    thead_trs = set(thead.find_all('tr')) if thead else set()
+    tfoot = table.find('tfoot')
+    tfoot_trs = set(tfoot.find_all('tr')) if tfoot else set()
+
+    # Determine body trs (exclude thead and tfoot)
+    body = table.find('tbody')
+    if body:
+        all_tbodies = table.find_all('tbody')
+        body_trs = []
+        for tb in all_tbodies:
+            body_trs.extend(tb.find_all('tr'))
+    else:
+        body_trs = [tr for tr in all_trs if tr not in thead_trs and tr not in tfoot_trs]
+
+    # If a custom row_parser is provided, let it parse each body row directly
+    if row_parser is not None:
+        custom_rows = []
+        for tr in body_trs[skip_rows:]:
+            parsed_row = row_parser(tr)
+            if parsed_row is None:
+                continue
+            if isinstance(parsed_row, list) and parsed_row and isinstance(parsed_row[0], dict):
+                custom_rows.extend(parsed_row)
+            else:
+                custom_rows.append(parsed_row)
+
+        if not custom_rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(custom_rows)
+        if context:
+            for k, v in context.items():
+                df[k] = v
+        if column_rename:
+            df.rename(columns=column_rename, inplace=True)
+        return df
+
+    headers = None
+    if custom_headers is not None:
+        headers = list(custom_headers)
+    elif header_row is not None:
+        if thead and thead.find_all('th'):
+            headers = [th.get_text(strip=strip_whitespace) for th in thead.find_all('th')]
+        elif thead and thead.find_all('td'):
+            headers = [td.get_text(strip=strip_whitespace) for td in thead.find_all('td')]
+        elif len(body_trs) > header_row:
+            first_row = body_trs[header_row]
+            header_cells = first_row.find_all('th') or first_row.find_all('td')
+            headers = [c.get_text(strip=strip_whitespace) for c in header_cells]
+            body_trs = body_trs[header_row + 1:]
+
+    if headers:
+        if uppercase_headers:
+            headers = [str(h).upper() for h in headers]
+        if header_transform is not None:
+            headers = [header_transform(str(h)) for h in headers]
+
+    rows = []
+    for tr in body_trs[skip_rows:]:
+        cells = [parse_cell(td) for td in tr.find_all(['td', 'th'])]
+        if cells:
+            if drop_empty_rows and all(str(c).strip() == '' or c is None for c in cells):
+                continue
+            rows.append(cells)
+
+    if not rows:
+        df = pd.DataFrame(columns=headers if headers else None)
+        if context:
+            for k, v in context.items():
+                df[k] = v
+        if column_rename:
+            df.rename(columns=column_rename, inplace=True)
+        return df
+
+    max_cols = max(len(r) for r in rows)
+    if headers:
+        if len(headers) < max_cols:
+            headers = headers + [f'col_{i}' for i in range(len(headers), max_cols)]
+        headers = headers[:max_cols]
+    else:
+        headers = [f'col_{i}' for i in range(max_cols)]
+
+    padded_rows = [r + [''] * (max_cols - len(r)) for r in rows]
+    df = pd.DataFrame(padded_rows, columns=headers)
+
+    if context:
+        for k, v in context.items():
+            df[k] = v
+    if column_rename:
+        df.rename(columns=column_rename, inplace=True)
+
+    return df
+
+
+def fetch_html_table(
+    url_or_soup: Union[str, BeautifulSoup, Tag],
+    table_selector: Optional[str] = None,
+    table_index: int = 0,
+    all_tables: bool = False,
+    concat_tables: bool = False,
+    table_context_parser: Optional[Callable[[Tag], Dict[str, Any]]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 15,
+    **parse_kwargs
+) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+    """
+    Fetches a webpage and parses its HTML <table> element(s) into pandas DataFrame(s).
+    Acts as a lightweight, zero-dependency, crash-free replacement for pd.read_html.
+
+    :param url_or_soup: Webpage URL string to fetch, or an existing BeautifulSoup/Tag instance.
+    :param table_selector: Optional CSS selector to target specific tables (e.g. 'table.datatable').
+    :param table_index: The 0-based index of the table to return when multiple tables match (default: 0).
+    :param all_tables: If True, returns a list of all parsed DataFrames (or one merged DataFrame
+                       if concat_tables=True).
+    :param concat_tables: If True, concatenates all matching tables into a single DataFrame.
+                          (automatically enables processing of all tables).
+    :param table_context_parser: Optional function f(table_tag) -> Dict to extract table metadata
+                                 (e.g. preceding team name or header) to inject into that table's rows.
+    :param headers: Optional HTTP headers dictionary to pass to requests.
+    :param params: Optional URL query parameters dictionary.
+    :param timeout: Network timeout in seconds (default: 15).
+    :param parse_kwargs: Optional keyword arguments forwarded directly to parse_html_table
+                         (e.g. uppercase_headers, header_transform, column_rename, cell_parser,
+                         row_parser, custom_headers, header_row, skip_rows, drop_empty_rows).
+    :return: A pandas DataFrame (or List[pd.DataFrame] if all_tables=True and concat_tables=False).
+    """
+    if isinstance(url_or_soup, (BeautifulSoup, Tag)):
+        soup = url_or_soup
+    else:
+        soup = fetch_soup(str(url_or_soup), params=params, headers=headers, timeout=timeout)
+
+    if not soup:
+        return [] if (all_tables and not concat_tables) else pd.DataFrame()
+
+    matched_tables = soup.select(table_selector) if table_selector else soup.find_all('table')
+    if not matched_tables:
+        return [] if (all_tables and not concat_tables) else pd.DataFrame()
+
+    if all_tables or concat_tables:
+        dfs = []
+        for t in matched_tables:
+            ctx = table_context_parser(t) if table_context_parser else None
+            parsed_df = parse_html_table(t, context=ctx, **parse_kwargs)
+            if not parsed_df.empty:
+                dfs.append(parsed_df)
+
+        if concat_tables:
+            return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        return dfs
+
+    if table_index >= len(matched_tables):
+        return pd.DataFrame()
+
+    target_table = matched_tables[table_index]
+    ctx = table_context_parser(target_table) if table_context_parser else None
+    return parse_html_table(target_table, context=ctx, **parse_kwargs)
 
 
 @retry(exceptions=(requests.exceptions.ReadTimeout, UnableToLoadWebsiteException), max_retries=3, delay_seconds=1)

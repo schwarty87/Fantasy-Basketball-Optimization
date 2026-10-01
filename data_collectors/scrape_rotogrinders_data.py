@@ -7,13 +7,12 @@ import bs4
 import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Union, Optional, Tuple
-from bs4 import BeautifulSoup
 from tqdm import tqdm
 from requests.exceptions import TooManyRedirects, ReadTimeout
 
 from constants import POSITION_TO_NUM, URLS, NUM_TO_POSITION, TEAM_NAME_TO_ID
 from enums import Sites
-from utils import get_current_date, load_schedule, retry, UnableToLoadWebsiteException, update_dir_name
+from utils import get_current_date, load_schedule, retry, UnableToLoadWebsiteException, update_dir_name, fetch_soup
 
 
 @retry(exceptions=(ReadTimeout, UnableToLoadWebsiteException, TooManyRedirects), max_retries=3, delay_seconds=1)
@@ -96,22 +95,17 @@ def parse_player_tag(player_tag: bs4.element.Tag) -> Dict[str, Any]:
     return add_dict
 
 
-@retry(exceptions=requests.exceptions.ConnectTimeout, max_retries=3, delay_seconds=5)
-def url_to_soup(url: str):
-    page = requests.get(url)
-    return BeautifulSoup(page.content, 'html.parser')
-
-
 def get_lineup_data_per_date_site(site: Sites, date: datetime.date) -> Optional[pd.DataFrame]:
     curr_url = URLS().lineups_rotogrinders(date=date, site=site)
     if date == get_current_date():
         curr_url = curr_url.replace(f"date={date}&", "")
-    page = requests.get(curr_url)
-    soup = BeautifulSoup(page.content, "html.parser")
+    soup = fetch_soup(curr_url)
+    if not soup:
+        return None
 
     games = soup.find_all(class_="module game-card")
     if len(games) == 0:
-        return
+        return None
     all_players_data = list()
     for game_id, game in enumerate(games):
         team_names = [shrt.text.strip() for shrt in game.find_all(class_="team-nameplate")]

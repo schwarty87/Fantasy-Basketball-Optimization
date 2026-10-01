@@ -1,14 +1,12 @@
 import os
 import datetime
-import io
 import numpy as np
 import pandas as pd
-import requests
 from requests.exceptions import TooManyRedirects, ReadTimeout, ConnectTimeout
 from typing import List, Optional, Union
 from constants import FIX_TEAM_NAMES
 from utils import (FixPlayerNames, retry, UnableToLoadWebsiteException, get_current_date, date_to_season_str,
-                   update_dir_name, get_header)
+                   update_dir_name, fetch_html_table)
 
 EJECTIONS_DF_COLUMNS = ["NAME", "TEAM", "DATE"]
 EMPTY_DF = pd.DataFrame(columns=EJECTIONS_DF_COLUMNS)
@@ -33,13 +31,14 @@ class Ejections:
            delay_seconds=1, return_on_fail=EMPTY_DF)
     def _load_ejections_spotrac(self) -> pd.DataFrame:
         url = f'https://www.spotrac.com/nba/fines-suspensions/_/year/{self.season}'
-        # ejections_df = pd.read_html(f'https://www.spotrac.com/nba/fines-suspensions/{self.season}/fines/ejection/')[0]
-        # ejections_df = pd.read_html(url)[0]
-        header = get_header()
-        response = requests.get(url, headers={k: v for k, v in header.items() if k in ('User-Agent',)})
-        ejections_df = pd.read_html(io.StringIO(response.text))[0]
-        ejections_df.dropna(subset=['Player', 'Team', 'Date'], how='any', inplace=True)
-        ejections_df.rename(columns={'Player': 'NAME', 'Team': 'TEAM', 'Date': 'DATE'}, inplace=True)
+        ejections_df = fetch_html_table(
+            url,
+            column_rename={'Player': 'NAME', 'Team': 'TEAM', 'Date': 'DATE'}
+        )
+        if ejections_df.empty or not all(c in ejections_df.columns for c in ['NAME', 'TEAM', 'DATE', 'Infraction']):
+            return EMPTY_DF
+
+        ejections_df.dropna(subset=['NAME', 'TEAM', 'DATE'], how='any', inplace=True)
         ejections_df = ejections_df.loc[ejections_df['Infraction'].str.lower().str.contains('eject')]
         ejections_df['NAME'] = self.fix_player_names.fix_names(ejections_df['NAME'])
         ejections_df['TEAM'] = ejections_df['TEAM'].replace(FIX_TEAM_NAMES)
@@ -51,7 +50,7 @@ class Ejections:
         curr_season_str = date_to_season_str(date=get_current_date())
         save_path = os.path.join(self.save_dir, f'{curr_season_str}.feather')
         if os.path.isfile(save_path):
-            modified_time = os.path.getctime(save_path)
+            modified_time = os.path.getmtime(save_path)
             modified_time = datetime.datetime.fromtimestamp(modified_time)
             modified_date = modified_time.date()
             if modified_date >= date - datetime.timedelta(days=1):
