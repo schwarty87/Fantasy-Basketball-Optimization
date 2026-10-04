@@ -15,7 +15,7 @@ from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
 from data_collectors.fantasy_data import LoadFantasyData
 from utils import (read_and_cache, fetch_soup, parse_html_table, fetch_html_table,
                    get_current_season, season_int_to_str, date_to_season_str, assert_valid_df_all,
-                   add_game_times_to_df, load_and_cache_players_list)
+                   add_game_times_to_df, load_and_cache_players_list, date_to_game_ids)
 from run_full_pipeline import RunFullPipeline
 
 
@@ -880,6 +880,90 @@ class TestDataCollectors(unittest.TestCase):
         loader._load_starters(schedule=schedule, date=datetime.date.today())
         self.assertTrue(loader.df.empty)
 
+    @patch("data_collectors.starters.requests.get")
+    def test_nbacom_starters_malformed_json(self, mock_get):
+        """Verify LoadStartersNBACOM handles invalid JSON gracefully."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"Not a JSON object"
+        mock_get.return_value = mock_resp
+
+        loader = LoadStartersNBACOM()
+        schedule = pd.DataFrame({"DATE": [datetime.date.today()], "GAME_ID": [100]})
+        loader._load_starters(schedule=schedule, date=datetime.date.today())
+        self.assertTrue(loader.df.empty)
+
+    @patch("data_collectors.starters.requests.get")
+    def test_nbacom_starters_happy_path(self, mock_get):
+        """Verify LoadStartersNBACOM parses valid JSON payload into starters DataFrame."""
+        payload = {
+            "games": [{
+                "gameId": "0022600100",
+                "homeTeam": {
+                    "teamAbbreviation": "BOS",
+                    "players": [
+                        {"personId": 1628369, "playerName": "Jayson Tatum", "position": "SF",
+                         "rosterStatus": "Active", "lineupStatus": "Confirmed"},
+                        {"personId": 1627759, "playerName": "Jaylen Brown", "position": "SG",
+                         "rosterStatus": "Active", "lineupStatus": "Confirmed"}
+                    ]
+                },
+                "awayTeam": {
+                    "teamAbbreviation": "MIA",
+                    "players": [
+                        {"personId": 1628389, "playerName": "Bam Adebayo", "position": "C",
+                         "rosterStatus": "Active", "lineupStatus": "Confirmed"}
+                    ]
+                }
+            }]
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps(payload).encode("utf-8")
+        mock_get.return_value = mock_resp
+
+        loader = LoadStartersNBACOM()
+        schedule = pd.DataFrame({"DATE": [datetime.date.today()], "GAME_ID": [22600100]})
+        loader._load_starters(schedule=schedule, date=datetime.date.today())
+
+        self.assertEqual(len(loader.df), 3)
+        self.assertIn("Jayson Tatum", loader.df["NAME"].values)
+        self.assertIn("Bam Adebayo", loader.df["NAME"].values)
+        self.assertTrue(loader.df["CONFIRMED"].all())
+
+    @patch("data_collectors.starters.fetch_soup")
+    def test_rotowire_starters_per_team_confirmation_and_filtering(self, mock_soup):
+        """Verify per-team confirmation status, out_players filtering, and non-starter rejection."""
+        html = """
+        <div class="lineup__box">
+            <!-- Box with missing team links should be skipped -->
+        </div>
+        <div class="lineup__box">
+            <div class="lineup__teams">
+                <a href="#">UTA</a>
+                <a href="#">DEN</a>
+            </div>
+            <ul class="lineup__list is-visit">
+                <li class="lineup__status is-confirmed">Confirmed Lineup</li>
+                <li class="lineup__player"><div class="lineup__pos">PG</div><a title="Keyonte George">K. George</a></li>
+                <li class="lineup__player"><div class="lineup__pos">UTIL</div><a title="Bench Player">B. Player</a></li>
+            </ul>
+            <ul class="lineup__list is-home">
+                <li class="lineup__status is-expected">Expected Lineup</li>
+                <li class="lineup__player"><div class="lineup__pos">PG</div><a title="Jamal Murray">J. Murray</a></li>
+            </ul>
+        </div>
+        """
+        mock_soup.return_value = BeautifulSoup(html, "html.parser")
+        loader = LoadStartersRotowire()
+        # Keyonte George is confirmed, so shouldn't be dropped even if in out_players.
+        # Jamal Murray is unconfirmed, so should be dropped when in out_players.
+        loader.run(out_players=["Keyonte George", "Jamal Murray"])
+
+        self.assertEqual(len(loader.df), 1)
+        self.assertEqual(loader.df.iloc[0]["NAME"], "Keyonte George")
+        self.assertTrue(loader.df.iloc[0]["CONFIRMED"])
+
     @patch("data_collectors.injuries.requests.get")
     def test_injuries_nbacom_graceful_error_handling(self, mock_get):
         """Verify Injuries._load_injuries_nbacom handles HTTP errors gracefully."""
@@ -891,6 +975,51 @@ class TestDataCollectors(unittest.TestCase):
         injuries = Injuries()
         res = injuries._load_injuries_nbacom(date=datetime.date.today())
         self.assertTrue(res.empty)
+
+    @patch("data_collectors.injuries.requests.get")
+    def test_injuries_nbacom_malformed_json(self, mock_get):
+        """Verify Injuries._load_injuries_nbacom handles malformed JSON gracefully."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"{invalid"
+        mock_get.return_value = mock_resp
+
+        injuries = Injuries()
+        res = injuries._load_injuries_nbacom(date=datetime.date.today())
+        self.assertTrue(res.empty)
+
+    @patch("data_collectors.injuries.date_to_game_ids", return_value=[22600100])
+    @patch("data_collectors.injuries.requests.get")
+    def test_injuries_nbacom_happy_path(self, mock_get, mock_gids):
+        """Verify Injuries._load_injuries_nbacom correctly maps inactive players to IS_OUT."""
+        payload = {
+            "games": [{
+                "gameId": "0022600100",
+                "homeTeam": {
+                    "teamAbbreviation": "BOS",
+                    "players": [
+                        {"personId": 1, "playerName": "Active Player", "position": "SF", "rosterStatus": "Active"},
+                        {"personId": 2, "playerName": "Inactive Player", "position": "PG", "rosterStatus": "Inactive"}
+                    ]
+                },
+                "awayTeam": {
+                    "teamAbbreviation": "MIA",
+                    "players": []
+                }
+            }]
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps(payload).encode("utf-8")
+        mock_get.return_value = mock_resp
+
+        injuries = Injuries()
+        res = injuries._load_injuries_nbacom(date=datetime.date.today())
+
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res.iloc[0]["NAME"], "Inactive Player")
+        self.assertTrue(res.iloc[0]["IS_OUT"])
+        self.assertFalse(res.iloc[0]["IS_QUESTIONABLE"])
 
 
 if __name__ == "__main__":

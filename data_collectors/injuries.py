@@ -149,7 +149,7 @@ class Injuries:
         df.rename(columns={'personId': 'PLAYER_ID', 'teamId': 'TEAM_ID', 'playerName': 'NAME',
                            'position': 'START_POSITION', 'TEAM_NAME': 'TEAM', 'rosterStatus': 'STATUS'},
                   inplace=True)
-        df.drop(columns=['firstName', 'lastName', 'timestamp'], inplace=True)
+        df.drop(columns=['firstName', 'lastName', 'timestamp'], errors='ignore', inplace=True)
 
         self._fix_names(df=df)
 

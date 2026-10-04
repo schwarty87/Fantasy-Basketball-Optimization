@@ -57,6 +57,10 @@ class LoadStartersAbstract(ABC):
         return self.df.reset_index(drop=True)
 
     def _postprocess(self, out_players: list[str] | None = None):
+        if self.df.empty:
+            self.df = EMPTY_DF.copy()
+            return
+
         if 'PLAYER_ID' not in self.df:
             self.df['PLAYER_ID'] = np.nan
 
@@ -113,7 +117,7 @@ class LoadStartersNBACOM(LoadStartersAbstract):
         df.rename(columns={"personId": "PLAYER_ID", "teamId": "TEAM_ID", "playerName": "NAME",
                            "position": "START_POSITION", "TEAM_NAME": "TEAM", "rosterStatus": "STATUS"},
                   inplace=True)
-        df.drop(columns=["firstName", "lastName", "timestamp"], inplace=True)
+        df.drop(columns=["firstName", "lastName", "timestamp"], errors='ignore', inplace=True)
         df = df.loc[df["START_POSITION"].notnull() & (df["START_POSITION"].str.len() > 0)]
         if date == get_current_date():
             df["CONFIRMED"] = df["lineupStatus"] == "Confirmed"
@@ -187,16 +191,18 @@ class LoadStartersRotowire(LoadStartersAbstract):
                 continue
             away_team, home_team = team_links[0], team_links[1]
 
-            is_confirmed = (
-                'is-confirmed' in b.get('class', []) or
-                bool(b.find(class_='is-confirmed')) or
-                'confirmed' in b.get_text(strip=True).lower()
-            )
+            box_confirmed = 'is-confirmed' in b.get('class', [])
 
-            # away starters
-            away_ul = b.find('ul', class_='is-visit')
-            if away_ul:
-                for li in away_ul.find_all('li', class_='lineup__player'):
+            for side_class, team in [('is-visit', away_team), ('is-home', home_team)]:
+                ul = b.find('ul', class_=side_class)
+                if not ul:
+                    continue
+                status_li = ul.find('li', class_='lineup__status')
+                team_confirmed = box_confirmed or (
+                    status_li and 'confirmed' in status_li.get_text(strip=True).lower()
+                ) or bool(ul.find(class_='is-confirmed'))
+
+                for li in ul.find_all('li', class_='lineup__player'):
                     pos_el = li.find(class_='lineup__pos')
                     a_el = li.find('a')
                     if pos_el and a_el:
@@ -205,26 +211,9 @@ class LoadStartersRotowire(LoadStartersAbstract):
                             name = a_el.get('title') or a_el.get_text(strip=True)
                             rows.append({
                                 'NAME': name,
-                                'TEAM': away_team,
+                                'TEAM': team,
                                 'START_POSITION': pos,
-                                'CONFIRMED': is_confirmed,
-                            })
-
-            # home starters
-            home_ul = b.find('ul', class_='is-home')
-            if home_ul:
-                for li in home_ul.find_all('li', class_='lineup__player'):
-                    pos_el = li.find(class_='lineup__pos')
-                    a_el = li.find('a')
-                    if pos_el and a_el:
-                        pos = pos_el.get_text(strip=True)
-                        if pos in START_POSITIONS:
-                            name = a_el.get('title') or a_el.get_text(strip=True)
-                            rows.append({
-                                'NAME': name,
-                                'TEAM': home_team,
-                                'START_POSITION': pos,
-                                'CONFIRMED': is_confirmed,
+                                'CONFIRMED': team_confirmed,
                             })
 
         if not rows:
