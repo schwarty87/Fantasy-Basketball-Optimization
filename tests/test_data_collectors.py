@@ -9,7 +9,8 @@ from data_collectors.injuries import Injuries, InjuriesSources
 from data_collectors.ejections import Ejections
 from data_collectors.starters import LoadStartersBasketballMonster
 from data_collectors.stats_loaders import StatsLoaderPlayers
-from utils import read_and_cache, fetch_soup, parse_html_table, fetch_html_table
+from utils import (read_and_cache, fetch_soup, parse_html_table, fetch_html_table,
+                   get_current_season, season_int_to_str, date_to_season_str, assert_valid_df_all)
 
 
 class TestDataCollectors(unittest.TestCase):
@@ -556,6 +557,90 @@ class TestDataCollectors(unittest.TestCase):
             headers=headers,
             timeout=25
         )
+
+    # -------------------------------------------------------------------------
+    # 12. Stage 2 - Dynamic Season Resolution, Defaults & Invariant Tests
+    # -------------------------------------------------------------------------
+    def test_get_current_season_boundary_dates(self):
+        """Verify NBA season resolution based on month/year boundaries."""
+        # October start of 2026-27 season
+        self.assertEqual(get_current_season(datetime.date(2026, 10, 1)), 2026)
+        self.assertEqual(get_current_season(datetime.date(2026, 12, 25)), 2026)
+        # Mid-season next calendar year
+        self.assertEqual(get_current_season(datetime.date(2027, 1, 15)), 2026)
+        self.assertEqual(get_current_season(datetime.date(2027, 4, 11)), 2026)
+        self.assertEqual(get_current_season(datetime.date(2027, 6, 20)), 2026)
+        # September before season begins belongs to previous season
+        self.assertEqual(get_current_season(datetime.date(2026, 9, 30)), 2025)
+        # String parsing support
+        self.assertEqual(get_current_season("2026-10-04"), 2026)
+        # Default with no arguments resolves to an integer >= 2026
+        self.assertGreaterEqual(get_current_season(), 2026)
+
+    def test_season_int_to_str_formatting(self):
+        """Verify season integer to formatted string conversion and defaults."""
+        self.assertEqual(season_int_to_str(2026), "2026-27")
+        self.assertEqual(season_int_to_str(2023), "2023-24")
+        self.assertEqual(season_int_to_str("2026-27"), "2026-27")
+        # None default should return string of current season
+        self.assertEqual(season_int_to_str(None), season_int_to_str(get_current_season()))
+        self.assertEqual(season_int_to_str(), season_int_to_str(get_current_season()))
+
+    def test_date_to_season_str_resolution(self):
+        """Verify date to season string conversion."""
+        self.assertEqual(date_to_season_str(datetime.date(2026, 10, 15)), "2026-27")
+        self.assertEqual(date_to_season_str(datetime.date(2027, 3, 1)), "2026-27")
+        self.assertEqual(date_to_season_str(datetime.date(2024, 2, 10)), "2023-24")
+        self.assertEqual(date_to_season_str(), season_int_to_str(get_current_season()))
+
+    @patch("data_collectors.stats_loaders.load_schedule")
+    def test_stats_loader_defaults_to_dynamic_season(self, mock_schedule):
+        """Verify StatsLoaderPlayers defaults to get_current_season() when season is None."""
+        mock_schedule.return_value = pd.DataFrame()
+        loader = StatsLoaderPlayers()
+        expected_season = get_current_season()
+        self.assertEqual(loader.season, expected_season)
+        self.assertEqual(loader.season_str, season_int_to_str(expected_season))
+
+    def test_ejections_defaults_to_dynamic_season(self):
+        """Verify Ejections defaults to get_current_season() when season is None."""
+        ejections = Ejections()
+        self.assertEqual(ejections.season, get_current_season())
+
+    def test_assert_valid_df_all_validates_completed_seasons(self):
+        """Verify assert_valid_df_all asserts 1230 games for all completed seasons."""
+        current_season = get_current_season()
+        completed_cutoff = current_season - 1
+
+        rows = []
+        for s in range(2018, current_season + 1):
+            if s == 2019:
+                n_games = 1059
+            elif s == 2020:
+                n_games = 1080
+            elif s == current_season:
+                n_games = 10  # Ongoing season has fewer games
+            else:
+                n_games = 1230
+
+            for g in range(n_games):
+                rows.append({
+                    "GAME_ID": s * 100000 + g,
+                    "DATE": datetime.date(s, 11, 1),
+                    "TEAM_ID": 1,
+                    "TEAM": "BOS",
+                    "SEASON_YEAR": s,
+                })
+        valid_df = pd.DataFrame(rows)
+
+        # Should pass without assertion errors
+        assert_valid_df_all(valid_df)
+
+        # Now simulate a completed season missing games (e.g. completed_cutoff having only 1200)
+        invalid_rows = [r for r in rows if not (r["SEASON_YEAR"] == completed_cutoff and r["GAME_ID"] >= completed_cutoff * 100000 + 1200)]
+        invalid_df = pd.DataFrame(invalid_rows)
+        with self.assertRaises(AssertionError):
+            assert_valid_df_all(invalid_df)
 
 
 if __name__ == "__main__":

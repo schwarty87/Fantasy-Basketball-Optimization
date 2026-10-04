@@ -9,7 +9,8 @@ from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
 from calc_features import CalcFeatures
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
 from utils import add_missing_points_columns_to_predictions, get_current_time, define_logger, load_schedule, \
-    get_current_date, load_and_cache_players_list, scrape_season_schedules, get_next_game_time, update_dir_name, DATA_DIR
+    get_current_date, load_and_cache_players_list, scrape_season_schedules, get_next_game_time, update_dir_name, DATA_DIR, \
+    get_current_season
 from submit_dfs_team import SubmitDFSTeamYahooByCSV
 from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM
 from enums import Browsers
@@ -20,7 +21,7 @@ from machine_learning.enums import DataSplitType
 
 
 class RunFullPipeline:
-    def __init__(self, load_params_from_model_id: int, season: int = 2025,
+    def __init__(self, load_params_from_model_id: int, season: Optional[int] = None,
                  run_date: Union[datetime.date, str] = get_current_date(),
                  headless: bool = True, minutes_before_game_to_run: int = 10,
                  params_update_dict: Optional[Dict] = None, run_immediately: bool = False):
@@ -38,7 +39,7 @@ class RunFullPipeline:
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
                       filename=os.path.join(DATA_DIR, 'logs', f"logs_{get_current_date()}.txt"), print_to_console=True, filemode='a')
 
-        self.season = season
+        self.season = season or get_current_season()
         self.headless = headless
         self.minutes_before_game_to_run = minutes_before_game_to_run
         self._run_immediately = run_immediately
@@ -51,8 +52,8 @@ class RunFullPipeline:
             self._model_params_update_dict['training'] = dict()
         self._model_params_update_dict['training']['run_extra_callbacks'] = False
 
-        self.stats_loaders_players = StatsLoaderPlayers(season=season)
-        self.stats_loaders_teams = StatsLoaderTeams(season=season)
+        self.stats_loaders_players = StatsLoaderPlayers(season=self.season)
+        self.stats_loaders_teams = StatsLoaderTeams(season=self.season)
         self.calc_features = CalcFeatures()
 
         self.train_nn = None

@@ -63,7 +63,7 @@ class LoadFantasyData:
                 rotogrinders_df = \
                     rotogrinders_df.merge(extra_data_df[['TEAM']], how='left', left_index=True, right_index=True)
             else:
-                players_df = load_and_cache_players_list(season=2025)
+                players_df = load_and_cache_players_list()
                 rotogrinders_df = rotogrinders_df.merge(players_df[['TEAM_ABBREVIATION', 'NAME']], on='NAME', how='left').rename(columns={'TEAM_ABBREVIATION': 'TEAM'})
         self._fix_names(rotogrinders_df)
         self._convert_salary_cols_to_num(rotogrinders_df)

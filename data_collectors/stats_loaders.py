@@ -13,7 +13,7 @@ from constants import URLS, SCORING, TEAM_NAME_TO_ID, TEAM_ID_TO_NAME
 from enums import StatsTypes, BoxscoreTypes, Sites
 from utils import downcast_df, load_and_cache_players_list, season_int_to_str, load_nbacom_data, read_and_cache, \
     get_latest_date_with_data, assert_valid_df_all, assert_valid_df_players, load_schedule, get_current_time, \
-    get_current_date, FixPlayerNames, get_header, update_dir_name
+    get_current_date, FixPlayerNames, get_header, update_dir_name, get_current_season
 
 FILL_ZEROS_COLS = ['MIN', 'FGM', 'FGA', '3PM', '3PA', 'FTM', 'FTA', 'OREB', 'DREB', 'REB', 'AST', 'TOV', 'STL',
                    'BLK', 'BLKA', 'PF', 'PFD', 'PTS', 'PLUS_MINUS', 'FG_PCT', '3P_PCT', 'FT_PCT']
@@ -37,12 +37,12 @@ class StatsLoader:
                             'TD3': 'TRIPLE_DOUBLE'}
     SORT_COLS = []
 
-    def __init__(self, season: int = 2023, **kwargs):
+    def __init__(self, season: Optional[int] = None, **kwargs):
         """
-        :param season:the season to collect stats for (2022 will collect stats for the 2022-23 season)
+        :param season: the season to collect stats for (e.g. 2026 for 2026-27, defaults to current season)
         """
-        self.season = season
-        self.season_str = season_int_to_str(season)
+        self.season = season or get_current_season()
+        self.season_str = season_int_to_str(self.season)
 
         self._stats_dir = update_dir_name('stats')
         self.filepath = os.path.join(self._stats_dir, f'{self.LOADER_TYPE.name}_boxscores.feather')
@@ -180,9 +180,9 @@ class StatsLoaderPlayers(StatsLoader):
     SORT_COLS = ['DATE', 'GAME_ID', 'TEAM_ID', 'PLAYER_ID']
     MERGE_ON = ['GAME_ID', 'TEAM_ID', 'PLAYER_ID']
 
-    def __init__(self, season: Optional[int] = 2025, out_players: Optional[Dict] = None, **kwargs):
+    def __init__(self, season: Optional[int] = None, out_players: Optional[Dict] = None, **kwargs):
         """
-        :param season: the season we're loading data for (for example if season==2022, then we're working on 2022-23)
+        :param season: the season we're loading data for (defaults to current season)
         :param out_players: a dict of players that are out today and their replacements in the starting lineup.
                             used when scraping data from rotogrinders
         """

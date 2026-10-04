@@ -69,8 +69,23 @@ def retry(exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exce
     return decorator_retry
 
 
-def season_int_to_str(season: Optional[int] = 2022) -> str:
-    return f'{season}-{str(season+1)[-2:]}' if season is not None else ''
+def get_current_season(date: Optional[Union[datetime.date, datetime.datetime, str, pd.Timestamp]] = None) -> int:
+    """Returns the NBA season starting year (e.g. Oct 2026 -> 2026 for 2026-27 season)."""
+    if date is None:
+        d = get_current_date()
+    elif isinstance(date, str):
+        d = pd.to_datetime(date).date()
+    else:
+        d = date
+    return d.year if d.month >= 10 else d.year - 1
+
+
+def season_int_to_str(season: Optional[Union[int, str]] = None) -> str:
+    if season is None:
+        season = get_current_season()
+    elif isinstance(season, str):
+        return season
+    return f'{season}-{str(season+1)[-2:]}'
 
 
 def downcast_df(df: pd.DataFrame, df_name: Optional[str] = None, print_usage: bool = True, rtol: float = 1e-6,
@@ -125,7 +140,9 @@ def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[st
     return df
 
 
-def load_and_cache_players_list(print_usage: bool = True, season: int = 2025):
+def load_and_cache_players_list(print_usage: bool = True, season: Optional[int] = None):
+    if season is None:
+        season = get_current_season()
     cached_data_dir = update_dir_name('cached_data')
     cache_path = os.path.join(cached_data_dir, 'players_list.feather')
     if (os.path.isfile(cache_path) and
@@ -548,7 +565,8 @@ def assert_valid_df_all(df: pd.DataFrame, allow_less_games_2014: bool = False):
 
     # there are 1230 total games in every regular season
     games_per_year = df.groupby('SEASON_YEAR')['GAME_ID'].nunique()
-    games_per_year = games_per_year.loc[games_per_year.index <= 2022]
+    completed_season_cutoff = get_current_season() - 1
+    games_per_year = games_per_year.loc[games_per_year.index <= completed_season_cutoff]
     if 2019 in games_per_year.index:
         assert games_per_year.loc[2019] == 1059, '2020 doesnt have the correct amount of games!!!'
         games_per_year.drop(index=2019, inplace=True)
@@ -822,11 +840,8 @@ class FixPlayerNames:
         return converted_names
 
 
-def date_to_season_str(date: datetime.date = get_current_date()) -> str:
-    year = date.year
-    month = date.month
-    season = year if month >= 10 else year - 1
-    return season_int_to_str(season)
+def date_to_season_str(date: Optional[Union[datetime.date, datetime.datetime, str, pd.Timestamp]] = None) -> str:
+    return season_int_to_str(get_current_season(date))
 
 
 def date_to_game_ids(date: datetime.date = get_current_date()) -> np.ndarray:

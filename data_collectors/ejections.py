@@ -5,8 +5,8 @@ import pandas as pd
 from requests.exceptions import TooManyRedirects, ReadTimeout, ConnectTimeout
 from typing import List, Optional, Union
 from constants import FIX_TEAM_NAMES
-from utils import (FixPlayerNames, retry, UnableToLoadWebsiteException, get_current_date, date_to_season_str,
-                   update_dir_name, fetch_html_table)
+from utils import (FixPlayerNames, retry, UnableToLoadWebsiteException, get_current_date, get_current_season,
+                   season_int_to_str, update_dir_name, fetch_html_table)
 
 EJECTIONS_DF_COLUMNS = ["NAME", "TEAM", "DATE"]
 EMPTY_DF = pd.DataFrame(columns=EJECTIONS_DF_COLUMNS)
@@ -14,11 +14,11 @@ EMPTY_DF = pd.DataFrame(columns=EJECTIONS_DF_COLUMNS)
 
 class Ejections:
     def __init__(self, nbacom_players_list: Optional[Union[List[str], pd.Series, np.ndarray, pd.DataFrame]] = None,
-                 season: int = 2025):
+                 season: Optional[int] = None):
         if isinstance(nbacom_players_list, pd.DataFrame):
             nbacom_players_list = nbacom_players_list["NAME"].values
         self.fix_player_names = FixPlayerNames(compare_names=nbacom_players_list)
-        self.season = season
+        self.season = season or get_current_season()
 
         self.df = EMPTY_DF
 
@@ -47,7 +47,7 @@ class Ejections:
 
     def collect_data(self) -> pd.DataFrame:
         date = get_current_date()
-        curr_season_str = date_to_season_str(date=get_current_date())
+        curr_season_str = season_int_to_str(self.season)
         save_path = os.path.join(self.save_dir, f'{curr_season_str}.feather')
         if os.path.isfile(save_path):
             modified_time = os.path.getmtime(save_path)
