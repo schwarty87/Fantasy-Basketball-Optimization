@@ -759,17 +759,18 @@ def load_schedule(schedules_dir: str = 'season_schedules', drop_ppd: bool = True
     return schedule
 
 
-def add_game_times_to_df(df: pd.DataFrame) -> pd.DataFrame:
-    schedules = load_schedule()
-    df = df.merge(schedules, how='left', left_on=['GAME_ID', 'TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID_HOME'])
-    df = df.merge(schedules, how='left', left_on=['GAME_ID', 'TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID_AWAY'])
-    df['GAME_DATE_TIME'] = df['GAME_DATE_TIME_x'].fillna(df['GAME_DATE_TIME_y'])
-
-    drop_cols = [c + suff for c in schedules for suff in ('_x', '_y') if c + suff in df]
-    df.drop(columns=drop_cols, inplace=True)
-
+def add_game_times_to_df(df: pd.DataFrame, schedule: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Enriches a DataFrame containing GAME_ID with the exact game start time (GAME_DATE_TIME).
+    Can optionally accept a preloaded schedule DataFrame to avoid redundant disk I/O.
+    """
+    if schedule is None:
+        schedule = load_schedule(drop_ppd=False)
+    game_times = schedule[['GAME_ID', 'GAME_DATE_TIME']].drop_duplicates('GAME_ID')
+    if 'GAME_DATE_TIME' in df.columns:
+        df = df.drop(columns=['GAME_DATE_TIME'])
+    df = df.merge(game_times, on='GAME_ID', how='left')
     assert not df['GAME_DATE_TIME'].isnull().any(), 'missing game times!!!!'
-
     return df
 
 

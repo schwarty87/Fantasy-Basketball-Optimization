@@ -9,7 +9,7 @@ from calc_features import CalcFeatures
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
 from utils import add_missing_points_columns_to_predictions, get_current_time, define_logger, load_schedule, \
     get_current_date, load_and_cache_players_list, scrape_season_schedules, get_next_game_time, update_dir_name, DATA_DIR, \
-    get_current_season
+    get_current_season, add_game_times_to_df
 from submit_dfs_team import SubmitDFSTeamYahooByCSV
 from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM
 from enums import Browsers
@@ -91,16 +91,21 @@ class RunFullPipeline:
 
     @staticmethod
     def _wait_until_certain_time(wait_until: datetime.datetime):
-        wait_seconds = (wait_until - get_current_time()).total_seconds()
+        current_time = get_current_time()
+        if wait_until.tzinfo is None and current_time.tzinfo is not None:
+            wait_until = wait_until.replace(tzinfo=current_time.tzinfo)
+        elif wait_until.tzinfo is not None and current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=wait_until.tzinfo)
+        wait_seconds = (wait_until - current_time).total_seconds()
         if wait_seconds > 0:
             logging.info(f'sleeping until {wait_until}')
             time.sleep(wait_seconds)
 
-    @staticmethod
-    def _todays_model_already_trained() -> bool:
+    def _todays_model_already_trained(self, date: datetime.date | str | None = None) -> bool:
+        target_date = date or self._run_date
         todays_model_dir = os.path.join(
             DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
-            'model_' + str(get_current_date()).replace('-', '_')
+            f'model_{str(target_date).replace("-", "_")}'
         )
         if not os.path.isdir(todays_model_dir):
             return False
@@ -112,20 +117,8 @@ class RunFullPipeline:
         return self._run_date in self.dates_to_game_times.keys()
 
     @staticmethod
-    def _add_game_times_to_df(df: pd.DataFrame) -> pd.DataFrame:
-        schedules_dir = update_dir_name('season_schedules')
-        schedule_names = sorted(os.listdir(schedules_dir))
-        schedules = pd.concat([pd.read_feather(os.path.join(schedules_dir, s)) for s in schedule_names], axis=0)
-        df = df.merge(schedules, how='left', left_on=['GAME_ID', 'TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID_HOME'])
-        df = df.merge(schedules, how='left', left_on=['GAME_ID', 'TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID_AWAY'])
-        df['GAME_DATE_TIME'] = df['GAME_DATE_TIME_x'].fillna(df['GAME_DATE_TIME_y'])
-
-        drop_cols = [c + suff for c in schedules for suff in ('_x', '_y') if c + suff in df]
-        df.drop(columns=drop_cols, inplace=True)
-
-        assert not df['GAME_DATE_TIME'].isnull().any(), 'missing game times!!!!'
-
-        return df
+    def _add_game_times_to_df(df: pd.DataFrame, schedule: pd.DataFrame | None = None) -> pd.DataFrame:
+        return add_game_times_to_df(df, schedule=schedule)
 
     def _get_todays_predictions(self, teams_template: pd.DataFrame | None = None) -> pd.DataFrame:
         metrics_params = self.train_nn._change_metrics_params_tuple_to_per_sample(self.train_nn.params.training_params.metrics_params)
@@ -344,7 +337,7 @@ class RunFullPipeline:
                 #     continue
 
     @staticmethod
-    def _get_game_times_by_day_dict() -> Dict:
+    def _get_game_times_by_day_dict() -> dict:
         schedule = load_schedule(drop_ppd=True)
         game_times_by_day = schedule.groupby('DATE')['GAME_DATE_TIME'].unique().to_dict()
         return game_times_by_day

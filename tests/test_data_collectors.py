@@ -1,8 +1,10 @@
+import os
 import datetime
 import json
 import unittest
 from unittest.mock import MagicMock, patch
 import pandas as pd
+from constants import DATA_DIR
 
 from bs4 import BeautifulSoup
 from data_collectors.injuries import Injuries, InjuriesSources
@@ -10,7 +12,9 @@ from data_collectors.ejections import Ejections
 from data_collectors.starters import LoadStartersBasketballMonster
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from utils import (read_and_cache, fetch_soup, parse_html_table, fetch_html_table,
-                   get_current_season, season_int_to_str, date_to_season_str, assert_valid_df_all)
+                   get_current_season, season_int_to_str, date_to_season_str, assert_valid_df_all,
+                   add_game_times_to_df)
+from run_full_pipeline import RunFullPipeline
 
 
 class TestDataCollectors(unittest.TestCase):
@@ -641,6 +645,80 @@ class TestDataCollectors(unittest.TestCase):
         invalid_df = pd.DataFrame(invalid_rows)
         with self.assertRaises(AssertionError):
             assert_valid_df_all(invalid_df)
+
+    # -------------------------------------------------------------------------
+    # 13. Pipeline & Game Times Optimization Tests
+    # -------------------------------------------------------------------------
+    def test_add_game_times_to_df_clean_merge(self):
+        """Verify add_game_times_to_df merges GAME_DATE_TIME cleanly on GAME_ID."""
+        mock_schedule = pd.DataFrame({
+            "GAME_ID": [1001, 1002],
+            "GAME_DATE_TIME": [
+                pd.Timestamp("2026-10-25 19:30:00-0400"),
+                pd.Timestamp("2026-10-25 22:00:00-0400")
+            ],
+            "TEAM_ID": [1, 2]
+        })
+        input_df = pd.DataFrame({
+            "PLAYER_ID": [101, 102],
+            "GAME_ID": [1001, 1002],
+            "TEAM_ID": [1, 2],
+            "NAME": ["Player A", "Player B"]
+        })
+
+        result_df = add_game_times_to_df(input_df, schedule=mock_schedule)
+        self.assertIn("GAME_DATE_TIME", result_df.columns)
+        self.assertEqual(len(result_df), 2)
+        self.assertEqual(result_df.iloc[0]["GAME_DATE_TIME"], pd.Timestamp("2026-10-25 19:30:00-0400"))
+        # Verify static wrapper on RunFullPipeline produces exact same result
+        wrapper_df = RunFullPipeline._add_game_times_to_df(input_df, schedule=mock_schedule)
+        self.assertTrue(result_df.equals(wrapper_df))
+
+    def test_add_game_times_to_df_missing_game_raises_assertion(self):
+        """Verify add_game_times_to_df asserts when a GAME_ID is not found in schedule."""
+        mock_schedule = pd.DataFrame({
+            "GAME_ID": [1001],
+            "GAME_DATE_TIME": [pd.Timestamp("2026-10-25 19:30:00-0400")],
+        })
+        input_df = pd.DataFrame({
+            "GAME_ID": [1001, 9999],  # 9999 not in schedule
+        })
+        with self.assertRaises(AssertionError):
+            add_game_times_to_df(input_df, schedule=mock_schedule)
+
+    @patch("run_full_pipeline.time.sleep")
+    def test_wait_until_certain_time_handles_naive_and_aware(self, mock_sleep):
+        """Verify _wait_until_certain_time handles both tz-naive and tz-aware datetimes without crashing."""
+        from constants import NY_TZ
+        future_aware = datetime.datetime.now(tz=NY_TZ) + datetime.timedelta(seconds=5)
+        future_naive = datetime.datetime.now() + datetime.timedelta(seconds=5)
+
+        # Neither should raise TypeError: can't subtract offset-naive and offset-aware datetimes
+        RunFullPipeline._wait_until_certain_time(future_aware)
+        self.assertTrue(mock_sleep.called)
+
+        mock_sleep.reset_mock()
+        RunFullPipeline._wait_until_certain_time(future_naive)
+        self.assertTrue(mock_sleep.called)
+
+    @patch("run_full_pipeline.os.path.isdir")
+    @patch("run_full_pipeline.os.path.isfile")
+    def test_todays_model_already_trained_respects_custom_run_date(self, mock_isfile, mock_isdir):
+        """Verify _todays_model_already_trained respects self._run_date and custom date argument."""
+        pipeline = MagicMock(spec=RunFullPipeline)
+        pipeline._run_date = datetime.date(2026, 11, 15)
+        mock_isdir.return_value = True
+        mock_isfile.return_value = True
+
+        # Call the actual unbound method with our mock instance
+        is_trained = RunFullPipeline._todays_model_already_trained(pipeline)
+        self.assertTrue(is_trained)
+        mock_isdir.assert_called_with(
+            os.path.join(
+                DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
+                'model_2026_11_15'
+            )
+        )
 
 
 if __name__ == "__main__":
