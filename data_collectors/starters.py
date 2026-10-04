@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 from abc import ABC, abstractmethod
 from requests.exceptions import TooManyRedirects, ReadTimeout, ConnectTimeout
-from typing import List, Optional, Union, Type, Dict
 from constants import URLS, FIX_TEAM_NAMES, NUM_TO_POSITION, TEAM_ID_TO_NAME, START_POSITIONS, UNKNOWN_PLAYER_ID
 from enums import Sites
 from utils import FixPlayerNames, retry, get_header, UnableToLoadWebsiteException, load_schedule, get_current_date, \
@@ -23,7 +22,7 @@ START_POSITIONS_SET = set(START_POSITIONS)
 
 
 class LoadStartersAbstract(ABC):
-    def __init__(self, fix_player_names_instance: Optional[FixPlayerNames] = None):
+    def __init__(self, fix_player_names_instance: FixPlayerNames | None = None):
         self.fix_player_names = fix_player_names_instance or FixPlayerNames()
         self.df = EMPTY_DF
     
@@ -43,7 +42,7 @@ class LoadStartersAbstract(ABC):
             self.df["OPPONENT"] = self.df["OPPONENT"].replace(FIX_TEAM_NAMES)
         self.df["NAME"] = self.fix_player_names.fix_names(self.df["NAME"])
 
-    def _filter_df(self, out_players: Optional[List[str]] = None) -> pd.DataFrame:
+    def _filter_df(self, out_players: list[str] | None = None) -> pd.DataFrame:
         self.df = self.df.loc[self.df["START_POSITION"].notnull() & (self.df["START_POSITION"].str.len() > 0)]
         self.df.drop_duplicates(["NAME", "TEAM"], keep="first", inplace=True)
         self.df.drop_duplicates(["TEAM", "START_POSITION"], keep="first", inplace=True)
@@ -57,17 +56,17 @@ class LoadStartersAbstract(ABC):
                 self.df = self.df.loc[~drop].reset_index(drop=True)
         return self.df.reset_index(drop=True)
 
-    def _postprocess(self, out_players: List[str]):
+    def _postprocess(self, out_players: list[str] | None = None):
         if 'PLAYER_ID' not in self.df:
             self.df['PLAYER_ID'] = np.nan
 
         if not set(STARTER_DF_COLUMNS).issubset(set(self.df.columns)):
-            raise ValueError(f"the starters df returned from {self.__name__} has to have all of the following columns: "
+            raise ValueError(f"the starters df returned from {type(self).__name__} has to have all of the following columns: "
                              f"{STARTER_DF_COLUMNS}")
         self._fix_names()
         self._filter_df(out_players=out_players)
 
-    def run(self, date: datetime.date = get_current_date(), out_players: Optional[List[str]] = None, **kwargs):
+    def run(self, date: datetime.date = get_current_date(), out_players: list[str] | None = None, **kwargs):
         self._load_starters(date=date, **kwargs)
         self._postprocess(out_players=out_players)
 
@@ -80,11 +79,21 @@ class LoadStartersNBACOM(LoadStartersAbstract):
 
         url = URLS().games_lineups_nbacom(str(date))
         headers = get_header()
-        html = requests.get(url, headers=headers, timeout=30).content
-        if len(html) == 0:
-            raise UnableToLoadWebsiteException(site=url)
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code != 200 or len(resp.content) == 0:
+                self.df = EMPTY_DF
+                return
+            data_dict = json.loads(resp.content).get("games", [])
+        except Exception as e:
+            logging.warning(f"Error fetching NBA lineups from {url}: {e}")
+            self.df = EMPTY_DF
+            return
 
-        data_dict = json.loads(html)["games"]
+        if not data_dict:
+            self.df = EMPTY_DF
+            return
+
         dfs = list()
         for curr_dict in data_dict:
             home_dict = curr_dict["homeTeam"]
@@ -152,14 +161,80 @@ class LoadStartersRotogrinders(LoadStartersAbstract):
 
 
 class LoadStartersRotowire(LoadStartersAbstract):
+    ROTOWIRE_LINEUPS_URL = 'https://www.rotowire.com/basketball/nba-lineups.php'
+
+    @retry(exceptions=(ReadTimeout, UnableToLoadWebsiteException, TooManyRedirects, ConnectTimeout), max_retries=3,
+           delay_seconds=1, return_on_fail=EMPTY_DF)
     def _load_starters(self, date: datetime.date = get_current_date(), **kwargs):
-        # TODO fill this!
-        self.df = EMPTY_DF
+        if date != get_current_date():
+            return EMPTY_DF
+
+        soup = fetch_soup(self.ROTOWIRE_LINEUPS_URL)
+        if not soup:
+            return EMPTY_DF
+
+        boxes = soup.find_all('div', class_='lineup__box')
+        if not boxes:
+            return EMPTY_DF
+
+        rows = []
+        for b in boxes:
+            teams_div = b.find('div', class_='lineup__teams')
+            if not teams_div:
+                continue
+            team_links = [a.get_text(strip=True) for a in teams_div.find_all('a') if len(a.get_text(strip=True)) == 3]
+            if len(team_links) < 2:
+                continue
+            away_team, home_team = team_links[0], team_links[1]
+
+            is_confirmed = (
+                'is-confirmed' in b.get('class', []) or
+                bool(b.find(class_='is-confirmed')) or
+                'confirmed' in b.get_text(strip=True).lower()
+            )
+
+            # away starters
+            away_ul = b.find('ul', class_='is-visit')
+            if away_ul:
+                for li in away_ul.find_all('li', class_='lineup__player'):
+                    pos_el = li.find(class_='lineup__pos')
+                    a_el = li.find('a')
+                    if pos_el and a_el:
+                        pos = pos_el.get_text(strip=True)
+                        if pos in START_POSITIONS:
+                            name = a_el.get('title') or a_el.get_text(strip=True)
+                            rows.append({
+                                'NAME': name,
+                                'TEAM': away_team,
+                                'START_POSITION': pos,
+                                'CONFIRMED': is_confirmed,
+                            })
+
+            # home starters
+            home_ul = b.find('ul', class_='is-home')
+            if home_ul:
+                for li in home_ul.find_all('li', class_='lineup__player'):
+                    pos_el = li.find(class_='lineup__pos')
+                    a_el = li.find('a')
+                    if pos_el and a_el:
+                        pos = pos_el.get_text(strip=True)
+                        if pos in START_POSITIONS:
+                            name = a_el.get('title') or a_el.get_text(strip=True)
+                            rows.append({
+                                'NAME': name,
+                                'TEAM': home_team,
+                                'START_POSITION': pos,
+                                'CONFIRMED': is_confirmed,
+                            })
+
+        if not rows:
+            return EMPTY_DF
+
+        self.df = pd.DataFrame(rows)
 
 
 class LoadStartersLineupsDotCom(LoadStartersAbstract):
     def _load_starters(self, date: datetime.date = get_current_date(), **kwargs):
-        # TODO fill this!
         self.df = EMPTY_DF
 
 
@@ -213,8 +288,8 @@ class Starters:
     Each loading class loads the starters data from a given site, and returns a df with the starters data. We then
     combine all the data and return the combined results
     """
-    def __init__(self, nbacom_players_list: Optional[Union[List[str], pd.Series, np.ndarray, pd.DataFrame]] = None,
-                 player_name_to_id: Optional[Dict[str, int]] = None):
+    def __init__(self, nbacom_players_list: list[str] | pd.Series | np.ndarray | pd.DataFrame | None = None,
+                 player_name_to_id: dict[str, int] | None = None):
         if isinstance(nbacom_players_list, pd.DataFrame):
             nbacom_players_list = nbacom_players_list["NAME"].values
 
@@ -231,12 +306,12 @@ class Starters:
             os.mkdir(self.save_dir)
 
     @staticmethod
-    def all_load_classes() -> List[Type[LoadStartersAbstract]]:
+    def all_load_classes() -> list[type[LoadStartersAbstract]]:
         return [LoadStartersNBACOM, LoadStartersBasketballMonster, LoadStartersRotogrinders, LoadStartersRotowire,
                 LoadStartersLineupsDotCom]
 
     @staticmethod
-    def _is_finished(df: pd.DataFrame, todays_teams: List[str]) -> bool:
+    def _is_finished(df: pd.DataFrame, todays_teams: list[str] | np.ndarray) -> bool:
         has_all_positions = df.groupby('TEAM')['START_POSITION'].apply(set) == START_POSITIONS_SET
         has_five_starters_teams = has_all_positions.loc[has_all_positions].index.to_list()
         is_finished = (set(todays_teams) == set(has_five_starters_teams))
@@ -277,7 +352,7 @@ class Starters:
                            axis=0)
         return df.reset_index(drop=True)
 
-    def _fill_missing_starters(self, df: pd.DataFrame, salaries_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    def _fill_missing_starters(self, df: pd.DataFrame, salaries_df: pd.DataFrame | None) -> pd.DataFrame:
         if salaries_df is None:
             return df
         if 'IS_OUT' in salaries_df.columns:
@@ -306,8 +381,8 @@ class Starters:
                 logging.info(f'filling missing starter for team {team}, position {p} with {replace_name}')
         return pd.concat([df, pd.DataFrame(add_rows)])
 
-    def collect_data(self, date: datetime.date = get_current_date(), out_players: Optional[List[str]] = None,
-                     salaries_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    def collect_data(self, date: datetime.date = get_current_date(), out_players: list[str] | None = None,
+                     salaries_df: pd.DataFrame | None = None) -> pd.DataFrame:
         """
         Load starters data from the various websites for a given date.
         :param date: The date we want to collect the starters data for

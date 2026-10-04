@@ -10,7 +10,7 @@ from constants import DATA_DIR
 from bs4 import BeautifulSoup
 from data_collectors.injuries import Injuries, InjuriesSources
 from data_collectors.ejections import Ejections
-from data_collectors.starters import LoadStartersBasketballMonster
+from data_collectors.starters import LoadStartersBasketballMonster, LoadStartersRotowire, LoadStartersNBACOM
 from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
 from data_collectors.fantasy_data import LoadFantasyData
 from utils import (read_and_cache, fetch_soup, parse_html_table, fetch_html_table,
@@ -812,6 +812,85 @@ class TestDataCollectors(unittest.TestCase):
         self.assertIn(datetime.date(2026, 10, 25), result)
         self.assertEqual(len(result[datetime.date(2026, 10, 25)]), 2)
         self.assertEqual(len(result[datetime.date(2026, 10, 26)]), 1)
+
+    @patch("data_collectors.starters.fetch_soup")
+    def test_rotowire_starters_parser(self, mock_soup):
+        """Verify LoadStartersRotowire correctly parses lineup boxes, positions, names, and confirmation."""
+        html = """
+        <div class="lineup__box is-confirmed">
+            <div class="lineup__teams">
+                <a href="#">UTA</a>
+                <a href="#">DEN</a>
+            </div>
+            <ul class="lineup__list is-visit">
+                <li class="lineup__player"><div class="lineup__pos">PG</div><a title="Keyonte George">K. George</a></li>
+                <li class="lineup__player"><div class="lineup__pos">SG</div><a title="Darryn Peterson">D. Peterson</a></li>
+                <li class="lineup__player"><div class="lineup__pos">SF</div><a title="Lauri Markkanen">L. Markkanen</a></li>
+                <li class="lineup__player"><div class="lineup__pos">PF</div><a title="Jaren Jackson">J. Jackson</a></li>
+                <li class="lineup__player"><div class="lineup__pos">C</div><a title="Jusuf Nurkic">J. Nurkic</a></li>
+            </ul>
+            <ul class="lineup__list is-home">
+                <li class="lineup__player"><div class="lineup__pos">PG</div><a title="Jamal Murray">J. Murray</a></li>
+                <li class="lineup__player"><div class="lineup__pos">SG</div><a title="Christian Braun">C. Braun</a></li>
+                <li class="lineup__player"><div class="lineup__pos">SF</div><a title="Cameron Johnson">C. Johnson</a></li>
+                <li class="lineup__player"><div class="lineup__pos">PF</div><a title="Aaron Gordon">A. Gordon</a></li>
+                <li class="lineup__player"><div class="lineup__pos">C</div><a title="Nikola Jokic">N. Jokic</a></li>
+            </ul>
+        </div>
+        """
+        mock_soup.return_value = BeautifulSoup(html, "html.parser")
+        loader = LoadStartersRotowire()
+        loader.run()
+
+        self.assertEqual(len(loader.df), 10)
+        self.assertTrue(loader.df["CONFIRMED"].all())
+        uta_starters = loader.df.query('TEAM == "UTA"')
+        self.assertEqual(len(uta_starters), 5)
+        self.assertEqual(set(uta_starters["START_POSITION"]), {"PG", "SG", "SF", "PF", "C"})
+        self.assertIn("Keyonte George", uta_starters["NAME"].values)
+
+        den_starters = loader.df.query('TEAM == "DEN"')
+        self.assertEqual(len(den_starters), 5)
+        self.assertEqual(set(den_starters["START_POSITION"]), {"PG", "SG", "SF", "PF", "C"})
+        self.assertIn("Nikola Jokic", den_starters["NAME"].values)
+
+    @patch("data_collectors.starters.fetch_soup")
+    def test_rotowire_starters_empty_or_past_date(self, mock_soup):
+        """Verify LoadStartersRotowire returns EMPTY_DF for past dates or empty soup."""
+        mock_soup.return_value = None
+        loader = LoadStartersRotowire()
+        loader.run()
+        self.assertTrue(loader.df.empty)
+
+        # Past date
+        past_date = datetime.date(2026, 1, 1)
+        loader._load_starters(date=past_date)
+        self.assertTrue(loader.df.empty)
+
+    @patch("data_collectors.starters.requests.get")
+    def test_nbacom_starters_graceful_error_handling(self, mock_get):
+        """Verify LoadStartersNBACOM handles 404/empty responses gracefully."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.content = b""
+        mock_get.return_value = mock_resp
+
+        loader = LoadStartersNBACOM()
+        schedule = pd.DataFrame({"DATE": [datetime.date.today()], "GAME_ID": [100]})
+        loader._load_starters(schedule=schedule, date=datetime.date.today())
+        self.assertTrue(loader.df.empty)
+
+    @patch("data_collectors.injuries.requests.get")
+    def test_injuries_nbacom_graceful_error_handling(self, mock_get):
+        """Verify Injuries._load_injuries_nbacom handles HTTP errors gracefully."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.content = b""
+        mock_get.return_value = mock_resp
+
+        injuries = Injuries()
+        res = injuries._load_injuries_nbacom(date=datetime.date.today())
+        self.assertTrue(res.empty)
 
 
 if __name__ == "__main__":

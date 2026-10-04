@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 from enums import Enum, auto
 from requests.exceptions import TooManyRedirects, ReadTimeout
-from typing import List, Optional, Union, Dict, Tuple
 from constants import URLS, FIX_TEAM_NAMES, TEAM_ID_TO_NAME
 from utils import FixPlayerNames, retry, get_header, UnableToLoadWebsiteException, get_current_date, \
     date_to_game_ids, update_dir_name, fetch_html_table
@@ -26,14 +25,14 @@ class InjuriesSources(Enum):
     CBS = auto()
 
     @classmethod
-    def all_injuries_sources(cls) -> Tuple["InjuriesSources", ...]:
+    def all_injuries_sources(cls) -> tuple["InjuriesSources", ...]:
         return tuple([c for c in cls])
 
 
 class Injuries:
-    def __init__(self, injuries_sources: Union[InjuriesSources, Tuple[InjuriesSources, ...]] = InjuriesSources.all_injuries_sources(),
-                 nbacom_players_list: Optional[Union[List[str], pd.Series, np.ndarray, pd.DataFrame]] = None,
-                 player_id_to_name: Optional[Dict[int, str]] = None):
+    def __init__(self, injuries_sources: InjuriesSources | tuple[InjuriesSources, ...] = InjuriesSources.all_injuries_sources(),
+                 nbacom_players_list: list[str] | pd.Series | np.ndarray | pd.DataFrame | None = None,
+                 player_id_to_name: dict[int, str] | None = None):
         self.injuries_sources = injuries_sources
         if isinstance(self.injuries_sources, InjuriesSources):
             self.injuries_sources = (self.injuries_sources,)
@@ -119,11 +118,17 @@ class Injuries:
 
         url = URLS().games_lineups_nbacom(str(get_current_date()))
         headers = get_header()
-        html = requests.get(url, headers=headers, timeout=30).content
-        if len(html) == 0:
-            raise UnableToLoadWebsiteException(site=url)
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code != 200 or len(resp.content) == 0:
+                return EMPTY_DF
+            data_dict = json.loads(resp.content).get('games', [])
+        except Exception as e:
+            logging.warning(f"Error fetching NBA lineups from {url}: {e}")
+            return EMPTY_DF
 
-        data_dict = json.loads(html)['games']
+        if not data_dict:
+            return EMPTY_DF
         dfs = list()
         for curr_dict in data_dict:
             home_dict = curr_dict['homeTeam']
@@ -235,7 +240,7 @@ class Injuries:
 
         return df
 
-    def combine_dfs(self, injuries_source_to_df: Dict[InjuriesSources, pd.DataFrame]):
+    def combine_dfs(self, injuries_source_to_df: dict[InjuriesSources, pd.DataFrame]):
         is_out_cols = list()
         is_questionable_cols = list()
         all_dfs = list()
@@ -262,13 +267,13 @@ class Injuries:
         self.injuries_df = self.injuries_df.loc[self.injuries_df[['IS_OUT', 'IS_QUESTIONABLE']].any(axis=1)]
         self.injuries_df.reset_index(drop=True, inplace=True)
 
-    def out_players(self) -> List[str]:
+    def out_players(self) -> list[str]:
         return self.injuries_df.query('IS_OUT')['NAME'].unique().tolist()
 
-    def questionable_players(self) -> List[str]:
+    def questionable_players(self) -> list[str]:
         return self.injuries_df.query('IS_QUESTIONABLE')['NAME'].unique().tolist()
 
-    def out_and_questionable_players(self) -> List[str]:
+    def out_and_questionable_players(self) -> list[str]:
         return self.out_players() + self.questionable_players()
 
     def collect_data(self, date: datetime.date = get_current_date()) -> pd.DataFrame:
