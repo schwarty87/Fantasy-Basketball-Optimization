@@ -6,7 +6,6 @@ import json
 import requests
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict
 from tqdm import tqdm
 from nba_api.stats.endpoints import playergamelogs, teamgamelogs, boxscoretraditionalv3
 from constants import URLS, SCORING, TEAM_NAME_TO_ID, TEAM_ID_TO_NAME
@@ -37,7 +36,7 @@ class StatsLoader:
                             'TD3': 'TRIPLE_DOUBLE'}
     SORT_COLS = []
 
-    def __init__(self, season: Optional[int] = None, **kwargs):
+    def __init__(self, season: int | None = None, **kwargs):
         """
         :param season: the season to collect stats for (e.g. 2026 for 2026-27, defaults to current season)
         """
@@ -180,7 +179,7 @@ class StatsLoaderPlayers(StatsLoader):
     SORT_COLS = ['DATE', 'GAME_ID', 'TEAM_ID', 'PLAYER_ID']
     MERGE_ON = ['GAME_ID', 'TEAM_ID', 'PLAYER_ID']
 
-    def __init__(self, season: Optional[int] = None, out_players: Optional[Dict] = None, **kwargs):
+    def __init__(self, season: int | None = None, out_players: dict | None = None, **kwargs):
         """
         :param season: the season we're loading data for (defaults to current season)
         :param out_players: a dict of players that are out today and their replacements in the starting lineup.
@@ -196,7 +195,7 @@ class StatsLoaderPlayers(StatsLoader):
 
         self._schedule = load_schedule(drop_ppd=True)
 
-    def call(self, players_list: Optional[pd.DataFrame] = None, add_upcoming_games: bool = True):
+    def call(self, players_list: pd.DataFrame | None = None, add_upcoming_games: bool = True):
         if players_list is not None:
             self._players_list = players_list
         else:
@@ -274,7 +273,7 @@ class StatsLoaderPlayers(StatsLoader):
                 # print('ccc >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         return curr_df
 
-    def get_player_name_to_id(self) -> Dict[str, int]:
+    def get_player_name_to_id(self) -> dict[str, int]:
         return self._player_name_to_id
 
     def _read_single_game_boxscores_comments(self):

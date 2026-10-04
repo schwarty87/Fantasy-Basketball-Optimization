@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from functools import wraps
-from typing import Optional, Union, Tuple, Type, Callable, List, Dict, Any
+from typing import Callable, Any
 from bs4 import BeautifulSoup, Tag
 from pandas.api.types import is_datetime64_any_dtype, is_string_dtype
 from constants import FIX_PLAYER_NAMES, URLS, START_POSITIONS, SCORING, NY_TZ, DATA_DIR
@@ -33,7 +33,7 @@ class UnableToLoadWebsiteException(Exception):
 _NO_DEFAULT = object()
 
 
-def retry(exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exception, max_retries: int = 3,
+def retry(exceptions: type[Exception] | tuple[type[Exception], ...] = Exception, max_retries: int = 3,
           delay_seconds: float = 60, return_on_fail: Any = _NO_DEFAULT):
     """
     Decorator function that retries a given function if specific exceptions occur.
@@ -69,7 +69,7 @@ def retry(exceptions: Union[Type[Exception], Tuple[Type[Exception], ...]] = Exce
     return decorator_retry
 
 
-def get_current_season(date: Optional[Union[datetime.date, datetime.datetime, str, pd.Timestamp]] = None) -> int:
+def get_current_season(date: datetime.date | datetime.datetime | str | pd.Timestamp | None = None) -> int:
     """Returns the NBA season starting year (e.g. Oct 2026 -> 2026 for 2026-27 season)."""
     if date is None:
         d = get_current_date()
@@ -80,7 +80,7 @@ def get_current_season(date: Optional[Union[datetime.date, datetime.datetime, st
     return d.year if d.month >= 10 else d.year - 1
 
 
-def season_int_to_str(season: Optional[Union[int, str]] = None) -> str:
+def season_int_to_str(season: int | str | None = None) -> str:
     if season is None:
         season = get_current_season()
     elif isinstance(season, str):
@@ -88,7 +88,7 @@ def season_int_to_str(season: Optional[Union[int, str]] = None) -> str:
     return f'{season}-{str(season+1)[-2:]}'
 
 
-def downcast_df(df: pd.DataFrame, df_name: Optional[str] = None, print_usage: bool = True, rtol: float = 1e-6,
+def downcast_df(df: pd.DataFrame, df_name: str | None = None, print_usage: bool = True, rtol: float = 1e-6,
                 atol: float = 1e-5) -> pd.DataFrame:
     memory_usage_before = df.memory_usage().sum() * 1e-6
     int_cols = set(list(df.select_dtypes(('integer', 'bool')).columns) + [c for c in df.columns if c.endswith('_ID')])
@@ -121,7 +121,7 @@ def downcast_df(df: pd.DataFrame, df_name: Optional[str] = None, print_usage: bo
     return df
 
 
-def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[str] = None, 
+def read_and_cache(func, func_params: dict, cache_name: str, suffix: str | None = None, 
                    sleep_time_after_reading_from_web: int = 0):
     cached_data_dir = update_dir_name('cached_data')
     cache_path = os.path.join(cached_data_dir, cache_name)
@@ -140,7 +140,7 @@ def read_and_cache(func, func_params: dict, cache_name: str, suffix: Optional[st
     return df
 
 
-def load_and_cache_players_list(print_usage: bool = True, season: Optional[int] = None):
+def load_and_cache_players_list(print_usage: bool = True, season: int | None = None):
     if season is None:
         season = get_current_season()
     cached_data_dir = update_dir_name('cached_data')
@@ -187,7 +187,7 @@ def load_and_cache_players_list(print_usage: bool = True, season: Optional[int] 
     return players_list
 
 
-def get_header(player_or_team: bool = True, url: Optional[str] = None):
+def get_header(player_or_team: bool = True, url: str | None = None):
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -230,7 +230,7 @@ def get_header(player_or_team: bool = True, url: Optional[str] = None):
 
 @retry(exceptions=(requests.exceptions.ReadTimeout, UnableToLoadWebsiteException, requests.exceptions.ConnectionError, KeyError, requests.exceptions.HTTPError), max_retries=3, delay_seconds=2)
 def load_nbacom_data(url: str, use_key: str = 'resultSets', player_or_team: bool = True,
-                     use_header: bool = True) -> Optional[Union[pd.DataFrame, dict]]:
+                     use_header: bool = True) -> pd.DataFrame | dict | None:
     headers = None
     if use_header:
         headers = get_header(player_or_team=player_or_team, url=url)
@@ -266,14 +266,14 @@ def load_nbacom_data(url: str, use_key: str = 'resultSets', player_or_team: bool
 @retry(max_retries=3, delay_seconds=1, return_on_fail=None)
 def fetch_soup(
     url: str,
-    params: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
     timeout: int = 15,
-    session: Optional[requests.Session] = None,
+    session: requests.Session | None = None,
     parser: str = 'html.parser',
     raise_for_status: bool = True,
-    encoding: Optional[str] = None
-) -> Optional[BeautifulSoup]:
+    encoding: str | None = None
+) -> BeautifulSoup | None:
     """
     Fetches a webpage using an HTTP GET request with standard desktop headers and parses
     its content using BeautifulSoup. Retries up to 3 times on network errors with a 1-second delay.
@@ -308,17 +308,17 @@ def fetch_soup(
 
 
 def parse_html_table(
-    table: Optional[Union[BeautifulSoup, Tag]],
-    header_row: Optional[int] = 0,
+    table: BeautifulSoup | Tag | None,
+    header_row: int | None = 0,
     uppercase_headers: bool = False,
-    header_transform: Optional[Callable[[str], str]] = None,
-    custom_headers: Optional[List[str]] = None,
+    header_transform: Callable[[str], str] | None = None,
+    custom_headers: list[str] | None = None,
     strip_whitespace: bool = True,
-    cell_parser: Optional[Callable[[Tag], Any]] = None,
-    row_parser: Optional[Callable[[Tag], Optional[Union[Dict[str, Any], List[Any]]]]] = None,
+    cell_parser: Callable[[Tag], Any] | None = None,
+    row_parser: Callable[[Tag], dict[str, Any] | list[Any] | None] | None = None,
     skip_rows: int = 0,
-    column_rename: Optional[Dict[str, str]] = None,
-    context: Optional[Dict[str, Any]] = None,
+    column_rename: dict[str, str] | None = None,
+    context: dict[str, Any] | None = None,
     drop_empty_rows: bool = True
 ) -> pd.DataFrame:
     """
@@ -446,17 +446,17 @@ def parse_html_table(
 
 
 def fetch_html_table(
-    url_or_soup: Union[str, BeautifulSoup, Tag],
-    table_selector: Optional[str] = None,
+    url_or_soup: str | BeautifulSoup | Tag,
+    table_selector: str | None = None,
     table_index: int = 0,
     all_tables: bool = False,
     concat_tables: bool = False,
-    table_context_parser: Optional[Callable[[Tag], Dict[str, Any]]] = None,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
+    table_context_parser: Callable[[Tag], dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
     timeout: int = 15,
     **parse_kwargs
-) -> Union[pd.DataFrame, List[pd.DataFrame]]:
+) -> pd.DataFrame | list[pd.DataFrame]:
     """
     Fetches a webpage and parses its HTML <table> element(s) into pandas DataFrame(s).
     Acts as a lightweight, zero-dependency, crash-free replacement for pd.read_html.
@@ -657,7 +657,7 @@ def add_missing_points_columns_to_predictions(predictions_df: pd.DataFrame):
                                                               SCORING[Sites.YAHOO].items()], axis=1).sum(axis=1)
 
 
-def scrape_season_schedules(season: Union[int, str], save_dir: Optional[str] = None) -> None:
+def scrape_season_schedules(season: int | str, save_dir: str | None = None) -> None:
     if save_dir:
         if isinstance(season, str):
             season = int(season.split('-')[0])
@@ -696,7 +696,7 @@ def scrape_season_schedules(season: Union[int, str], save_dir: Optional[str] = N
         logging.info(f'saved season schedule to {save_path}')
 
 
-def get_current_time(tz=NY_TZ, return_date: bool = False) -> Union[datetime.date, datetime.datetime]:
+def get_current_time(tz=NY_TZ, return_date: bool = False) -> datetime.date | datetime.datetime:
     curr_time = datetime.datetime.now(tz=tz)
     if return_date:
         curr_time = curr_time.date()
@@ -707,7 +707,7 @@ def get_current_date(tz=NY_TZ) -> datetime.date:
     return get_current_time(tz=tz, return_date=True)
 
 
-def get_next_game_time(tz=NY_TZ, template: Optional[pd.DataFrame] = None) -> datetime.datetime:
+def get_next_game_time(tz=NY_TZ, template: pd.DataFrame | None = None) -> datetime.datetime:
     current_time = get_current_time(tz=tz)
     if template is not None:
         return template.loc[template['Time'] > current_time, 'Time'].min()
@@ -715,9 +715,9 @@ def get_next_game_time(tz=NY_TZ, template: Optional[pd.DataFrame] = None) -> dat
     return schedule.loc[schedule['GAME_DATE_TIME'] > current_time, 'GAME_DATE_TIME'].min()
 
 
-def define_logger(filename: Optional[str] = None, level=logging.INFO,
-                  format: Optional[str] = '%(asctime)s [%(levelname)s] - %(message)s', print_to_console: bool = True,
-                  filemode: Optional[str] = 'a'):
+def define_logger(filename: str | None = None, level=logging.INFO,
+                  format: str | None = '%(asctime)s [%(levelname)s] - %(message)s', print_to_console: bool = True,
+                  filemode: str | None = 'a'):
     assert print_to_console or filename is not None, 'the logger has to print to the console and/or to a file!!!'
 
     vars = {'level': level
@@ -773,7 +773,7 @@ def add_game_times_to_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def remove_accents(input_str: Optional[str]) -> Optional[str]:
+def remove_accents(input_str: str | None) -> str | None:
     if input_str is None:
         return None
     # Normalize string to decompose accented characters
@@ -785,7 +785,7 @@ def remove_accents(input_str: Optional[str]) -> Optional[str]:
 class FixPlayerNames:
     SUFFIXES = (' Jr.', ' Jr', ' Sr.', ' Sr', ' II', ' III', ' IV', '.', "'")
 
-    def __init__(self, compare_names: Optional[Union[List[str], np.ndarray, pd.Series]] = None):
+    def __init__(self, compare_names: list[str] | np.ndarray | pd.Series | None = None):
         """
         Fix player names, so that all names from all sources will match
         :param compare_names: The names that we want to search in to see if we could find similar names
@@ -797,7 +797,7 @@ class FixPlayerNames:
             self.compare_names = [remove_accents(n) for n in self.compare_names if n is not None]
             self.compare_names = [FIX_PLAYER_NAMES.get(n, n) for n in self.compare_names]
 
-    def fix_names(self, names_to_convert: Union[List[str], np.ndarray, pd.Series]) -> np.ndarray:
+    def fix_names(self, names_to_convert: list[str] | np.ndarray | pd.Series) -> np.ndarray:
         if isinstance(names_to_convert, pd.Series):
             names_to_convert = names_to_convert.values
         elif isinstance(names_to_convert, list):
@@ -840,7 +840,7 @@ class FixPlayerNames:
         return converted_names
 
 
-def date_to_season_str(date: Optional[Union[datetime.date, datetime.datetime, str, pd.Timestamp]] = None) -> str:
+def date_to_season_str(date: datetime.date | datetime.datetime | str | pd.Timestamp | None = None) -> str:
     return season_int_to_str(get_current_season(date))
 
 

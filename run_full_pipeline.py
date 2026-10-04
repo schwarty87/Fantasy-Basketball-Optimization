@@ -4,7 +4,6 @@ import os
 import time
 import pandas as pd
 from datetime import timedelta
-from typing import Optional, Dict, Union
 from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
 from calc_features import CalcFeatures
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
@@ -21,10 +20,10 @@ from machine_learning.enums import DataSplitType
 
 
 class RunFullPipeline:
-    def __init__(self, load_params_from_model_id: int, season: Optional[int] = None,
-                 run_date: Union[datetime.date, str] = get_current_date(),
+    def __init__(self, load_params_from_model_id: int, season: int | None = None,
+                 run_date: datetime.date | str = get_current_date(),
                  headless: bool = True, minutes_before_game_to_run: int = 10,
-                 params_update_dict: Optional[Dict] = None, run_immediately: bool = False):
+                 params_update_dict: dict | None = None, run_immediately: bool = False):
         """
         Run everything we need to continuously update stats, train new models, predict/create teams and submit them
         continuously
@@ -62,7 +61,7 @@ class RunFullPipeline:
         self.submit_teams = None
         # self.google_drive_driver = None    # driver for reading data from Google Drive
 
-    def _reset(self, run_date: Union[datetime.date, str]):
+    def _reset(self, run_date: datetime.date | str):
         """
         Should be called at the beginning of each run, and every time we start a new day. Calculate all the relevant
         info for the current day. We get the new model name that we want to run, and (re)initialize the
@@ -128,7 +127,7 @@ class RunFullPipeline:
 
         return df
 
-    def _get_todays_predictions(self, teams_template: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    def _get_todays_predictions(self, teams_template: pd.DataFrame | None = None) -> pd.DataFrame:
         metrics_params = self.train_nn._change_metrics_params_tuple_to_per_sample(self.train_nn.params.training_params.metrics_params)
         loss_params = self.train_nn._change_metrics_params_tuple_to_per_sample(self.train_nn.params.training_params.loss_params)
         predictions = self.train_nn.predict(data_split_type=DataSplitType.TRAIN, metrics_params=metrics_params,
@@ -223,7 +222,7 @@ class RunFullPipeline:
         self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
 
     @staticmethod
-    def _browser_profile_path() -> Optional[str]:
+    def _browser_profile_path() -> str | None:
         if BROWSER == Browsers.CHROME:
             if os.path.isdir('/home/danieli/.config/google-chrome'):
                 return '/home/danieli/.config/google-chrome'

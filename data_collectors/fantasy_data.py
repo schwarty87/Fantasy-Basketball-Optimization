@@ -2,7 +2,6 @@ import os
 import datetime
 import numpy as np
 import pandas as pd
-from typing import Optional, Union, List, Dict
 from constants import TEAM_ID_TO_NAME, FIX_TEAM_NAMES
 from utils import get_current_date, FixPlayerNames, load_schedule, load_and_cache_players_list, update_dir_name
 from data_collectors.scrape_rotogrinders_data import load_fantasy_salaries_positions_lineups_hq, get_first_slate_id, \
@@ -16,8 +15,8 @@ TEMPLATE_RENAME_COLS = {'Name': 'NAME', 'Salary': 'YAHOO_SALARY', 'Position': 'Y
 
 
 class LoadFantasyData:
-    def __init__(self, nbacom_players_list: Optional[Union[List[str], pd.Series, np.ndarray, pd.DataFrame]] = None,
-                 player_name_to_id: Optional[Dict[str, int]] = None):
+    def __init__(self, nbacom_players_list: list[str] | pd.Series | np.ndarray | pd.DataFrame | None = None,
+                 player_name_to_id: dict[str, int] | None = None):
         if isinstance(nbacom_players_list, pd.DataFrame):
             nbacom_players_list = nbacom_players_list["NAME"].values
         self.fix_player_names = FixPlayerNames(compare_names=nbacom_players_list)
@@ -86,12 +85,12 @@ class LoadFantasyData:
         return set(FANTASY_DATA_COLUMNS).issubset(set(df.columns))
 
     @staticmethod
-    def _teams_match_todays_teams(df_teams: Union[np.ndarray, List[set]], todays_teams: Union[np.ndarray, List[set]]
+    def _teams_match_todays_teams(df_teams: np.ndarray | list[set], todays_teams: np.ndarray | list[set]
                                   ) -> bool:
         return set(df_teams) == set(todays_teams)
 
-    def _postprocess(self, df: pd.DataFrame, todays_teams: Union[np.ndarray, List[set]],
-                     name_to_team: Optional[Dict[str, str]]) -> pd.DataFrame:
+    def _postprocess(self, df: pd.DataFrame, todays_teams: np.ndarray | list[set],
+                     name_to_team: dict[str, str] | None) -> pd.DataFrame:
         # getting player ids
         df_has_player_id_col = 'PLAYER_ID' in df.columns
         if self.player_name_to_id is not None:
@@ -131,12 +130,12 @@ class LoadFantasyData:
 
         return df[FANTASY_DATA_COLUMNS].reset_index(drop=True)
 
-    def _is_finished(self, df: pd.DataFrame, todays_teams: Union[np.ndarray, List[set]]) -> bool:
+    def _is_finished(self, df: pd.DataFrame, todays_teams: np.ndarray | list[set]) -> bool:
         return self._df_has_all_columns(df) and \
                self._teams_match_todays_teams(df['TEAM'].unique(), todays_teams=todays_teams) and \
                df['TEAM'].value_counts().min() > 5
 
-    def collect_data(self, date: datetime.date, name_to_team: Optional[Dict[str, str]] = None) -> pd.DataFrame:
+    def collect_data(self, date: datetime.date, name_to_team: dict[str, str] | None = None) -> pd.DataFrame:
         todays_schedule = self.schedule.loc[self.schedule['DATE'] == date]
         todays_teams = todays_schedule['TEAM'].unique()
 

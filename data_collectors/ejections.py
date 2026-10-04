@@ -3,7 +3,6 @@ import datetime
 import numpy as np
 import pandas as pd
 from requests.exceptions import TooManyRedirects, ReadTimeout, ConnectTimeout
-from typing import List, Optional, Union
 from constants import FIX_TEAM_NAMES
 from utils import (FixPlayerNames, retry, UnableToLoadWebsiteException, get_current_date, get_current_season,
                    season_int_to_str, update_dir_name, fetch_html_table)
@@ -13,8 +12,8 @@ EMPTY_DF = pd.DataFrame(columns=EJECTIONS_DF_COLUMNS)
 
 
 class Ejections:
-    def __init__(self, nbacom_players_list: Optional[Union[List[str], pd.Series, np.ndarray, pd.DataFrame]] = None,
-                 season: Optional[int] = None):
+    def __init__(self, nbacom_players_list: list[str] | pd.Series | np.ndarray | pd.DataFrame | None = None,
+                 season: int | None = None):
         if isinstance(nbacom_players_list, pd.DataFrame):
             nbacom_players_list = nbacom_players_list["NAME"].values
         self.fix_player_names = FixPlayerNames(compare_names=nbacom_players_list)
