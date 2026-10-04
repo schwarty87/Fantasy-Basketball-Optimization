@@ -27,9 +27,7 @@ class LoadFantasyData:
 
         self.df = EMPTY_DF
 
-        self.save_dir = os.path.join(update_dir_name('cached_data'), 'fantasy_data')
-        if not os.path.isdir(self.save_dir):
-            os.mkdir(self.save_dir)
+        self.save_dir = update_dir_name('fantasy_data')
 
     @staticmethod
     def merge_dfs(df1: pd.DataFrame, df2: pd.DataFrame) -> pd.DataFrame:

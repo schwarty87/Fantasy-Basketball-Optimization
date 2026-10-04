@@ -467,9 +467,8 @@ class RunModel:
                 (epoch_num >= (self.params.training_params.num_epochs - 1)))
 
     def train(self, trainer_cls=None, torch_save=None, precision=None):
-        self._init_models_dir()
-        self._init_model_id()
-
+        # NOTE: model_id / _model_dir are initialized once in __init__. Re-deriving them here would make
+        # get_next_model_id() see the dir __init__ just created and return model_id + 1.
         seed = getattr(self.params.training_params, "seed", None)
         if seed is not None and type(seed).__name__ != "MagicMock":
             if self.use_lightning:
@@ -854,7 +853,7 @@ class RunModel:
         return os.path.join(self._model_dir, 'tensorboard_logs')
 
     def _save_eval_results_to_feather(self, eval_results: pd.DataFrame):
-        save_path = os.path.join(self._models_dir, str(self.model_id), 'eval_results.arrow')
+        save_path = os.path.join(self._model_dir, 'eval_results.arrow')
         eval_results.reset_index().rename(columns={'index': 'split_type'}).to_feather(save_path)
 
     def _add_extra_metrics_to_eval_results(self, eval_results: pd.DataFrame, predict_results: pd.DataFrame

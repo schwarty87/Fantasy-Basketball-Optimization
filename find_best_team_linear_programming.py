@@ -18,6 +18,8 @@ from pulp.apis.core import LpSolver
 from constants import DFS_POSITIONS, DFS_MAX_TEAM_SALARY, NUM_TO_POSITION
 from enums import Sites
 
+DEFAULT_LP_SOLVER = getattr(pulp, 'COIN_CMD', getattr(pulp, 'PULP_CBC_CMD', None))
+
 NUM_PLAYERS_PER_POSITION = {Sites.YAHOO: {'PG': {'min_amount': 1, 'max_amount': 3},
                                           'SG': {'min_amount': 1, 'max_amount': 3},
                                           'SF': {'min_amount': 1, 'max_amount': 3},
@@ -131,12 +133,14 @@ class FindBestSetOfTeamsLinearProgramming(ABC):
         """ Define all the constraints """
         raise NotImplementedError
 
-    def _solve(self, solver: LpSolver = pulp.PULP_CBC_CMD(msg=False, timeLimit=60)):
+    def _solve(self, solver: LpSolver | None = None):
         """
         Solve the linear programming problem. This should only be called after all the variables have been
         initialized and the constraints defined
         :param solver: the solver to use when solving the linear programming problem
         """
+        if solver is None:
+            solver = DEFAULT_LP_SOLVER(msg=False, timeLimit=60)
         if self._verbose:
             logging.info('solving optimal set of teams using linear programming...')
         self.prob.solve(solver=solver)
@@ -219,7 +223,7 @@ class FindBestSetOfTeamsLinearProgramming(ABC):
         self._define_objective_function()
         self._define_constraints(locked_dfs_list)
 
-        solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=60, gapRel=self._gap_rel)#, threads=1)
+        solver = DEFAULT_LP_SOLVER(msg=False, timeLimit=60, gapRel=self._gap_rel)#, threads=1)
         self._solve(solver=solver)
 
     def run(self, df: pd.DataFrame, locked_dfs: Dict[int, pd.DataFrame] | None = None) -> pd.DataFrame:

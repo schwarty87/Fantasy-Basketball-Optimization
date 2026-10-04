@@ -13,10 +13,11 @@ from lightning.pytorch.callbacks import (
 )
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from run_all import main, clean_empty_model_dirs
+from run_all import main, clean_empty_model_dirs, compare_dataclasses, create_params
 from machine_learning_fantasy_basketball_predictions.run_model import (
     RunModelFantasyBasketballPredictions,
 )
+from dataclasses import dataclass
 
 
 class TestRunAll(unittest.TestCase):
@@ -327,6 +328,93 @@ class TestRunAll(unittest.TestCase):
         with patch.object(runner, "_load_contests_df", side_effect=FileNotFoundError("not found")):
             res = runner._add_extra_metrics_to_eval_results(eval_df, pred_df)
             pd.testing.assert_frame_equal(res, eval_df)
+
+    def test_compare_dataclasses_matching_and_mismatch(self):
+        """Tests that compare_dataclasses verifies identical structures and detects mismatches."""
+        @dataclass
+        class SubConfig:
+            lr: float
+            name: str
+
+        @dataclass
+        class Config:
+            sub: SubConfig
+            active: bool
+
+        cfg1 = Config(sub=SubConfig(lr=0.01, name="model"), active=True)
+        cfg2 = Config(sub=SubConfig(lr=0.01, name="model"), active=True)
+        cfg_mismatch = Config(sub=SubConfig(lr=0.05, name="model"), active=True)
+
+        # Matching: should not raise
+        compare_dataclasses(cfg1, cfg2)
+
+        # Mismatch: should raise AssertionError
+        with self.assertRaises(AssertionError):
+            compare_dataclasses(cfg1, cfg_mismatch)
+
+    @patch("run_all.clean_empty_model_dirs")
+    @patch("run_all.define_logger")
+    @patch("run_all.test_params")
+    @patch("run_all.RunModelFantasyBasketballPredictions")
+    @patch("run_all.models_dir")
+    def test_main_fast_dev_run_flag_propagates(
+        self,
+        mock_models_dir,
+        mock_run_model_cls,
+        mock_test_params,
+        mock_define_logger,
+        mock_clean_empty,
+    ):
+        """Tests that main(params=params) preserves fast_dev_run when set."""
+        mock_models_dir.return_value = self.temp_dir
+        params = MagicMock()
+        params.training_params.fast_dev_run = True
+
+        mock_runner = MagicMock()
+        mock_runner.model_id = 105
+        mock_runner.run_full_training_session.return_value = (pd.DataFrame(), MagicMock())
+        mock_run_model_cls.return_value = mock_runner
+
+        main(use_lightning=True, params=params)
+        self.assertTrue(params.training_params.fast_dev_run)
+        mock_run_model_cls.assert_called_once_with(
+            params=params, description=None, use_lightning=True
+        )
+
+    @patch("machine_learning.run_model.models_dir")
+    @patch("machine_learning.run_model.get_next_model_id")
+    @patch("machine_learning_fantasy_basketball_predictions.run_model.FantasyBasketballDataModule")
+    @patch("machine_learning_fantasy_basketball_predictions.run_model.FantasyBasketballLightningModule")
+    @patch("machine_learning_fantasy_basketball_predictions.run_model.pl.Trainer")
+    @patch("machine_learning_fantasy_basketball_predictions.run_model.torch.save")
+    def test_model_id_stable_across_train_and_eval_save(
+        self,
+        mock_torch_save,
+        mock_trainer_cls,
+        mock_module_cls,
+        mock_datamodule_cls,
+        mock_get_next_model_id,
+        mock_models_dir,
+    ):
+        """model_id must not be re-derived in train(); eval results go into the same dir as the checkpoints."""
+        mock_models_dir.return_value = self.temp_dir
+        # Simulates the real behavior: once dir 7 exists, the next lookup would return 8
+        mock_get_next_model_id.side_effect = [7, 8, 9]
+        mock_params = MagicMock()
+        mock_params.continue_model_id = None
+        mock_params.training_params.num_epochs = 1
+        mock_params.training_params.gradient_accumulation_num_batches = 1
+
+        runner = RunModelFantasyBasketballPredictions(params=mock_params, use_lightning=True)
+        runner.train()
+
+        expected_dir = os.path.join(self.temp_dir, "7")
+        self.assertEqual(runner.model_id, 7)
+        self.assertEqual(runner._model_dir, expected_dir)
+        self.assertEqual(mock_get_next_model_id.call_count, 1)
+
+        runner._save_eval_results_to_feather(pd.DataFrame({"loss": [0.5]}, index=["validation"]))
+        self.assertTrue(os.path.isfile(os.path.join(expected_dir, "eval_results.arrow")))
 
 
 if __name__ == "__main__":

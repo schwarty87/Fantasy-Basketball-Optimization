@@ -213,7 +213,7 @@ class RotoGrindersLineup:
         return all_lineups_data
 
     def get_lineup_data_per_date(self, date: datetime.date) -> pd.DataFrame:
-        cache_path = os.path.join(update_dir_name('cached_data'), 'rotogrinders_lineups', f'rotogrinders_lineups_{str(date)}.feather')
+        cache_path = os.path.join(update_dir_name('rotogrinders_lineups'), f'rotogrinders_lineups_{str(date)}.feather')
         if self.cache_data and os.path.isfile(cache_path):
             cached_data = pd.read_feather(cache_path)
 

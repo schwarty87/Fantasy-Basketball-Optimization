@@ -23,7 +23,8 @@ class RunFullPipeline:
     def __init__(self, load_params_from_model_id: int, season: int | None = None,
                  run_date: datetime.date | str = get_current_date(),
                  headless: bool = True, minutes_before_game_to_run: int = 10,
-                 params_update_dict: dict | None = None, run_immediately: bool = False):
+                 params_update_dict: dict | None = None, run_immediately: bool = False,
+                 initialize_daily_job: bool = True):
         """
         Run everything we need to continuously update stats, train new models, predict/create teams and submit them
         continuously
@@ -34,6 +35,7 @@ class RunFullPipeline:
         :param minutes_before_game_to_run: the amount of time we want to run the pipeline before each game
         :param run_immediately: if True, don't wait for the game times to run. Should only be true when debugging
         :param params_update_dict: data to update params with
+        :param initialize_daily_job: if True, initialize today's schedule and daily run via _reset()
         """
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
                       filename=os.path.join(DATA_DIR, 'logs', f"logs_{get_current_date()}.txt"), print_to_console=True, filemode='a')
@@ -46,8 +48,8 @@ class RunFullPipeline:
 
         self.dates_to_game_times = dict()   #self._get_game_times_by_day_dict()
 
-        self._model_params_update_dict = params_update_dict
-        if 'training' not in self._model_params_update_dict.keys():
+        self._model_params_update_dict = params_update_dict.copy() if params_update_dict is not None else dict()
+        if 'training' not in self._model_params_update_dict:
             self._model_params_update_dict['training'] = dict()
         self._model_params_update_dict['training']['run_extra_callbacks'] = False
 
@@ -56,7 +58,8 @@ class RunFullPipeline:
         self.calc_features = CalcFeatures()
 
         self.train_nn = None
-        self._reset(run_date)
+        if initialize_daily_job:
+            self._reset(run_date)
 
         self.submit_teams = None
         # self.google_drive_driver = None    # driver for reading data from Google Drive
@@ -217,17 +220,18 @@ class RunFullPipeline:
     @staticmethod
     def _browser_profile_path() -> str | None:
         if BROWSER == Browsers.CHROME:
-            if os.path.isdir('/home/danieli/.config/google-chrome'):
-                return '/home/danieli/.config/google-chrome'
-            if os.path.isdir("C:/Users/schwa/AppData/Local/Google/Chrome/User Data"):
-                return "C:/Users/schwa/AppData/Local/Google/Chrome/User Data"
+            for p in ['/home/danieli/.config/google-chrome',
+                      "C:/Users/schwa/AppData/Local/Google/Chrome/User Data"]:
+                if os.path.isdir(p):
+                    return p
             return None
         elif BROWSER == Browsers.FIREFOX:
-            if os.path.isdir('/home/danieli/.mozilla/firefox'):
-                return '/home/danieli/.mozilla/firefox/f0lpo4uh.default-release'
-            else:
-                return 'C:/Users/schwa/AppData/Roaming/Mozilla/Firefox/Profiles/irl9n0gn.default-release'
-        raise ValueError('no browser profile path found!')
+            for p in ['/home/danieli/.mozilla/firefox/f0lpo4uh.default-release',
+                      'C:/Users/schwa/AppData/Roaming/Mozilla/Firefox/Profiles/irl9n0gn.default-release']:
+                if os.path.isdir(p):
+                    return p
+            return None
+        return None
 
     def run_full_pipeline(self):
         profile_path = self._browser_profile_path()

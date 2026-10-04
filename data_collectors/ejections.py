@@ -21,10 +21,7 @@ class Ejections:
 
         self.df = EMPTY_DF
 
-        cached_data_dir = update_dir_name('cached_data')
-        self.save_dir = os.path.join(cached_data_dir, 'ejections')
-        if not os.path.isdir(self.save_dir):
-            os.mkdir(self.save_dir)
+        self.save_dir = update_dir_name('ejections')
 
     @retry(exceptions=(ReadTimeout, UnableToLoadWebsiteException, TooManyRedirects, ConnectTimeout), max_retries=3,
            delay_seconds=1, return_on_fail=EMPTY_DF)

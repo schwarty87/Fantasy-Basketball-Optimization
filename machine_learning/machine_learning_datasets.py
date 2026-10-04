@@ -633,7 +633,9 @@ class MachineLearningDatasetCombined:
     @staticmethod
     def _convert_datetime_to_epoch_time(features_df: pd.DataFrame) -> pd.DataFrame:
         if not is_datetime64_any_dtype(features_df['DATE']):
-            features_df = features_df.assign(EPOCH_DATE=pd.to_datetime(features_df['DATE']).astype('int64') * 1e-9)
+            # pandas 2.x infers datetime64[s] for date objects, so pin to ns before converting to int64
+            epoch_ns = pd.to_datetime(features_df['DATE']).astype('datetime64[ns]').astype('int64')
+            features_df = features_df.assign(EPOCH_DATE=epoch_ns * 1e-9)
             assert (pd.to_datetime(features_df['EPOCH_DATE'], unit='s') == features_df['DATE']).all(), \
                 "The conversion to epoch time was unsuccessful!"
         return features_df

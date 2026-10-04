@@ -1,9 +1,13 @@
+import datetime
 import os
 import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
+from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
 from machine_learning.utils import get_next_model_id
 
 
@@ -71,6 +75,25 @@ class TestGetNextModelId(unittest.TestCase):
 
         next_id = get_next_model_id("fantasy_basketball_predictions")
         self.assertEqual(next_id, 6)
+
+
+class TestConvertDatetimeToEpochTime(unittest.TestCase):
+    def test_date_objects_convert_to_epoch_seconds(self):
+        """DATE as datetime.date (as produced by CalcFeatures.load_df) must map to true epoch seconds."""
+        dates = [datetime.date(2014, 10, 28), datetime.date(2021, 10, 19), datetime.date(2026, 10, 20)]
+        df = pd.DataFrame({"DATE": dates})
+
+        result = MachineLearningDatasetCombined._convert_datetime_to_epoch_time(df)
+
+        expected = [(pd.Timestamp(d) - pd.Timestamp("1970-01-01")).total_seconds() for d in dates]
+        self.assertEqual(result["EPOCH_DATE"].tolist(), expected)
+        self.assertEqual(result["EPOCH_DATE"].iloc[0], 1414454400.0)
+
+    def test_datetime64_column_is_left_untouched(self):
+        """An already-datetime64 DATE column skips conversion (existing behavior)."""
+        df = pd.DataFrame({"DATE": pd.to_datetime(["2021-10-19"])})
+        result = MachineLearningDatasetCombined._convert_datetime_to_epoch_time(df)
+        self.assertNotIn("EPOCH_DATE", result.columns)
 
 
 if __name__ == "__main__":
