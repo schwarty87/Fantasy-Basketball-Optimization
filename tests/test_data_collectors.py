@@ -3,6 +3,7 @@ import datetime
 import json
 import unittest
 from unittest.mock import MagicMock, patch
+import numpy as np
 import pandas as pd
 from constants import DATA_DIR
 
@@ -10,10 +11,11 @@ from bs4 import BeautifulSoup
 from data_collectors.injuries import Injuries, InjuriesSources
 from data_collectors.ejections import Ejections
 from data_collectors.starters import LoadStartersBasketballMonster
-from data_collectors.stats_loaders import StatsLoaderPlayers
+from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
+from data_collectors.fantasy_data import LoadFantasyData
 from utils import (read_and_cache, fetch_soup, parse_html_table, fetch_html_table,
                    get_current_season, season_int_to_str, date_to_season_str, assert_valid_df_all,
-                   add_game_times_to_df)
+                   add_game_times_to_df, load_and_cache_players_list)
 from run_full_pipeline import RunFullPipeline
 
 
@@ -719,6 +721,97 @@ class TestDataCollectors(unittest.TestCase):
                 'model_2026_11_15'
             )
         )
+
+    def test_stats_loader_teams_defaults_to_dynamic_season(self):
+        """Verify StatsLoaderTeams defaults to get_current_season() when season is None."""
+        loader = StatsLoaderTeams()
+        expected_season = get_current_season()
+        self.assertEqual(loader.season, expected_season)
+        self.assertEqual(loader.season_str, season_int_to_str(expected_season))
+
+    @patch("utils.load_nbacom_data")
+    @patch("utils.os.path.isfile", return_value=False)
+    @patch("pandas.DataFrame.to_feather")
+    def test_load_and_cache_players_list_defaults_to_current_season(self, mock_to_feather, mock_isfile, mock_load):
+        """Verify load_and_cache_players_list defaults to current season."""
+        mock_load.return_value = pd.DataFrame({
+            "PLAYER_FIRST_NAME": ["Cooper"],
+            "PLAYER_LAST_NAME": ["Flagg"],
+            "PERSON_ID": [1642250],
+            "DRAFT_NUMBER": [1]
+        })
+        res = load_and_cache_players_list(print_usage=False)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res.iloc[0]["NAME"], "Cooper Flagg")
+
+    @patch("run_full_pipeline.define_logger")
+    @patch("run_full_pipeline.StatsLoaderPlayers")
+    @patch("run_full_pipeline.StatsLoaderTeams")
+    @patch("run_full_pipeline.CalcFeatures")
+    @patch.object(RunFullPipeline, "_reset")
+    def test_run_full_pipeline_season_propagation(self, mock_reset, mock_calc, mock_teams, mock_players, mock_logger):
+        """Verify RunFullPipeline propagates dynamic season to child loaders."""
+        pipeline = RunFullPipeline(load_params_from_model_id=1, season=None, params_update_dict={})
+        expected_season = get_current_season()
+        self.assertEqual(pipeline.season, expected_season)
+        mock_players.assert_called_once_with(season=expected_season)
+        mock_teams.assert_called_once_with(season=expected_season)
+
+    def test_load_fantasy_data_teams_match(self):
+        """Verify _teams_match_todays_teams works with array/list inputs."""
+        teams_a = np.array(["BOS", "LAL"])
+        teams_b = ["LAL", "BOS"]
+        self.assertTrue(LoadFantasyData._teams_match_todays_teams(teams_a, teams_b))
+        self.assertFalse(LoadFantasyData._teams_match_todays_teams(["BOS"], ["LAL"]))
+
+    def test_load_fantasy_data_convert_salary_cols(self):
+        """Verify salary columns ending with _SALARY are converted to floats."""
+        df = pd.DataFrame({
+            "NAME": ["Player A"],
+            "YAHOO_SALARY": ["25"],
+            "DRAFTKINGS_SALARY": [30],
+            "POINTS": [10]
+        })
+        LoadFantasyData._convert_salary_cols_to_num(df)
+        self.assertEqual(df["YAHOO_SALARY"].dtype, float)
+        self.assertEqual(df["YAHOO_SALARY"].iloc[0], 25.0)
+        self.assertEqual(df["DRAFTKINGS_SALARY"].dtype, float)
+        self.assertEqual(df["DRAFTKINGS_SALARY"].iloc[0], 30.0)
+
+    @patch("data_collectors.fantasy_data.load_schedule")
+    @patch("data_collectors.fantasy_data.load_fantasy_salaries_positions_lineups_hq")
+    @patch("data_collectors.fantasy_data.get_first_slate_id", return_value=None)
+    @patch("data_collectors.fantasy_data.load_and_cache_players_list")
+    def test_load_fantasy_data_rotogrinders_fallback_calls_dynamic_players_list(
+        self, mock_load_players, mock_first_slate, mock_rg_salaries, mock_schedule
+    ):
+        """Verify rotogrinders fallback calls load_and_cache_players_list dynamically."""
+        mock_schedule.return_value = pd.DataFrame({"TEAM_ID": [1], "DATE": [datetime.date(2026, 11, 1)]})
+        mock_rg_salaries.return_value = pd.DataFrame({"NAME": ["Player A"], "YAHOO_SALARY": [15]})
+        mock_load_players.return_value = pd.DataFrame({"NAME": ["Player A"], "TEAM_ABBREVIATION": ["BOS"]})
+
+        lfd = LoadFantasyData(nbacom_players_list=[])
+        res = lfd._load_data_rotogrinders(date=datetime.date(2026, 11, 1))
+
+        mock_load_players.assert_called_once_with()
+        self.assertIn("TEAM", res.columns)
+        self.assertEqual(res.iloc[0]["TEAM"], "BOS")
+
+    @patch("run_full_pipeline.load_schedule")
+    def test_get_game_times_by_day_dict(self, mock_schedule):
+        """Verify _get_game_times_by_day_dict correctly groups game times by date."""
+        mock_schedule.return_value = pd.DataFrame({
+            "DATE": [datetime.date(2026, 10, 25), datetime.date(2026, 10, 25), datetime.date(2026, 10, 26)],
+            "GAME_DATE_TIME": [
+                pd.Timestamp("2026-10-25 19:30:00"),
+                pd.Timestamp("2026-10-25 22:00:00"),
+                pd.Timestamp("2026-10-26 20:00:00"),
+            ]
+        })
+        result = RunFullPipeline._get_game_times_by_day_dict()
+        self.assertIn(datetime.date(2026, 10, 25), result)
+        self.assertEqual(len(result[datetime.date(2026, 10, 25)]), 2)
+        self.assertEqual(len(result[datetime.date(2026, 10, 26)]), 1)
 
 
 if __name__ == "__main__":
