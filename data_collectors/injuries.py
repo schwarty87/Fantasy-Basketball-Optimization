@@ -44,9 +44,7 @@ class Injuries:
 
         self.injuries_df = EMPTY_DF
 
-        self.save_dir = os.path.join(update_dir_name('cached_data'), 'injuries')
-        if not os.path.isdir(self.save_dir):
-            os.mkdir(self.save_dir)
+        self.save_dir = update_dir_name('injuries')
 
     def _fix_names(self, df: pd.DataFrame):
         if 'NAME' not in df and 'PLAYER_ID' in df:
@@ -179,7 +177,7 @@ class Injuries:
 
         all_game_comments = list()
         for gid in todays_game_ids:
-            game_path = os.path.join(update_dir_name('cached_data'), 'nbacom_single_game_boxscores',
+            game_path = os.path.join(update_dir_name('nbacom_single_game_boxscores'),
                                      f'nbacom_boxscoretraditionalv2_gid_{gid}.feather')
             if os.path.isfile(game_path):
                 game_comments = pd.read_feather(game_path)

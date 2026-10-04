@@ -10,12 +10,14 @@ from constants import DATA_DIR
 from bs4 import BeautifulSoup
 from data_collectors.injuries import Injuries, InjuriesSources
 from data_collectors.ejections import Ejections
-from data_collectors.starters import LoadStartersBasketballMonster, LoadStartersRotowire, LoadStartersNBACOM
+from data_collectors.starters import (LoadStartersBasketballMonster, LoadStartersRotowire,
+                                     LoadStartersNBACOM, Starters)
 from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
 from data_collectors.fantasy_data import LoadFantasyData
 from utils import (read_and_cache, fetch_soup, parse_html_table, fetch_html_table,
                    get_current_season, season_int_to_str, date_to_season_str, assert_valid_df_all,
-                   add_game_times_to_df, load_and_cache_players_list, date_to_game_ids)
+                   add_game_times_to_df, load_and_cache_players_list, date_to_game_ids,
+                   update_dir_name)
 from run_full_pipeline import RunFullPipeline
 
 
@@ -1020,6 +1022,80 @@ class TestDataCollectors(unittest.TestCase):
         self.assertEqual(res.iloc[0]["NAME"], "Inactive Player")
         self.assertTrue(res.iloc[0]["IS_OUT"])
         self.assertFalse(res.iloc[0]["IS_QUESTIONABLE"])
+
+    # -------------------------------------------------------------------------
+    # 20. Stage 4 - Directory Structure & Cache Unification Tests
+    # -------------------------------------------------------------------------
+    def test_update_dir_name_canonical_cache_mapping(self):
+        """Verify update_dir_name routes cache categories canonically under cached_data."""
+        expected_cached = [
+            'starters',
+            'injuries',
+            'fantasy_data',
+            'ejections',
+            'nbacom_single_game_boxscores',
+            'nbacom_single_game_pbp',
+            'rotogrinders_lineups',
+            'left_midgame',
+        ]
+        for cat in expected_cached:
+            resolved = update_dir_name(cat)
+            expected = os.path.join(DATA_DIR, 'cached_data', cat)
+            self.assertEqual(resolved, expected, f"Failed canonical routing for {cat}")
+
+            # Explicit cached_data/cat should resolve identically
+            resolved_explicit = update_dir_name(f'cached_data/{cat}')
+            self.assertEqual(resolved_explicit, expected)
+
+        # Root-level data directories should resolve directly under DATA_DIR
+        for root_cat in ['stats', 'season_schedules', 'features', 'comments_nbacom', 'dfs_contests', 'logs']:
+            resolved_root = update_dir_name(root_cat)
+            expected_root = os.path.join(DATA_DIR, root_cat)
+            self.assertEqual(resolved_root, expected_root)
+
+        # Base cached_data resolution
+        self.assertEqual(update_dir_name('cached_data'), os.path.join(DATA_DIR, 'cached_data'))
+
+    def test_collectors_save_dir_consistency(self):
+        """Verify all collectors initialize save_dir using canonical update_dir_name paths."""
+        starters = Starters()
+        self.assertEqual(starters.save_dir, update_dir_name('starters'))
+        self.assertEqual(starters.save_dir, os.path.join(DATA_DIR, 'cached_data', 'starters'))
+
+        injuries = Injuries()
+        self.assertEqual(injuries.save_dir, update_dir_name('injuries'))
+        self.assertEqual(injuries.save_dir, os.path.join(DATA_DIR, 'cached_data', 'injuries'))
+
+        fantasy = LoadFantasyData()
+        self.assertEqual(fantasy.save_dir, update_dir_name('fantasy_data'))
+        self.assertEqual(fantasy.save_dir, os.path.join(DATA_DIR, 'cached_data', 'fantasy_data'))
+
+        ejections = Ejections()
+        self.assertEqual(ejections.save_dir, update_dir_name('ejections'))
+        self.assertEqual(ejections.save_dir, os.path.join(DATA_DIR, 'cached_data', 'ejections'))
+
+    def test_cached_data_unified_coverage(self):
+        """Verify that cached_data contains unified historical data across seasons with zero loss."""
+        # 1. Boxscores: must contain both 2024-25 (2240xxxx) and 2025-26 (2250xxxx) games
+        boxscore_dir = update_dir_name('nbacom_single_game_boxscores')
+        if os.path.exists(boxscore_dir):
+            boxscore_files = os.listdir(boxscore_dir)
+            self.assertGreaterEqual(len(boxscore_files), 2460, "Must contain all 2,460 boxscores for 24-25 and 25-26")
+            has_2024 = any("2240" in f for f in boxscore_files)
+            has_2025 = any("2250" in f for f in boxscore_files)
+            self.assertTrue(has_2024, "Missing 2024-25 season boxscores in unified cache")
+            self.assertTrue(has_2025, "Missing 2025-26 season boxscores in unified cache")
+
+        # 2. Starters & Injuries: must contain March-April 2025 files and 2025-26 files
+        for cat in ['starters', 'injuries', 'fantasy_data']:
+            cat_dir = update_dir_name(cat)
+            if os.path.exists(cat_dir):
+                files = os.listdir(cat_dir)
+                self.assertGreaterEqual(len(files), 189, f"Must contain at least 189 unified daily files for {cat}")
+                has_2025_spring = any("2025_03_" in f or "2025_04_" in f for f in files)
+                has_2025_autumn = any("2025_10_" in f or "2025_11_" in f for f in files)
+                self.assertTrue(has_2025_spring, f"Missing 2025 spring historical data in {cat}")
+                self.assertTrue(has_2025_autumn, f"Missing 2025 autumn data in {cat}")
 
 
 if __name__ == "__main__":

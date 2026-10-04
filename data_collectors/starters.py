@@ -290,9 +290,7 @@ class Starters:
 
         self.df = EMPTY_DF
 
-        self.save_dir = os.path.join(update_dir_name('cached_data'), 'starters')
-        if not os.path.isdir(self.save_dir):
-            os.mkdir(self.save_dir)
+        self.save_dir = update_dir_name('starters')
 
     @staticmethod
     def all_load_classes() -> list[type[LoadStartersAbstract]]:

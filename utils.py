@@ -890,10 +890,32 @@ def timeit(method):
     return timed
 
 
-def update_dir_name(dir_name: str):
-    """Resolve a data subdirectory name to an absolute path under DATA_DIR."""
-    dir_name = dir_name.strip('/')
-    full_path = os.path.join(DATA_DIR, dir_name)
+def update_dir_name(dir_name: str) -> str:
+    """Resolve a data subdirectory name to a canonical absolute path under DATA_DIR.
+
+    Subdirectories in cached_subdirs canonically live under DATA_DIR/cached_data/.
+    Root-level data categories (e.g. 'stats', 'season_schedules', 'features')
+    live directly under DATA_DIR.
+    """
+    clean_name = dir_name.replace('\\', '/').strip('/')
+    cached_subdirs = {
+        'starters',
+        'injuries',
+        'fantasy_data',
+        'ejections',
+        'nbacom_single_game_boxscores',
+        'nbacom_single_game_pbp',
+        'rotogrinders_lineups',
+        'left_midgame',
+    }
+    parts = clean_name.split('/')
+    if parts[0] == 'cached_data':
+        full_path = os.path.join(DATA_DIR, *parts)
+    elif parts[0] in cached_subdirs:
+        full_path = os.path.join(DATA_DIR, 'cached_data', *parts)
+    else:
+        full_path = os.path.join(DATA_DIR, *parts)
+
     os.makedirs(full_path, exist_ok=True)
     return full_path
 
