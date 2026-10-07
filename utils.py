@@ -9,6 +9,7 @@ import requests
 import pyarrow
 import time
 import unicodedata
+import re
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -774,13 +775,57 @@ def add_game_times_to_df(df: pd.DataFrame, schedule: pd.DataFrame | None = None)
     return df
 
 
+NON_DECOMPOSING_ACCENTS = str.maketrans({
+    'Đ': 'D', 'đ': 'd',
+    'Ø': 'O', 'ø': 'o',
+    'Ł': 'L', 'ł': 'l',
+    'Æ': 'AE', 'æ': 'ae',
+    'Œ': 'OE', 'œ': 'oe',
+    'ß': 'ss',
+    'Þ': 'TH', 'þ': 'th',
+})
+
+_END_SUFFIX_REGEX = re.compile(r'\s+(jr|sr|ii|iii|iv|v)\.?$', re.IGNORECASE)
+
+
 def remove_accents(input_str: str | None) -> str | None:
-    if input_str is None:
-        return None
+    if input_str is None or not isinstance(input_str, str):
+        return input_str
+    # Replace non-decomposing characters first
+    input_str = input_str.translate(NON_DECOMPOSING_ACCENTS)
     # Normalize string to decompose accented characters
     normalized_str = unicodedata.normalize('NFD', input_str)
     # Filter out combining characters (accents and diacritics)
     return ''.join(char for char in normalized_str if not unicodedata.combining(char))
+
+
+def normalize_player_name(name: str | None) -> str:
+    """
+    Produce a canonical comparison key for a player name by stripping accents,
+    punctuation (periods, apostrophes, hyphens), end suffixes (Jr, Sr, III, etc.),
+    and collapsing whitespace.
+    """
+    if not isinstance(name, str):
+        return ''
+    clean = remove_accents(name)
+    if not clean:
+        return ''
+    clean = clean.lower()
+    clean = clean.replace('-', ' ')
+    clean = re.sub(r"[.\'’`]", "", clean)
+    clean = _END_SUFFIX_REGEX.sub("", clean)
+    return " ".join(clean.split())
+
+
+def _clean_player_name(n: Any) -> Any:
+    """Safely remove accents, strip whitespace, and apply manual aliases in a single pass."""
+    if not isinstance(n, str):
+        return n
+    n = remove_accents(n)
+    if isinstance(n, str):
+        n = n.strip(' ')
+        n = FIX_PLAYER_NAMES.get(n, n)
+    return n
 
 
 class FixPlayerNames:
@@ -794,42 +839,85 @@ class FixPlayerNames:
         if compare_names is not None and isinstance(compare_names, pd.Series):
             compare_names = compare_names.values
         self.compare_names = compare_names
+        self.compare_names_set: set[str] = set()
+        self._lower_to_compare: dict[str, str] = {}
+        self._norm_to_compare: dict[str, str] = {}
+        self._ambiguous_norms: set[str] = set()
+
         if self.compare_names is not None:
-            self.compare_names = [remove_accents(n) for n in self.compare_names if n is not None]
-            self.compare_names = [FIX_PLAYER_NAMES.get(n, n) for n in self.compare_names]
+            cleaned_compare = []
+            for n in self.compare_names:
+                c = _clean_player_name(n)
+                if isinstance(c, str):
+                    cleaned_compare.append(c)
+            self.compare_names = cleaned_compare
+            self.compare_names_set = set(cleaned_compare)
+            self._lower_to_compare = {n.lower(): n for n in cleaned_compare}
+
+            for n in cleaned_compare:
+                norm_key = normalize_player_name(n)
+                if norm_key:
+                    if norm_key in self._norm_to_compare and self._norm_to_compare[norm_key] != n:
+                        self._ambiguous_norms.add(norm_key)
+                    else:
+                        self._norm_to_compare[norm_key] = n
 
     def fix_names(self, names_to_convert: list[str] | np.ndarray | pd.Series) -> np.ndarray:
         if isinstance(names_to_convert, pd.Series):
             names_to_convert = names_to_convert.values
         elif isinstance(names_to_convert, list):
-            names_to_convert = np.array(names_to_convert)
+            names_to_convert = np.array(names_to_convert, dtype=object)
+        else:
+            names_to_convert = np.asarray(names_to_convert, dtype=object)
 
-        converted_names = np.array([remove_accents(n) if isinstance(n, str) else n for n in names_to_convert])
-        converted_names = np.array([n.strip(' ') for n in converted_names])
-        converted_names = np.array([FIX_PLAYER_NAMES.get(n, n) for n in converted_names])
-        if self.compare_names is not None:
-            names_to_fix = \
-                sorted(set([n for n in converted_names if n not in self.compare_names and n is not None and len(n) > 3]))
-            original_to_fixed_names = dict()    # keep all the names that were fixed here
-            names_not_fixed = list()            # the names that weren't fixed
+        # Single-pass safe cleaning (accents + strip + dictionary)
+        converted_names = np.array([_clean_player_name(n) for n in names_to_convert], dtype=object)
+
+        if self.compare_names is not None and len(self.compare_names_set) > 0:
+            names_to_fix = sorted({
+                n for n in converted_names
+                if isinstance(n, str) and n not in self.compare_names_set and len(n) > 3
+            })
+            original_to_fixed_names = dict()
+            names_not_fixed = list()
+
             for n in names_to_fix:
                 inds = np.where(converted_names == n)[0]
-                check_names = [f'{n[0]}.{n[1]}.{n[2:]}', f'{n[0]}.{n[1]} {n[2:]}']
-                check_names += [n.replace(suff, '') for suff in FixPlayerNames.SUFFIXES if suff in n]
-                check_names += [n + suff for suff in FixPlayerNames.SUFFIXES]
+                matched_target = None
 
-                check_names_in_compare_names = sorted(set(check_names) & set(self.compare_names))
-                if len(check_names_in_compare_names) > 0:
-                    converted_names[inds] = check_names_in_compare_names[0]
-                    original_to_fixed_names[n] = check_names_in_compare_names[0]
+                # 1. Direct lowercase match (O(1))
+                if n.lower() in self._lower_to_compare:
+                    matched_target = self._lower_to_compare[n.lower()]
+
+                # 2. Check initial expansions and suffix variations
+                if matched_target is None:
+                    check_names = []
+                    # Initial expansion without double spaces
+                    if len(n) >= 3 and n[0].isupper() and n[1].isupper() and n[2] == ' ':
+                        check_names.append(f"{n[0]}.{n[1]}. {n[3:]}")
+                    elif len(n) >= 5 and n[0].isupper() and n[1] == '.' and n[2].isupper() and n[3] == '.' and n[4] == ' ':
+                        check_names.append(f"{n[0]}{n[2]} {n[5:]}")
+
+                    for suff in FixPlayerNames.SUFFIXES:
+                        if suff in n:
+                            check_names.append(n.replace(suff, ''))
+                        check_names.append(n + suff)
+
+                    valid_checks = [c for c in check_names if c in self.compare_names_set]
+                    if valid_checks:
+                        matched_target = valid_checks[0]
+
+                # 3. Normalized key match (handles accents, hyphens, periods, casing, suffixes automatically)
+                if matched_target is None:
+                    norm_key = normalize_player_name(n)
+                    if norm_key and norm_key in self._norm_to_compare and norm_key not in self._ambiguous_norms:
+                        matched_target = self._norm_to_compare[norm_key]
+
+                if matched_target is not None:
+                    converted_names[inds] = matched_target
+                    original_to_fixed_names[n] = matched_target
                 else:
-                    matches_lower = \
-                        [compare_name for compare_name in self.compare_names if n.lower() == compare_name.lower()]
-                    if len(matches_lower) > 0:
-                        converted_names[inds] = matches_lower[0]
-                        original_to_fixed_names[n] = matches_lower[0]
-                    else:
-                        names_not_fixed.append(n)
+                    names_not_fixed.append(n)
 
             if len(original_to_fixed_names) > 0:
                 logging.info(f'\n@@@@@@@@@@@@@@@@@@@ fixed names: @@@@@@@@@@@@@@@@@@@\n{original_to_fixed_names}\n'
