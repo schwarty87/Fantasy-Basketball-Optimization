@@ -91,31 +91,36 @@ def season_int_to_str(season: int | str | None = None) -> str:
 
 def downcast_df(df: pd.DataFrame, df_name: str | None = None, print_usage: bool = True, rtol: float = 1e-6,
                 atol: float = 1e-5) -> pd.DataFrame:
+    if df.empty:
+        return df
     memory_usage_before = df.memory_usage().sum() * 1e-6
-    int_cols = set(list(df.select_dtypes(('integer', 'bool')).columns) + [c for c in df.columns if c.endswith('_ID')])
-    float_cols = set(df.select_dtypes('float').columns)
-    for c in df.columns:
-        if is_datetime64_any_dtype(df[c]) or is_string_dtype(df[c]) or c == 'DATE':
-            continue
-        if c not in int_cols and df[c].notnull().all() and (df[c].astype(int) == df[c]).all():
-            int_cols.add(c)
-            continue
-        if c not in int_cols and c not in float_cols and pd.to_numeric(df[c], errors='coerce').notnull().all():
-            float_cols.add(c)
-    bool_cols = set([c for c in int_cols if set(df[c].unique()) <= {0, 1, -1, True, False}])
-    int_cols = int_cols - bool_cols
-    float_cols = float_cols - int_cols - bool_cols
-    downcasted = df[sorted(float_cols)].apply(pd.to_numeric, downcast='float')
-    for c in float_cols:
-        if np.allclose(df[c], downcasted[c], rtol=rtol, atol=atol, equal_nan=True):
-            df[c] = downcasted[c].values
-    downcasted = df[sorted(int_cols)].apply(pd.to_numeric, downcast='integer')
-    for c in int_cols:
-        if df[c].notnull().all():
-            both_null = df[c].isnull() & downcasted[c].isnull()
-            if ((df[c].astype(int) == downcasted[c]) | both_null).all():
-                df[c] = downcasted[c]
-    df[sorted(bool_cols)] = (df[sorted(bool_cols)] == 1) | (df[sorted(bool_cols)] == True)
+
+    # 1. Downcast float64 columns to float32 where numeric precision is preserved
+    float_cols = list(df.select_dtypes(include=['float64']).columns)
+    if float_cols:
+        downcasted_floats = df[float_cols].apply(pd.to_numeric, downcast='float')
+        for c in float_cols:
+            if np.allclose(df[c], downcasted_floats[c], rtol=rtol, atol=atol, equal_nan=True):
+                df[c] = downcasted_floats[c].values
+
+    # 2. Downcast integer columns (int64 -> int32, int16, int8) preserving exact values (exclude _ID to maintain stable ID types)
+    int_cols = [c for c in df.select_dtypes(include=['int64', 'integer']).columns if not c.endswith('_ID')]
+    if int_cols:
+        downcasted_ints = df[int_cols].apply(pd.to_numeric, downcast='integer')
+        for c in int_cols:
+            if (df[c] == downcasted_ints[c]).all():
+                df[c] = downcasted_ints[c]
+
+    # 3. Only convert known boolean indicator flags or existing bools to boolean
+    # Prevents counting stats (like BLK, STL) or +/- metrics from being corrupted into booleans
+    bool_candidates = set(df.select_dtypes(include=['bool', 'boolean']).columns)
+    for c in ('AVAILABLE_FLAG', 'DOUBLE_DOUBLE', 'TRIPLE_DOUBLE', 'CONFIRMED', 'IS_QUESTIONABLE',
+              'LEFT_MIDGAME', 'EJECTED', 'IS_OUT', 'STARTER'):
+        if c in df.columns and set(df[c].dropna().unique()) <= {0, 1, True, False}:
+            bool_candidates.add(c)
+    for c in sorted(bool_candidates):
+        df[c] = (df[c] == 1) | (df[c] == True)
+
     if print_usage:
         logging.info(f'{df_name + " " if df_name is not None else ""}df memory usage: {memory_usage_before:.3f}mb -> '
                      f'{df.memory_usage().sum() * 1e-6:.3f}mb')
@@ -256,10 +261,7 @@ def load_nbacom_data(url: str, use_key: str = 'resultSets', player_or_team: bool
         data_dict = data_dict[0]
     if 'headers' in data_dict and 'rowSet' in data_dict:
         header, stats = data_dict['headers'], data_dict['rowSet']
-        df = pd.DataFrame(stats, columns=header)
-        if not df.empty:
-            return df
-        return
+        return pd.DataFrame(stats, columns=header)
     else:
         return data_dict
 
@@ -553,53 +555,80 @@ def get_latest_date_with_data(df: pd.DataFrame) -> datetime.date:
     return df.query('MIN > 0')['DATE'].max()
 
 
-def assert_valid_df_all(df: pd.DataFrame, allow_less_games_2014: bool = False):
-    assert df['GAME_ID'].notnull().all(), 'there are some rows with null GAME_ID!!!'
-    previous_dates = df['DATE'] < get_current_date()
-    if previous_dates.any():
-        assert df.loc[previous_dates, 'GAME_ID'].min() > 10, 'there are some invalid GAME_IDs!!!'
+def assert_valid_df_all(df: pd.DataFrame, allow_less_games_2014: bool = False, check_total_games: bool = True):
+    if df.empty:
+        return
+    if 'GAME_ID' in df.columns:
+        assert df['GAME_ID'].notnull().all(), 'there are some rows with null GAME_ID!!!'
+        if 'DATE' in df.columns:
+            dates = pd.to_datetime(df['DATE']).dt.date
+            previous_dates = dates < get_current_date()
+            if previous_dates.any():
+                min_id = pd.to_numeric(df.loc[previous_dates, 'GAME_ID'], errors='coerce').min()
+                assert min_id is not None and min_id > 10, 'there are some invalid GAME_IDs!!!'
 
-    assert (df.groupby('TEAM_ID')['TEAM'].nunique() == 1).all(), \
-        'there is a TEAM_ID with more than one team name!!!'
-    assert (df.groupby('TEAM')['TEAM_ID'].nunique() == 1).all(), \
-        'there is a team name with more than one TEAM_ID!!!'
+    if 'TEAM_ID' in df.columns and 'TEAM' in df.columns:
+        bad_teams = df.groupby('TEAM_ID')['TEAM'].nunique()
+        bad_team_ids = bad_teams[bad_teams > 1]
+        assert bad_team_ids.empty, f'there is a TEAM_ID with more than one team name: {bad_team_ids.to_dict()}!!!'
 
-    # there are 1230 total games in every regular season
-    games_per_year = df.groupby('SEASON_YEAR')['GAME_ID'].nunique()
-    completed_season_cutoff = get_current_season() - 1
-    games_per_year = games_per_year.loc[games_per_year.index <= completed_season_cutoff]
-    if 2019 in games_per_year.index:
-        assert games_per_year.loc[2019] == 1059, '2020 doesnt have the correct amount of games!!!'
-        games_per_year.drop(index=2019, inplace=True)
-    if 2020 in games_per_year.index:
-        assert games_per_year.loc[2020] == 1080, '2020 doesnt have the correct amount of games!!!'
-        games_per_year.drop(index=2020, inplace=True)
-    if allow_less_games_2014:
-        games_per_year = games_per_year.loc[games_per_year.index != 2014]
-    assert (games_per_year == 1230).all(), 'missing games for a certain year!!!'
+        bad_names = df.groupby('TEAM')['TEAM_ID'].nunique()
+        bad_team_names = bad_names[bad_names > 1]
+        assert bad_team_names.empty, f'there is a team name with more than one TEAM_ID: {bad_team_names.to_dict()}!!!'
+
+    if check_total_games and 'SEASON_YEAR' in df.columns and 'GAME_ID' in df.columns:
+        # there are 1230 total games in every regular season
+        games_per_year = df.groupby('SEASON_YEAR')['GAME_ID'].nunique()
+        completed_season_cutoff = get_current_season() - 1
+        games_per_year = games_per_year.loc[games_per_year.index <= completed_season_cutoff]
+        if 2019 in games_per_year.index:
+            assert games_per_year.loc[2019] == 1059, '2019 doesnt have the correct amount of games!!!'
+            games_per_year = games_per_year.drop(index=2019)
+        if 2020 in games_per_year.index:
+            assert games_per_year.loc[2020] == 1080, '2020 doesnt have the correct amount of games!!!'
+            games_per_year = games_per_year.drop(index=2020)
+        if allow_less_games_2014 and 2014 in games_per_year.index:
+            games_per_year = games_per_year.loc[games_per_year.index != 2014]
+        bad_years = games_per_year[games_per_year != 1230].to_dict()
+        assert (games_per_year == 1230).all(), f'missing games for a certain year (expected 1230): {bad_years}!!!'
 
 
 def assert_valid_df_players(df: pd.DataFrame):
-    num_unique_names_per_id = df.groupby('PLAYER_ID')['NAME'].nunique()
-    if not (num_unique_names_per_id <= 1).all():
-        ids_and_names = dict()
-        bad_ids = num_unique_names_per_id.loc[num_unique_names_per_id > 1].index
-        for bad_id in bad_ids:
-            ids_and_names[bad_id] = df.query(f'PLAYER_ID == {bad_id}')['NAME'].unique()
-        logging.error(f'found PLAYER_ID with more than 1 name!\n{ids_and_names}')
-        raise ValueError(f'found PLAYER_ID with more than 1 name!\n{ids_and_names}')
-    if 'STARTER' in df.columns:
-        assert (df.query('STARTER').groupby(['DATE', 'TEAM_ID']).size() == 5).all(), \
-            "there is at least one game that doesn't have 5 starters!!!"
-    if 'START_POSITION' in df.columns:
+    if df.empty:
+        return
+    if 'PLAYER_ID' in df.columns and 'NAME' in df.columns:
+        num_unique_names_per_id = df.groupby('PLAYER_ID')['NAME'].nunique()
+        if not (num_unique_names_per_id <= 1).all():
+            bad_ids = num_unique_names_per_id.loc[num_unique_names_per_id > 1].index
+            ids_and_names = {
+                bad_id: df.loc[df['PLAYER_ID'] == bad_id, 'NAME'].unique().tolist()
+                for bad_id in bad_ids
+            }
+            logging.error(f'found PLAYER_ID with more than 1 name!\n{ids_and_names}')
+            raise ValueError(f'found PLAYER_ID with more than 1 name!\n{ids_and_names}')
+
+    if 'STARTER' in df.columns and {'DATE', 'TEAM_ID'}.issubset(df.columns):
+        starters_per_team = df.loc[df['STARTER'].astype(bool)].groupby(['DATE', 'TEAM_ID']).size()
+        bad_starters = starters_per_team[starters_per_team != 5]
+        assert bad_starters.empty, f"there is at least one game that doesn't have 5 starters: {bad_starters.head(5).to_dict()}!!!"
+
+    if 'START_POSITION' in df.columns and {'DATE', 'TEAM_ID'}.issubset(df.columns):
         group_cols = ['DATE', 'TEAM_ID']
-        assert (df.assign(STARTER=df['START_POSITION'].notnull()).groupby(group_cols)['STARTER'].sum() == 5).all(), \
-            'there is at least one team that doesnt have 5 starters!!!'
-        assert (df.dropna(subset='START_POSITION').groupby(group_cols)['START_POSITION'].apply(set) ==
-                set(START_POSITIONS)).all(), \
-            "there is at least one team that doesn't have the correct positions!!!"
-    if df.groupby(['PLAYER_ID', 'DATE']).size().max() > 1:
-        raise ValueError('we have duplicate rows in the dataframe!')
+        starters_sum = df.assign(STARTER=df['START_POSITION'].notnull()).groupby(group_cols)['STARTER'].sum()
+        bad_sums = starters_sum[starters_sum != 5]
+        assert bad_sums.empty, f'there is at least one team that doesnt have 5 starters: {bad_sums.head(5).to_dict()}!!!'
+
+        positions = df.dropna(subset=['START_POSITION']).groupby(group_cols)['START_POSITION'].apply(set)
+        expected_pos = set(START_POSITIONS)
+        bad_pos = positions[positions != expected_pos]
+        assert bad_pos.empty, f"there is at least one team that doesn't have the correct positions: {bad_pos.head(5).to_dict()}!!!"
+
+    if 'PLAYER_ID' in df.columns and 'DATE' in df.columns:
+        dup_mask = df.duplicated(subset=['PLAYER_ID', 'DATE'])
+        if dup_mask.any():
+            sample_dups = df.loc[dup_mask, ['PLAYER_ID', 'DATE']].head(5).to_dict(orient='records')
+            raise ValueError(f'we have duplicate rows in the dataframe! Samples: {sample_dups}')
+
 
 
 def load_from_pkl(path: str):

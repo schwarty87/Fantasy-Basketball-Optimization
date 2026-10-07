@@ -1,5 +1,4 @@
 import os
-import data_collectors
 import datetime
 import logging
 import json
@@ -8,32 +7,69 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from nba_api.stats.endpoints import playergamelogs, teamgamelogs, boxscoretraditionalv3
+import data_collectors
 from constants import URLS, SCORING, TEAM_NAME_TO_ID, TEAM_ID_TO_NAME
 from enums import StatsTypes, BoxscoreTypes, Sites
-from utils import downcast_df, load_and_cache_players_list, season_int_to_str, load_nbacom_data, read_and_cache, \
-    get_latest_date_with_data, assert_valid_df_all, assert_valid_df_players, load_schedule, get_current_time, \
-    get_current_date, FixPlayerNames, get_header, update_dir_name, get_current_season
+from utils import (
+    downcast_df,
+    load_and_cache_players_list,
+    season_int_to_str,
+    load_nbacom_data,
+    read_and_cache,
+    get_latest_date_with_data,
+    assert_valid_df_all,
+    assert_valid_df_players,
+    load_schedule,
+    get_current_time,
+    get_current_date,
+    FixPlayerNames,
+    get_header,
+    update_dir_name,
+    get_current_season,
+)
 
-FILL_ZEROS_COLS = ['MIN', 'FGM', 'FGA', '3PM', '3PA', 'FTM', 'FTA', 'OREB', 'DREB', 'REB', 'AST', 'TOV', 'STL',
-                   'BLK', 'BLKA', 'PF', 'PFD', 'PTS', 'PLUS_MINUS', 'FG_PCT', '3P_PCT', 'FT_PCT']
+FILL_ZEROS_COLS = [
+    'MIN', 'FGM', 'FGA', '3PM', '3PA', 'FTM', 'FTA', 'OREB', 'DREB', 'REB', 'AST', 'TOV', 'STL',
+    'BLK', 'BLKA', 'PF', 'PFD', 'PTS', 'PLUS_MINUS', 'FG_PCT', '3P_PCT', 'FT_PCT'
+]
+
+
+def _coalesce_merge_columns(df: pd.DataFrame, suffix: str = '_x') -> pd.DataFrame:
+    """
+    Fills NaN values in base columns using suffixed columns (e.g. from an outer or left merge),
+    then drops all suffixed columns. Safely uses str.removesuffix instead of character-set strip.
+    """
+    suffix_cols = [c for c in df.columns if c.endswith(suffix)]
+    if not suffix_cols:
+        return df
+    base_cols = [c.removesuffix(suffix) for c in suffix_cols]
+    for base_col, s_col in zip(base_cols, suffix_cols):
+        if base_col in df.columns:
+            df[base_col] = df[base_col].fillna(df[s_col])
+        else:
+            df[base_col] = df[s_col]
+    df.drop(columns=suffix_cols, inplace=True)
+    return df
 
 
 class StatsLoader:
     """
-    parent class for loading stats. both the classes for loading/scraping players stats and team stats inherit form
-    this class
+    Parent class for loading stats. Both the classes for loading/scraping players stats and team stats inherit from
+    this class.
     """
 
     LOADER_TYPE = None
     BOXSCORE_TYPES = [BoxscoreTypes.Base]
-    SEASON_TYPES = ['Regular Season']  #, 'IST']
+    SEASON_TYPES = ['Regular Season']
     MERGE_ON = ['DATE', 'TEAM_ID']
     DROP_COLS = []
-    REPLACE_COLUMN_NAMES = {'PLAYER_NAME': 'NAME', 'TEAM_ABBREVIATION': 'TEAM', 'GAME_DATE': 'DATE',
-                            'MATCHUP': 'OPPONENT', 'WL': 'W_L', 'FG3M': '3PM', 'FG3A': '3PA', 'OFF_RATING': 'OFFRTG',
-                            'FG3_PCT': '3P_PCT', 'PCT_FG3M': 'PCT_3PM', 'DEF_RATING': 'DEFRTG', 'AST_TOV': 'AST_TO',
-                            'PCT_FG3A': 'PCT_3PA', 'NET_RATING': 'NETRTG', 'DD2': 'DOUBLE_DOUBLE',
-                            'TD3': 'TRIPLE_DOUBLE'}
+    REPLACE_COLUMN_NAMES = {
+        'PLAYER_NAME': 'NAME', 'TEAM_ABBREVIATION': 'TEAM', 'GAME_DATE': 'DATE',
+        'MATCHUP': 'OPPONENT', 'WL': 'W_L', 'FG3M': '3PM', 'FG3A': '3PA', 'OFF_RATING': 'OFFRTG',
+        'FG3_PCT': '3P_PCT', 'PCT_FG3M': 'PCT_3PM', 'DEF_RATING': 'DEFRTG', 'AST_TOV': 'AST_TO',
+        'PCT_FG3A': 'PCT_3PA', 'NET_RATING': 'NETRTG', 'DD2': 'DOUBLE_DOUBLE',
+        'TD3': 'TRIPLE_DOUBLE'
+    }
     SORT_COLS = []
 
     def __init__(self, season: int | None = None, **kwargs):
@@ -44,13 +80,14 @@ class StatsLoader:
         self.season_str = season_int_to_str(self.season)
 
         self._stats_dir = update_dir_name('stats')
-        self.filepath = os.path.join(self._stats_dir, f'{self.LOADER_TYPE.name}_boxscores.feather')
+        loader_name = self.LOADER_TYPE.name if self.LOADER_TYPE is not None else 'base'
+        self.filepath = os.path.join(self._stats_dir, f'{loader_name}_boxscores.feather')
 
         self.df = pd.DataFrame(columns=self.SORT_COLS)
         self.latest_date_with_data = datetime.date(2000, 1, 1)
         self._reset_updates_df()
 
-    def  call(self, add_upcoming_games: bool = True):
+    def call(self, add_upcoming_games: bool = True):
         self._reset_updates_df()
         self.load_saved_data()
         self.scrape_boxscores_from_nbacom()
@@ -89,9 +126,10 @@ class StatsLoader:
         yesterdays_date = (get_current_time() - datetime.timedelta(days=1)).date()
         if self.latest_date_with_data >= yesterdays_date:
             return
-        self.updates_df = list()
+
+        updates_list: list[pd.DataFrame] = []
         for season_type in self.SEASON_TYPES:
-            season_type_dfs = list()
+            season_type_dfs: list[pd.DataFrame] = []
             for i, boxscore_type in tqdm(enumerate(self.BOXSCORE_TYPES), total=len(self.BOXSCORE_TYPES),
                                          desc=f'scraping boxscores from nba.com for {self.LOADER_TYPE.name}'):
                 curr_df = self.scrape_single_boxscore_type_from_nbacom(boxscore_type=boxscore_type,
@@ -106,37 +144,39 @@ class StatsLoader:
                     break
 
                 # drop unneeded or duplicate columns
-                drop_cols = (set(curr_df.columns) & set(self.DROP_COLS)).union(
-                    set([c for c in curr_df if c.endswith('_RANK') or c.startswith('E_') or c.startswith('sp_work_')]))
-                duplicate_cols = set(curr_df.columns) & set(sum([list(df.columns) for df in season_type_dfs], []))
-                drop_cols = drop_cols.union(duplicate_cols)
+                existing_cols = {col for df in season_type_dfs for col in df.columns}
+                drop_cols = (set(curr_df.columns) & set(self.DROP_COLS)) | {
+                    c for c in curr_df.columns if c.endswith('_RANK') or c.startswith(('E_', 'sp_work_'))
+                } | (set(curr_df.columns) & existing_cols)
                 curr_df.drop(columns=list(drop_cols), inplace=True)
 
                 curr_df.set_index(self.MERGE_ON, inplace=True)
                 season_type_dfs.append(curr_df)
-            if len(season_type_dfs) > 0:
+
+            if season_type_dfs:
                 assert len(np.unique([df.shape[0] for df in season_type_dfs])) == 1, \
                     "the season_type_dfs don't have the same number of rows!"
-                self.updates_df.append(pd.concat(season_type_dfs, axis=1).reset_index(drop=False))
-        if len(self.updates_df) == 0:
+                updates_list.append(pd.concat(season_type_dfs, axis=1).reset_index(drop=False))
+
+        if not updates_list:
             self.updates_df = pd.DataFrame(columns=self.SORT_COLS)
             return
-        assert len(np.unique([df.shape[1] for df in self.updates_df])) == 1, \
+
+        assert len(np.unique([df.shape[1] for df in updates_list])) == 1, \
             "the updates_dfs don't have the same number of columns!"
-        self.updates_df = pd.concat(self.updates_df, axis=0).reset_index(drop=True)
+        self.updates_df = pd.concat(updates_list, axis=0).reset_index(drop=True)
         self.updates_df.drop_duplicates(self.MERGE_ON, inplace=True)
 
-        split_opp = list(map(lambda x: x.split(), self.updates_df['OPPONENT']))
-        vals = [(int(i[1] == 'vs.'), i[2]) for i in split_opp]
-        self.updates_df['HOME'] = [i[0] for i in vals]
-        self.updates_df['OPPONENT'] = [i[1] for i in vals]
+        split_opp = [x.split() for x in self.updates_df['OPPONENT']]
+        self.updates_df['HOME'] = [int(i[1] == 'vs.') for i in split_opp]
+        self.updates_df['OPPONENT'] = [i[2] for i in split_opp]
         self.updates_df['W_L'] = (self.updates_df['W_L'] == 'W').astype(int)
         self.updates_df['DATE'] = pd.to_datetime(self.updates_df['DATE']).dt.date
         self.updates_df['SEASON_YEAR'] = self.updates_df['SEASON_YEAR'].str.split('-').str[0].astype(int)
         self.updates_df.sort_values(self.SORT_COLS, inplace=True)
         self.updates_df = self.updates_df.loc[self.updates_df['TEAM_ID'].isin(TEAM_ID_TO_NAME.keys())]
         downcast_df(self.updates_df)
-        self.assert_valid_df(self.updates_df)
+        self.assert_valid_df(self.updates_df, is_incremental=True)
 
     def _add_extra_data_to_updates_df(self, add_upcoming_games: bool = True):
         pass
@@ -152,21 +192,26 @@ class StatsLoader:
             self.df = pd.concat([self.df.loc[dates_not_in_updates], self.updates_df], axis=0)
             self.df.sort_values(self.SORT_COLS, inplace=True)
 
-    def assert_valid_df(self, df: pd.DataFrame):
-        assert_valid_df_all(df)
+    def assert_valid_df(self, df: pd.DataFrame, is_incremental: bool = False):
+        assert_valid_df_all(df, check_total_games=not is_incremental)
 
     def _save_df(self):
         if not self.updates_df.empty:
             if 'AVAILABLE_FLAG' in self.df.columns:
-                self.df['AVAILABLE_FLAG'] = self.df['AVAILABLE_FLAG'].fillna(0).astype(bool).value_counts()
-            self.df.sort_values(self.SORT_COLS, inplace=True)
-            self.df.reset_index(drop=True, inplace=True)
-            self.assert_valid_df(self.df)
-            logging.info(f'saving {self.LOADER_TYPE.name} boxscores to {self.filepath}')
-
+                self.df['AVAILABLE_FLAG'] = self.df['AVAILABLE_FLAG'].fillna(0).astype(bool)
             if 'VIDEO_AVAILABLE' in self.df.columns:
                 self.df.drop(columns=['VIDEO_AVAILABLE'], inplace=True)
 
+            self.df.drop_duplicates(inplace=True)
+            self.df.sort_values(self.SORT_COLS, inplace=True)
+            self.df.reset_index(drop=True, inplace=True)
+            downcast_df(self.df)
+            self.assert_valid_df(self.df)
+
+            loader_name = self.LOADER_TYPE.name if self.LOADER_TYPE is not None else 'base'
+            logging.info(f'saving {loader_name} boxscores to {self.filepath}')
+
+            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
             tmp_path = self.filepath + '.tmp'
             self.df.to_feather(tmp_path)
             os.replace(tmp_path, self.filepath)
@@ -174,7 +219,7 @@ class StatsLoader:
 
 class StatsLoaderPlayers(StatsLoader):
     LOADER_TYPE = StatsTypes.player
-    BOXSCORE_TYPES = [BoxscoreTypes.Base]  # , BoxscoreTypes.Advanced, BoxscoreTypes.Usage]
+    BOXSCORE_TYPES = [BoxscoreTypes.Base]
     DROP_COLS = ['NICKNAME', 'TEAM_NAME', 'NBA_FANTASY_PTS', 'WNBA_FANTASY_PTS', 'VIDEO_AVAILABLE_FLAG']
     SORT_COLS = ['DATE', 'GAME_ID', 'TEAM_ID', 'PLAYER_ID']
     MERGE_ON = ['GAME_ID', 'TEAM_ID', 'PLAYER_ID']
@@ -185,13 +230,14 @@ class StatsLoaderPlayers(StatsLoader):
         :param out_players: a dict of players that are out today and their replacements in the starting lineup.
                             used when scraping data from rotogrinders
         """
-        super(StatsLoaderPlayers, self).__init__(season=season, **kwargs)
+        super().__init__(season=season, **kwargs)
 
         self.out_players = out_players
 
-        self._players_list = None
-        self._player_id_to_name = None
-        self._player_name_to_id = None
+        self._players_list: pd.DataFrame | None = None
+        self._player_id_to_name: dict[int, str] | None = None
+        self._player_name_to_id: dict[str, int] | None = None
+        self._name_fixer = FixPlayerNames()
 
         self._schedule = load_schedule(drop_ppd=True)
 
@@ -203,30 +249,41 @@ class StatsLoaderPlayers(StatsLoader):
         self._player_id_to_name = dict(zip(self._players_list['PLAYER_ID'], self._players_list['NAME']))
         self._player_name_to_id = dict(zip(self._players_list['NAME'], self._players_list['PLAYER_ID']))
 
-        super(StatsLoaderPlayers, self).call(add_upcoming_games=add_upcoming_games)
+        super().call(add_upcoming_games=add_upcoming_games)
 
     def load_saved_data(self) -> pd.DataFrame:
-        super().load_saved_data()
+        saved_df = super().load_saved_data()
+        if saved_df is not None:
+            self.df = saved_df
+        if self.df is None or self.df.empty:
+            return self.df
+
         self.df['MIN'] = self.df['MIN'].fillna(0)
         self.df = self.df.loc[self.df['NAME'].notnull()]
         for c in ('LEFT_MIDGAME', 'EJECTED', 'IS_OUT'):
-            self.df[c] = self.df[c].astype(bool)
-            self.df[c] = self.df[c].fillna(False)
+            if c in self.df.columns:
+                self.df[c] = self.df[c].fillna(False).astype(bool)
         self.df['PLAYER_ID'] = self.df['PLAYER_ID'].astype('int64')
 
         self.df['COMMENT'] = self.df['COMMENT'].fillna('')
         self.df.loc[(self.df['MIN'] > 0) & (self.df['COMMENT'].str.contains('DNP')), 'COMMENT'] = ''
 
         if not self.df.empty:
-            self.df['NAME'] = FixPlayerNames().fix_names(self.df['NAME'])
+            self.df['NAME'] = self._name_fixer.fix_names(self.df['NAME'])
 
         # adding missing ids from df
-        if self._player_name_to_id is not None:
-            already_in = set(self._player_id_to_name.keys()) if self._player_name_to_id is not None else set()
-            ids_to_add = list(set(self.df['PLAYER_ID'].unique()) - already_in)
-            add_dict = self.df.drop_duplicates('PLAYER_ID').set_index('PLAYER_ID').loc[ids_to_add, 'NAME'].to_dict()
-            self._player_id_to_name.update(add_dict)
-            self._player_name_to_id.update({v: k for k, v in add_dict.items()})
+        if self._player_name_to_id is not None and self._player_id_to_name is not None:
+            missing_ids = set(self.df['PLAYER_ID'].unique()) - set(self._player_id_to_name.keys())
+            if missing_ids:
+                new_records = (
+                    self.df.loc[self.df['PLAYER_ID'].isin(missing_ids), ['PLAYER_ID', 'NAME']]
+                    .drop_duplicates('PLAYER_ID')
+                )
+                add_dict = dict(zip(new_records['PLAYER_ID'], new_records['NAME']))
+                self._player_id_to_name.update(add_dict)
+                self._player_name_to_id.update(
+                    {name: pid for pid, name in add_dict.items() if name not in self._player_name_to_id}
+                )
 
         if 'VIDEO_AVAILABLE' in self.df.columns:
             self.df.drop(columns=['VIDEO_AVAILABLE'], inplace=True)
@@ -236,9 +293,9 @@ class StatsLoaderPlayers(StatsLoader):
         return self.df
 
     def scrape_boxscores_from_nbacom(self):
-        super(StatsLoaderPlayers, self).scrape_boxscores_from_nbacom()
+        super().scrape_boxscores_from_nbacom()
         if not self.updates_df.empty:
-            self.updates_df['NAME'] = FixPlayerNames().fix_names(self.updates_df['NAME'])
+            self.updates_df['NAME'] = self._name_fixer.fix_names(self.updates_df['NAME'])
 
     def scrape_single_boxscore_type_from_nbacom(self, boxscore_type: BoxscoreTypes,
                                                 season_type: str = 'Regular Season') -> pd.DataFrame:
@@ -247,6 +304,8 @@ class StatsLoaderPlayers(StatsLoader):
                                                 season=self.season_str,
                                                 season_type=season_type)
             curr_df = load_nbacom_data(curr_url)
+            if curr_df is None or curr_df.empty:
+                raise requests.exceptions.RequestException('Empty data from boxscores_nbacom2')
             curr_df['SEASON_YEAR'] = curr_df['SEASON_ID'].astype(str).str[1:]
             curr_df.drop(columns=['SEASON_ID'], inplace=True)
             for c in ('BLKA', 'PFD'):
@@ -254,24 +313,24 @@ class StatsLoaderPlayers(StatsLoader):
                     curr_df[c] = -1
             double_digits = (curr_df[['PTS', 'REB', 'AST', 'STL', 'BLK']] >= 10).sum(axis=1)
             curr_df['DOUBLE_DOUBLE'] = double_digits == 2
-            curr_df['TRIPLE_DOUBLE'] = double_digits == 3
-            # print('aaa >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-        except requests.exceptions.ConnectionError:
+            curr_df['TRIPLE_DOUBLE'] = double_digits >= 3
+        except (requests.exceptions.RequestException, KeyError):
             try:
                 curr_url = URLS().boxscores_nbacom(player_or_team=self.LOADER_TYPE.name,
                                                    measure_type=boxscore_type.name,
                                                    season=self.season_str,
                                                    season_type=season_type)
                 curr_df = load_nbacom_data(curr_url)
-                # print('bbb >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-            except requests.exceptions.ConnectionError:
+                if curr_df is None or curr_df.empty:
+                    raise requests.exceptions.RequestException('Empty data from boxscores_nbacom')
+            except (requests.exceptions.RequestException, KeyError):
                 player_game_logs = playergamelogs.PlayerGameLogs(season_nullable=self.season_str,
                                                                  measure_type_player_game_logs_nullable=boxscore_type.name,
                                                                  season_type_nullable=season_type,
                                                                  headers=get_header())
-                curr_df = player_game_logs.get_data_frames()[0]
-                # print('ccc >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-        return curr_df
+                dfs = player_game_logs.get_data_frames()
+                curr_df = dfs[0] if dfs else pd.DataFrame()
+        return curr_df if curr_df is not None else pd.DataFrame()
 
     def get_player_name_to_id(self) -> dict[str, int]:
         return self._player_name_to_id
@@ -292,14 +351,15 @@ class StatsLoaderPlayers(StatsLoader):
             all_dfs = all_dfs.loc[all_dfs['GAME_ID'].isin(game_ids)]
         else:
             keep_cols = ['GAME_ID', 'TEAM_ID', 'PLAYER_ID', 'START_POSITION', 'COMMENT']
-            rename_cols = {'gameId': 'GAME_ID', 'teamId': 'TEAM_ID', 'personId': 'PLAYER_ID', 'position': 'START_POSITION', 'comment': 'COMMENT'}
+            rename_cols = {
+                'gameId': 'GAME_ID', 'teamId': 'TEAM_ID', 'personId': 'PLAYER_ID',
+                'position': 'START_POSITION', 'comment': 'COMMENT'
+            }
             all_dfs = list()
             for count, gid in tqdm(enumerate(sorted(game_ids)), desc='getting boxscore comments from nba.com',
                                    total=len(game_ids)):
                 cache_name = f'nbacom_single_game_boxscores/nbacom_boxscoretraditionalv2_gid_{gid}.feather'
-                gid_str = str(gid)
-                if len(gid_str) < 10:
-                    gid_str = '0' * (10 - len(gid_str)) + gid_str
+                gid_str = str(gid).zfill(10)
                 try:
                     boxscore = boxscoretraditionalv3.BoxScoreTraditionalV3
                     tmp_df = read_and_cache(
@@ -310,22 +370,15 @@ class StatsLoaderPlayers(StatsLoader):
                     )
                 except (requests.exceptions.ReadTimeout, IndexError, json.decoder.JSONDecodeError):
                     curr_url = URLS().single_boxscores_nbacom(gid=gid_str)
-                    tmp_df = read_and_cache(lambda x: load_nbacom_data(url=x)[keep_cols], func_params={'x': curr_url},
-                                            cache_name=cache_name,
-                                            sleep_time_after_reading_from_web=0.6)
+                    tmp_df = read_and_cache(
+                        lambda x: load_nbacom_data(url=x)[keep_cols],
+                        func_params={'x': curr_url},
+                        cache_name=cache_name,
+                        sleep_time_after_reading_from_web=0.6
+                    )
                 all_dfs.append(tmp_df)
             all_dfs = pd.concat(all_dfs, axis=0).reset_index(drop=True)
 
-        # # changing the starters positions from G/F/C to PG/SG/SF/PF/C
-        # first_ind_in_team = np.where((all_dfs['TEAM_ID'] != all_dfs['TEAM_ID'].shift(1)) |
-        #                              (all_dfs['GAME_ID'] != all_dfs['GAME_ID'].shift(1)))[0]
-        # for i, prefix in enumerate(['S', 'P']):
-        #     add_inds = (first_ind_in_team + i).tolist() + (first_ind_in_team + i + 3).tolist()
-        #     assert all_dfs.loc[add_inds, 'START_POSITION'].isin(['F', 'G']).all(), \
-        #         f'indexing is off when adding prefix {prefix} to START_POSITION!!!'
-            # all_dfs.loc[add_inds, 'START_POSITION'] = prefix + all_dfs.loc[add_inds, 'START_POSITION']
-
-        # all_dfs['START_POSITION'].replace({'': np.nan}, inplace=True)
         for c in ['GAME_ID', 'TEAM_ID', 'PLAYER_ID']:
             all_dfs[c] = all_dfs[c].astype('int64')
         if 'START_POSITION' in all_dfs:
@@ -333,9 +386,10 @@ class StatsLoaderPlayers(StatsLoader):
         self.updates_df = self.updates_df.merge(all_dfs, on=['GAME_ID', 'TEAM_ID', 'PLAYER_ID'], how='outer')
 
         # filling nans for NAME
-        self.updates_df['NAME'] = \
-            self.updates_df['NAME'].fillna(self.updates_df['PLAYER_ID'].replace(self._player_id_to_name))
-        self.updates_df.loc[self.updates_df['PLAYER_ID'] == self.updates_df['NAME'], 'NAME'] = np.nan
+        if self._player_id_to_name:
+            self.updates_df['NAME'] = self.updates_df['NAME'].fillna(
+                self.updates_df['PLAYER_ID'].map(self._player_id_to_name)
+            )
 
         # filling nans for team stats
         fill_cols = ['DATE', 'SEASON_YEAR', 'TEAM', 'OPPONENT', 'W_L', 'HOME']
@@ -345,21 +399,22 @@ class StatsLoaderPlayers(StatsLoader):
         for c in merge_on:
             merge_df[c] = merge_df[c].astype('int64')
         self.updates_df = self.updates_df.merge(merge_df, on=merge_on, how='left', suffixes=(None, '_x'))
-        for c in fill_cols:
-            self.updates_df[c] = self.updates_df[c].fillna(self.updates_df[c + '_x'])
-        self.updates_df.drop(columns=[c + '_x' for c in fill_cols], inplace=True)
+        _coalesce_merge_columns(self.updates_df)
 
-        self.updates_df[FILL_ZEROS_COLS] = self.updates_df[FILL_ZEROS_COLS].fillna(0)
-        self.updates_df[['DOUBLE_DOUBLE', 'TRIPLE_DOUBLE']] = \
-            self.updates_df[['DOUBLE_DOUBLE', 'TRIPLE_DOUBLE']].fillna(False)
+        existing_zero_cols = [c for c in FILL_ZEROS_COLS if c in self.updates_df.columns]
+        if existing_zero_cols:
+            self.updates_df[existing_zero_cols] = self.updates_df[existing_zero_cols].fillna(0)
+        for c in ('DOUBLE_DOUBLE', 'TRIPLE_DOUBLE'):
+            if c in self.updates_df.columns:
+                self.updates_df[c] = self.updates_df[c].fillna(False)
 
         drop_inds = self.updates_df['NAME'].isnull() & (self.updates_df['MIN'] == 0)
         self.updates_df = self.updates_df.loc[~drop_inds]
 
         self.updates_df.sort_values(self.SORT_COLS, inplace=True)
-        self.updates_df['NAME'] = FixPlayerNames().fix_names(self.updates_df['NAME'])
+        self.updates_df['NAME'] = self._name_fixer.fix_names(self.updates_df['NAME'])
         downcast_df(self.updates_df)
-        self.assert_valid_df(self.updates_df)
+        self.assert_valid_df(self.updates_df, is_incremental=True)
 
     def _add_extra_data_to_updates_df(self, add_upcoming_games: bool = True):
         if (not add_upcoming_games) and (self.updates_df is None or self.updates_df.empty):
@@ -367,25 +422,31 @@ class StatsLoaderPlayers(StatsLoader):
 
         self._read_single_game_boxscores_comments()
 
-        players_list_names = self._players_list['NAME'].to_list()
+        players_list_names = self._players_list['NAME'].to_list() if self._players_list is not None else []
         ejections = data_collectors.ejections.Ejections(nbacom_players_list=players_list_names)
         ejections_df = ejections.collect_data()
 
-        update_dates = self.updates_df['DATE'].unique().tolist()
+        update_dates = list(dict.fromkeys(self.updates_df['DATE'].unique().tolist()))
         if add_upcoming_games:
-            update_dates.append(get_current_date())
+            today = get_current_date()
+            if today not in update_dates:
+                update_dates.append(today)
+
         extra_data = list()
-        injuries = data_collectors.injuries.Injuries(nbacom_players_list=players_list_names,
-                                     player_id_to_name=self._player_id_to_name
-                                     )
+        injuries = data_collectors.injuries.Injuries(
+            nbacom_players_list=players_list_names,
+            player_id_to_name=self._player_id_to_name
+        )
         load_fantasy_data = data_collectors.fantasy_data.LoadFantasyData(nbacom_players_list=players_list_names)
-        load_starters = data_collectors.starters.Starters(nbacom_players_list=players_list_names,
-                                          player_name_to_id=self._player_name_to_id
-                                          )
-        left_midgame_collector = data_collectors.left_midgame.LeftMidgame(nbacom_players_list=players_list_names,
-                                                          player_id_to_name=self._player_id_to_name,
-                                                          player_name_to_id=self._player_name_to_id
-                                                          )
+        load_starters = data_collectors.starters.Starters(
+            nbacom_players_list=players_list_names,
+            player_name_to_id=self._player_name_to_id
+        )
+        left_midgame_collector = data_collectors.left_midgame.LeftMidgame(
+            nbacom_players_list=players_list_names,
+            player_id_to_name=self._player_id_to_name,
+            player_name_to_id=self._player_name_to_id
+        )
         for date in tqdm(update_dates, desc='loading extra data per date'):
             # loading injuries data
             injuries.collect_data(date=date)
@@ -395,10 +456,10 @@ class StatsLoaderPlayers(StatsLoader):
             pbp_left_midgame = left_midgame_collector.collect_data(date=date)
 
             # removing players who played that day
-            # TODO this should be added to Injuries!
             if not self.updates_df.empty:
-                players_played_today = self.updates_df.loc[(self.updates_df['DATE'] == date) &
-                                                           (self.updates_df['MIN'] > 0), 'NAME']
+                players_played_today = self.updates_df.loc[
+                    (self.updates_df['DATE'] == date) & (self.updates_df['MIN'] > 0), 'NAME'
+                ]
                 heuristic_left_midgame = set(players_played_today) & set(injured_players)
                 left_midgame = (pbp_left_midgame | heuristic_left_midgame) & set(players_played_today)
                 injured_players = [p for p in injured_players if p not in left_midgame]
@@ -409,27 +470,25 @@ class StatsLoaderPlayers(StatsLoader):
             if self.updates_df.empty:
                 name_to_team = None
             else:
-                name_to_team = \
-                    self.updates_df.loc[self.updates_df['DATE'] == date][['NAME', 'TEAM']].set_index('NAME').iloc[:, 0].to_dict()
+                date_teams = self.updates_df.loc[self.updates_df['DATE'] == date, ['NAME', 'TEAM']].dropna()
+                name_to_team = dict(zip(date_teams['NAME'], date_teams['TEAM']))
             fantasy_data_df = load_fantasy_data.collect_data(date=date, name_to_team=name_to_team)
             fantasy_data_df['IS_OUT'] = fantasy_data_df['NAME'].isin(injured_players).values
 
             # loading starters
-            starters_df = load_starters.collect_data(date=date, out_players=injured_players,
-                                                     salaries_df=fantasy_data_df)
+            starters_df = load_starters.collect_data(
+                date=date, out_players=injured_players, salaries_df=fantasy_data_df
+            )
 
             # combine starters and salaries/positions
             combined = starters_df.merge(fantasy_data_df, on=['NAME', 'TEAM'], how='outer', suffixes=(None, '_x'))
-            x_cols = [c for c in combined if c.endswith('_x')]
-            non_x_cols = [c.strip('_x') for c in x_cols]
-            combined[non_x_cols] = \
-                combined[non_x_cols].fillna(combined[x_cols].rename(columns=lambda x: x.rstrip('_x')))
-            combined.drop(columns=x_cols, inplace=True)
+            _coalesce_merge_columns(combined)
             combined['DATE'] = date
             combined['LEFT_MIDGAME'] = combined['NAME'].isin(left_midgame)
 
             extra_data.append(combined)
-        extra_data = pd.concat(extra_data, axis=0)
+
+        extra_data = pd.concat(extra_data, axis=0) if extra_data else pd.DataFrame()
 
         # adding ejections data
         extra_data = extra_data.merge(ejections_df, on=['NAME', 'TEAM', 'DATE'], how='left', indicator='EJECTED')
@@ -445,34 +504,37 @@ class StatsLoaderPlayers(StatsLoader):
             self.updates_df = extra_data
         else:
             # we'll only keep players who played or have a comment about why they didn't play
-            self.updates_df = self.updates_df.merge(extra_data.loc[extra_data['DATE'] != get_current_date()],
-                                                    on=['NAME', 'TEAM', 'DATE'], how='left', suffixes=(None, '_x'))
-            x_cols = [c for c in self.updates_df if c.endswith('_x')]
-            non_x_cols = [c.strip('_x') for c in x_cols]
-            self.updates_df[non_x_cols] = \
-                self.updates_df[non_x_cols].fillna(self.updates_df[x_cols].rename(columns=lambda x: x.rstrip('_x')))
-            self.updates_df.drop(columns=x_cols, inplace=True)
-            self.updates_df = pd.concat([self.updates_df, extra_data.loc[extra_data['DATE'] == get_current_date()]],
-                                        axis=0)
-        is_null = self.updates_df['PLAYER_ID'].isnull()
-        self.updates_df.loc[is_null, 'PLAYER_ID'] = self.updates_df.loc[is_null, 'NAME'].map(self._player_name_to_id)
+            self.updates_df = self.updates_df.merge(
+                extra_data.loc[extra_data['DATE'] != get_current_date()],
+                on=['NAME', 'TEAM', 'DATE'],
+                how='left',
+                suffixes=(None, '_x')
+            )
+            _coalesce_merge_columns(self.updates_df)
+            self.updates_df = pd.concat(
+                [self.updates_df, extra_data.loc[extra_data['DATE'] == get_current_date()]],
+                axis=0
+            )
+
+        if self._player_name_to_id is not None:
+            is_null = self.updates_df['PLAYER_ID'].isnull()
+            self.updates_df.loc[is_null, 'PLAYER_ID'] = self.updates_df.loc[is_null, 'NAME'].map(self._player_name_to_id)
         is_null = self.updates_df['TEAM_ID'].isnull()
         self.updates_df.loc[is_null, 'TEAM_ID'] = self.updates_df.loc[is_null, 'TEAM'].map(TEAM_NAME_TO_ID)
 
         no_player_id = (self.updates_df['PLAYER_ID'] == self.updates_df['NAME']) | self.updates_df['PLAYER_ID'].isnull()
         if no_player_id.any():
-            logging.info(f'removing players with player ID:\n{self.updates_df.loc[no_player_id, "NAME"].to_list()}')
+            logging.info(f'removing players without valid player ID:\n{self.updates_df.loc[no_player_id, "NAME"].to_list()}')
 
         self.updates_df = self.updates_df.loc[(~no_player_id) | self.updates_df['START_POSITION'].notnull()]
 
-    def assert_valid_df(self, df: pd.DataFrame):
-        super(StatsLoaderPlayers, self).assert_valid_df(df=df)
+    def assert_valid_df(self, df: pd.DataFrame, is_incremental: bool = False):
+        super().assert_valid_df(df=df, is_incremental=is_incremental)
         assert_valid_df_players(df)
 
     def _postprocessing(self):
         """process the data in updates_df"""
-
-        super(StatsLoaderPlayers, self)._postprocessing()
+        super()._postprocessing()
 
         # filling 0 in the counting stats for players who didn't play
         if not self.updates_df.empty:
@@ -486,7 +548,10 @@ class StatsLoaderPlayers(StatsLoader):
 
             # converting confirmed to true for all past games
             not_today_inds = self.updates_df['DATE'] != get_current_date()
+            if 'CONFIRMED' not in self.updates_df.columns:
+                self.updates_df['CONFIRMED'] = False
             self.updates_df.loc[not_today_inds, 'CONFIRMED'] = True
+            self.updates_df['CONFIRMED'] = self.updates_df['CONFIRMED'].fillna(False).astype(bool)
             if 'IS_QUESTIONABLE' in self.updates_df.columns:
                 self.updates_df.loc[not_today_inds, 'IS_QUESTIONABLE'] = False
             else:
@@ -500,19 +565,20 @@ class StatsLoaderPlayers(StatsLoader):
 
             # adding fantasy points
             for site, scoring in SCORING.items():
-                self.updates_df[f'{site.name.upper()}_POINTS'] = np.sum([self.updates_df[c] * m for c, m in scoring.items()],
-                                                                   axis=0)
+                self.updates_df[f'{site.name.upper()}_POINTS'] = np.sum(
+                    [self.updates_df[c] * m for c, m in scoring.items()],
+                    axis=0
+                )
 
             # adding game times and game ids
             schedule = self._schedule.assign(OPPONENT=self._schedule['TEAM_ID_OPPONENT'].replace(TEAM_ID_TO_NAME))
-            self.updates_df = self.updates_df.merge(schedule[['DATE', 'GAME_TIME', 'GAME_ID', 'TEAM_ID', 'OPPONENT',
-                                                              'HOME']],
-                                                    how='left', on=['DATE', 'TEAM_ID'], suffixes=(None, '_x'))
-            x_cols = [c for c in self.updates_df.columns if c.endswith('_x')]
-            non_x_cols = [c.replace('_x', '') for c in x_cols]
-            self.updates_df[non_x_cols] = \
-                self.updates_df[non_x_cols].fillna(self.updates_df[x_cols].rename(columns=lambda x: x.rstrip('_x')))
-            self.updates_df.drop(columns=x_cols, inplace=True)
+            self.updates_df = self.updates_df.merge(
+                schedule[['DATE', 'GAME_TIME', 'GAME_ID', 'TEAM_ID', 'OPPONENT', 'HOME']],
+                how='left',
+                on=['DATE', 'TEAM_ID'],
+                suffixes=(None, '_x')
+            )
+            _coalesce_merge_columns(self.updates_df)
 
             if 'SEASON_YEAR' in self.updates_df:
                 self.updates_df['SEASON_YEAR'] = self.updates_df['SEASON_YEAR'].fillna(self.season)
@@ -534,63 +600,44 @@ class StatsLoaderTeams(StatsLoader):
             boxscore_type_name = 'Four Factors'
 
         try:
-            print('aaa >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-            return load_nbacom_data(url=URLS().boxscores_nbacom_team(measure_type=boxscore_type_name,
-                                                                     season=self.season_str,
-                                                                     season_type=season_type),
-                                    player_or_team=False)
-        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
+            res = load_nbacom_data(
+                url=URLS().boxscores_nbacom_team(
+                    measure_type=boxscore_type_name,
+                    season=self.season_str,
+                    season_type=season_type
+                ),
+                player_or_team=False
+            )
+            if res is None or res.empty:
+                raise requests.exceptions.RequestException('Empty data from boxscores_nbacom_team')
+            return res
+        except (requests.exceptions.RequestException, KeyError):
             try:
-                print('bbb >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-                return load_nbacom_data(url=URLS().BOXSCORES_NBACOM.format(player_or_team='team',
-                                                                           measure_type=boxscore_type_name,
-                                                                           season=self.season_str,
-                                                                           season_type=season_type),
-                                        player_or_team=False)
-            except requests.exceptions.ConnectionError:
-                print('ccc >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-                team_game_logs = teamgamelogs.TeamGameLogs(season_nullable=self.season_str,
-                                                           measure_type_player_game_logs_nullable=boxscore_type_name,
-                                                           season_type_nullable=season_type)
-                return team_game_logs.get_data_frames()[0]
+                res = load_nbacom_data(
+                    url=URLS().BOXSCORES_NBACOM.format(
+                        player_or_team='team',
+                        measure_type=boxscore_type_name,
+                        season=self.season_str,
+                        season_type=season_type
+                    ),
+                    player_or_team=False
+                )
+                if res is None or res.empty:
+                    raise requests.exceptions.RequestException('Empty data from BOXSCORES_NBACOM')
+                return res
+            except (requests.exceptions.RequestException, KeyError):
+                team_game_logs = teamgamelogs.TeamGameLogs(
+                    season_nullable=self.season_str,
+                    measure_type_player_game_logs_nullable=boxscore_type_name,
+                    season_type_nullable=season_type
+                )
+                dfs = team_game_logs.get_data_frames()
+                return dfs[0] if dfs else pd.DataFrame()
 
 
 if __name__ == '__main__':
-    # from utils import get_header
-    # header = get_header()
-    # df = pd.read_html('https://basketballmonster.com/nbalineups.aspx')
-
-    # slp = StatsLoaderPlayers(season=2024)
-    # slp.call()
-    # df = slp.load_saved_data()
-    # left_midgame2 = (slp.df['MIN'] == 0) & (slp.df['PF'] > 0)
-    # slp.df['LEFT_MIDGAME'] |= left_midgame2
-    # left_mid_game = pd.read_csv('C:/Users/schwa/Downloads/possibly_left_midgame - possibly_left_midgame.csv')
-    # left_mid_game['NAME'] = left_mid_game['NAME'].replace({'Cam Payne': 'Cameron Payne',
-    #                                                        "Mo Wagner": "Moritz Wagner",
-    #                                                        "Trey Murhoy III": 'Trey Murphy III'})
-    # left_mid_game['DATE'] = pd.to_datetime(left_mid_game['DATE']).dt.date
-    # left_mid_game['NAME'] = FixPlayerNames(compare_names=df['NAME'].unique()).fix_names(left_mid_game['NAME'])
-    # drop = [{'NAME': "Anfernee Simons", 'DATE': datetime.date(2024, 11, 13)},
-    #         {'NAME': "Coby White", 'DATE': datetime.date(2024, 12, 2)},
-    #         {'NAME': "Keyonte George", 'DATE': datetime.date(2025, 3, 24)},
-    #         ]
-    # left_mid_game = left_mid_game.merge(pd.DataFrame(drop), on=['NAME', 'DATE'], indicator='xxx', how='left')
-    # left_mid_game = left_mid_game.loc[left_mid_game['xxx'] == 'left_only'].drop(columns=['xxx'])
-    # slp.df = slp.df.merge(left_mid_game, on=['NAME', 'DATE'], how='outer', indicator='xxx', suffixes=(None, '_x'))
-    # if not slp.df.query('xxx=="right_only"').empty:
-    #     raise ValueError('aaaaaaaaaaaaaaaa')
-    # print(slp.df['LEFT_MIDGAME'].sum())
-    # slp.df.loc[slp.df['xxx'] == 'both', 'LEFT_MIDGAME'] = True
-    # print(slp.df['LEFT_MIDGAME'].sum())
-    # slp.df.drop(columns=['xxx', 'LEFT_MIDGAME_x'], inplace=True)
-    # #
-    # slp._save_df()
-
-    # for curr_season in range(2014, 2024):
     for curr_season in (2025,):
-        print(curr_season, '**************************************************')
-        # slp = StatsLoaderPlayers(season=curr_season)
+        logging.info(f'Processing season {curr_season}')
         slp = StatsLoaderTeams(season=curr_season)
         slp.call()
         del slp
