@@ -393,23 +393,14 @@ class StatsLoaderPlayers(StatsLoader):
                 try:
                     boxscore = boxscoretraditionalv3.BoxScoreTraditionalV3
                     tmp_df = read_and_cache(
-                        func=lambda x: boxscore(game_id=x, headers=get_header(), timeout=30).player_stats.get_data_frame().rename(columns=rename_cols)[keep_cols],
+                        func=lambda x: boxscore(game_id=x, headers=get_header(), timeout=5).player_stats.get_data_frame().rename(columns=rename_cols)[keep_cols],
                         func_params={'x': gid_str},
                         cache_name=cache_name,
-                        sleep_time_after_reading_from_web=0.6
+                        sleep_time_after_reading_from_web=0.5
                     )
-                except Exception as e1:
-                    try:
-                        curr_url = URLS().single_boxscores_nbacom(gid=gid_str)
-                        tmp_df = read_and_cache(
-                            lambda x: load_nbacom_data(url=x)[keep_cols],
-                            func_params={'x': curr_url},
-                            cache_name=cache_name,
-                            sleep_time_after_reading_from_web=0.6
-                        )
-                    except Exception as e2:
-                        logging.warning(f"Could not load boxscore comments for game {gid}: {e2}. Proceeding with default empty comments.")
-                        tmp_df = pd.DataFrame(columns=keep_cols)
+                except Exception as e:
+                    logging.debug(f"Could not load boxscore comments for game {gid}: {e}. Proceeding with default empty comments.")
+                    tmp_df = pd.DataFrame(columns=keep_cols)
 
                 if tmp_df is not None and not tmp_df.empty:
                     all_dfs.append(tmp_df)

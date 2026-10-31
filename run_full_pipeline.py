@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+import shutil
 import time
 import pandas as pd
 from datetime import timedelta
@@ -21,7 +22,7 @@ from machine_learning.enums import DataSplitType
 
 
 class RunFullPipeline:
-    def __init__(self, load_params_from_model_id: int, season: int | None = None,
+    def __init__(self, load_params_from_model_id: int = 0, season: int | None = None,
                  run_date: datetime.date | str = get_current_date(),
                  headless: bool = True, minutes_before_game_to_run: int = 10,
                  params_update_dict: dict | None = None, run_immediately: bool = False,
@@ -45,6 +46,11 @@ class RunFullPipeline:
         self.headless = headless
         self.minutes_before_game_to_run = minutes_before_game_to_run
         self._run_immediately = run_immediately
+
+        models_base = os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models')
+        if not os.path.isdir(os.path.join(models_base, str(load_params_from_model_id))):
+            logging.warning(f"Model ID {load_params_from_model_id} directory not found in {models_base}. Falling back to model 0.")
+            load_params_from_model_id = 0
         self._load_params_from_model_id = load_params_from_model_id
 
         self.dates_to_game_times = dict()   #self._get_game_times_by_day_dict()
@@ -57,6 +63,17 @@ class RunFullPipeline:
         self.stats_loaders_players = StatsLoaderPlayers(season=self.season)
         self.stats_loaders_teams = StatsLoaderTeams(season=self.season)
         self.calc_features = CalcFeatures()
+
+        if isinstance(run_date, datetime.date):
+            self._run_date = run_date
+        elif isinstance(run_date, str) and run_date == 'today':
+            self._run_date = get_current_date()
+        else:
+            self._run_date = get_current_date()
+
+        define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
+                      filename=os.path.join(DATA_DIR, 'logs', f"logs_{self._run_date}.txt"), print_to_console=True, filemode='a')
+        self._exclude_contest_ids = set()
 
         self.train_nn = None
         if initialize_daily_job:
@@ -211,16 +228,17 @@ class RunFullPipeline:
         params = MachineLearningParamsFantasyBasketballPredictions.load_params(params_path)
         # params.features_params.extra_weight_on_certain_date = self._run_date
         params.features_params.last_month_in_train = True
-        todays_model_name = 'model_' + str(get_current_date()).replace('-', '_')
+        todays_model_name = 'model_' + str(self._run_date).replace('-', '_')
         if not self._todays_model_already_trained() and self._has_games_today():
             self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
             self.train_nn.train()
 
             # change the model name from the model id to today's date
             model_dir = self.train_nn._model_dir
-            os.rename(model_dir,
-                      os.path.join(os.path.dirname(model_dir), todays_model_name)
-                      )
+            target_dir = os.path.join(os.path.dirname(model_dir), todays_model_name)
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir, ignore_errors=True)
+            os.rename(model_dir, target_dir)
 
         params.continue_model_id = todays_model_name
         self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
@@ -347,10 +365,30 @@ class RunFullPipeline:
 
 
 if __name__ == '__main__':
-    run_immediately = False
-    headless = True
+    import argparse
+    parser = argparse.ArgumentParser(description="NBA Fantasy Pipeline")
+    parser.add_argument('--train-only', action='store_true',
+                        help="Only run morning training job (run_once_per_day) and exit")
+    parser.add_argument('--model-id', type=int, default=0,
+                        help="Model ID to load params from (default: 0)")
+    parser.add_argument('--run-immediately', action='store_true',
+                        help="Do not wait for 8:00 AM or game times")
+    parser.add_argument('--date', type=str, default='today',
+                        help="Run date (default: today)")
+    args = parser.parse_args()
+
     params_update_dict = {'continue_model_name': 'extra_weight_on_ast'}
-    run_date = 'today'
-    ropd = RunFullPipeline(run_date=run_date, headless=headless, params_update_dict=params_update_dict,
-                           run_immediately=run_immediately, minutes_before_game_to_run=7, load_params_from_model_id=121)
-    ropd.run_full_pipeline_continuously()
+    ropd = RunFullPipeline(
+        run_date=args.date,
+        headless=True,
+        params_update_dict=params_update_dict,
+        run_immediately=args.run_immediately or args.train_only,
+        minutes_before_game_to_run=7,
+        load_params_from_model_id=args.model_id,
+        initialize_daily_job=not args.train_only
+    )
+    if args.train_only:
+        ropd.run_once_per_day()
+        logging.info("Morning model training completed successfully!")
+    else:
+        ropd.run_full_pipeline_continuously()
