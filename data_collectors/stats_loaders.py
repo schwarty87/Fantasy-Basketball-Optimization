@@ -19,6 +19,7 @@ from utils import (
     get_latest_date_with_data,
     assert_valid_df_all,
     assert_valid_df_players,
+    assert_reconciled_player_team_stats,
     load_schedule,
     get_current_time,
     get_current_date,
@@ -26,6 +27,8 @@ from utils import (
     get_header,
     update_dir_name,
     get_current_season,
+    define_logger,
+    scrape_season_schedules,
 )
 
 FILL_ZEROS_COLS = [
@@ -172,7 +175,12 @@ class StatsLoader:
         self.updates_df['OPPONENT'] = [i[2] for i in split_opp]
         self.updates_df['W_L'] = (self.updates_df['W_L'] == 'W').astype(int)
         self.updates_df['DATE'] = pd.to_datetime(self.updates_df['DATE']).dt.date
-        self.updates_df['SEASON_YEAR'] = self.updates_df['SEASON_YEAR'].str.split('-').str[0].astype(int)
+        if 'SEASON_YEAR' in self.updates_df.columns:
+            self.updates_df['SEASON_YEAR'] = self.updates_df['SEASON_YEAR'].astype(str).str.split('-').str[0].astype(int)
+        if 'GAME_ID' in self.updates_df.columns:
+            self.updates_df['GAME_ID'] = self.updates_df['GAME_ID'].astype('int64')
+        if 'TEAM_ID' in self.updates_df.columns:
+            self.updates_df['TEAM_ID'] = self.updates_df['TEAM_ID'].astype('int64')
         self.updates_df.sort_values(self.SORT_COLS, inplace=True)
         self.updates_df = self.updates_df.loc[self.updates_df['TEAM_ID'].isin(TEAM_ID_TO_NAME.keys())]
         downcast_df(self.updates_df)
@@ -201,6 +209,22 @@ class StatsLoader:
                 self.df['AVAILABLE_FLAG'] = self.df['AVAILABLE_FLAG'].fillna(0).astype(bool)
             if 'VIDEO_AVAILABLE' in self.df.columns:
                 self.df.drop(columns=['VIDEO_AVAILABLE'], inplace=True)
+
+            for col in ('GAME_ID', 'TEAM_ID', 'PLAYER_ID'):
+                if col in self.df.columns:
+                    self.df[col] = self.df[col].astype('int64')
+
+            if 'W_L' in self.df.columns:
+                if self.LOADER_TYPE == StatsTypes.player:
+                    self.df['W_L'] = self.df['W_L'].fillna(False).astype(bool)
+                elif self.LOADER_TYPE == StatsTypes.team:
+                    self.df['W_L'] = self.df['W_L'].fillna(0).astype('int8')
+
+            if 'HOME' in self.df.columns:
+                if self.LOADER_TYPE == StatsTypes.player:
+                    self.df['HOME'] = self.df['HOME'].fillna(False).astype(bool)
+                elif self.LOADER_TYPE == StatsTypes.team:
+                    self.df['HOME'] = self.df['HOME'].fillna(0).astype('int8')
 
             self.df.drop_duplicates(inplace=True)
             self.df.sort_values(self.SORT_COLS, inplace=True)
@@ -260,7 +284,7 @@ class StatsLoaderPlayers(StatsLoader):
 
         self.df['MIN'] = self.df['MIN'].fillna(0)
         self.df = self.df.loc[self.df['NAME'].notnull()]
-        for c in ('LEFT_MIDGAME', 'EJECTED', 'IS_OUT'):
+        for c in ('LEFT_MIDGAME', 'EJECTED', 'IS_OUT', 'W_L', 'HOME'):
             if c in self.df.columns:
                 self.df[c] = self.df[c].fillna(False).astype(bool)
         self.df['PLAYER_ID'] = self.df['PLAYER_ID'].astype('int64')
@@ -324,12 +348,17 @@ class StatsLoaderPlayers(StatsLoader):
                 if curr_df is None or curr_df.empty:
                     raise requests.exceptions.RequestException('Empty data from boxscores_nbacom')
             except (requests.exceptions.RequestException, KeyError):
-                player_game_logs = playergamelogs.PlayerGameLogs(season_nullable=self.season_str,
-                                                                 measure_type_player_game_logs_nullable=boxscore_type.name,
-                                                                 season_type_nullable=season_type,
-                                                                 headers=get_header())
-                dfs = player_game_logs.get_data_frames()
-                curr_df = dfs[0] if dfs else pd.DataFrame()
+                try:
+                    player_game_logs = playergamelogs.PlayerGameLogs(season_nullable=self.season_str,
+                                                                     measure_type_player_game_logs_nullable=boxscore_type.name,
+                                                                     season_type_nullable=season_type,
+                                                                     headers=get_header(),
+                                                                     timeout=60)
+                    dfs = player_game_logs.get_data_frames()
+                    curr_df = dfs[0] if dfs else pd.DataFrame()
+                except Exception as e:
+                    logging.warning(f"PlayerGameLogs fallback failed: {e}")
+                    curr_df = pd.DataFrame()
         return curr_df if curr_df is not None else pd.DataFrame()
 
     def get_player_name_to_id(self) -> dict[str, int]:
@@ -360,24 +389,35 @@ class StatsLoaderPlayers(StatsLoader):
                                    total=len(game_ids)):
                 cache_name = f'nbacom_single_game_boxscores/nbacom_boxscoretraditionalv2_gid_{gid}.feather'
                 gid_str = str(gid).zfill(10)
+                tmp_df = None
                 try:
                     boxscore = boxscoretraditionalv3.BoxScoreTraditionalV3
                     tmp_df = read_and_cache(
-                        func=lambda x: boxscore(game_id=x, headers=get_header(), timeout=10).player_stats.get_data_frame().rename(columns=rename_cols)[keep_cols],
+                        func=lambda x: boxscore(game_id=x, headers=get_header(), timeout=30).player_stats.get_data_frame().rename(columns=rename_cols)[keep_cols],
                         func_params={'x': gid_str},
                         cache_name=cache_name,
                         sleep_time_after_reading_from_web=0.6
                     )
-                except (requests.exceptions.ReadTimeout, IndexError, json.decoder.JSONDecodeError):
-                    curr_url = URLS().single_boxscores_nbacom(gid=gid_str)
-                    tmp_df = read_and_cache(
-                        lambda x: load_nbacom_data(url=x)[keep_cols],
-                        func_params={'x': curr_url},
-                        cache_name=cache_name,
-                        sleep_time_after_reading_from_web=0.6
-                    )
-                all_dfs.append(tmp_df)
-            all_dfs = pd.concat(all_dfs, axis=0).reset_index(drop=True)
+                except Exception as e1:
+                    try:
+                        curr_url = URLS().single_boxscores_nbacom(gid=gid_str)
+                        tmp_df = read_and_cache(
+                            lambda x: load_nbacom_data(url=x)[keep_cols],
+                            func_params={'x': curr_url},
+                            cache_name=cache_name,
+                            sleep_time_after_reading_from_web=0.6
+                        )
+                    except Exception as e2:
+                        logging.warning(f"Could not load boxscore comments for game {gid}: {e2}. Proceeding with default empty comments.")
+                        tmp_df = pd.DataFrame(columns=keep_cols)
+
+                if tmp_df is not None and not tmp_df.empty:
+                    all_dfs.append(tmp_df)
+
+            if all_dfs:
+                all_dfs = pd.concat(all_dfs, axis=0).reset_index(drop=True)
+            else:
+                all_dfs = pd.DataFrame(columns=keep_cols)
 
         for c in ['GAME_ID', 'TEAM_ID', 'PLAYER_ID']:
             all_dfs[c] = all_dfs[c].astype('int64')
@@ -452,16 +492,30 @@ class StatsLoaderPlayers(StatsLoader):
             injuries.collect_data(date=date)
             injured_players = injuries.out_players()
 
-            # loading left midgame data using play-by-play
+            # loading left midgame data using play-by-play and recap parsing
             pbp_left_midgame = left_midgame_collector.collect_data(date=date)
 
             # removing players who played that day
             if not self.updates_df.empty:
-                players_played_today = self.updates_df.loc[
-                    (self.updates_df['DATE'] == date) & (self.updates_df['MIN'] > 0), 'NAME'
-                ]
-                heuristic_left_midgame = set(players_played_today) & set(injured_players)
-                left_midgame = (pbp_left_midgame | heuristic_left_midgame) & set(players_played_today)
+                date_mask = self.updates_df['DATE'] == date
+                played_mask = date_mask & (self.updates_df['MIN'] > 0)
+                players_played_today = set(self.updates_df.loc[played_mask, 'NAME'])
+
+                # Heuristic: players on injury report who played very short minutes (< 15 mins)
+                short_min_mask = played_mask & (self.updates_df['MIN'] < 15)
+                short_min_players = set(self.updates_df.loc[short_min_mask, 'NAME'])
+                heuristic_left_midgame = short_min_players & set(injured_players)
+
+                left_midgame = (pbp_left_midgame | heuristic_left_midgame) & players_played_today
+
+                # Full-minute players (>= 30 mins) did not have a game-shortening exit
+                full_min_players = set(self.updates_df.loc[date_mask & (self.updates_df['MIN'] >= 30), 'NAME'])
+                left_midgame = left_midgame - full_min_players
+
+                self.updates_df.loc[date_mask, 'LEFT_MIDGAME'] = (
+                    self.updates_df.loc[date_mask, 'NAME'].isin(left_midgame)
+                )
+
                 injured_players = [p for p in injured_players if p not in left_midgame]
             else:
                 left_midgame = list()
@@ -528,9 +582,33 @@ class StatsLoaderPlayers(StatsLoader):
 
         self.updates_df = self.updates_df.loc[(~no_player_id) | self.updates_df['START_POSITION'].notnull()]
 
+        for c in ('LEFT_MIDGAME', 'EJECTED', 'IS_OUT'):
+            if c in self.updates_df.columns:
+                self.updates_df[c] = self.updates_df[c].fillna(False).astype(bool)
+            else:
+                self.updates_df[c] = False
+
+    def _get_team_boxscores_df(self) -> pd.DataFrame | None:
+        team_boxscores_path = os.path.join(os.path.dirname(self.filepath), 'team_boxscores.feather')
+        if not os.path.isfile(team_boxscores_path):
+            return None
+        if not hasattr(self, '_cached_team_df') or self._cached_team_df is None:
+            self._cached_team_df = pd.read_feather(team_boxscores_path)
+        return self._cached_team_df
+
     def assert_valid_df(self, df: pd.DataFrame, is_incremental: bool = False):
         super().assert_valid_df(df=df, is_incremental=is_incremental)
         assert_valid_df_players(df)
+
+        team_df = self._get_team_boxscores_df()
+        if team_df is not None and not df.empty and 'GAME_ID' in df.columns:
+            if is_incremental:
+                gids = df['GAME_ID'].dropna().unique()
+            elif hasattr(self, 'updates_df') and self.updates_df is not None and not self.updates_df.empty:
+                gids = self.updates_df['GAME_ID'].dropna().unique()
+            else:
+                gids = None
+            assert_reconciled_player_team_stats(df, team_df, game_ids=gids)
 
     def _postprocessing(self):
         """process the data in updates_df"""
@@ -556,6 +634,13 @@ class StatsLoaderPlayers(StatsLoader):
                 self.updates_df.loc[not_today_inds, 'IS_QUESTIONABLE'] = False
             else:
                 self.updates_df['IS_QUESTIONABLE'] = False
+
+            # ensuring boolean status columns are strictly boolean with zero nulls
+            for c in ('LEFT_MIDGAME', 'EJECTED', 'IS_OUT', 'W_L', 'HOME'):
+                if c in self.updates_df.columns:
+                    self.updates_df[c] = self.updates_df[c].fillna(False).astype(bool)
+                else:
+                    self.updates_df[c] = False
 
             # fixing salaries/positions from older versions
             site_salary_cols = [s.name + '_SALARY' for s in Sites]
@@ -626,18 +711,49 @@ class StatsLoaderTeams(StatsLoader):
                     raise requests.exceptions.RequestException('Empty data from BOXSCORES_NBACOM')
                 return res
             except (requests.exceptions.RequestException, KeyError):
-                team_game_logs = teamgamelogs.TeamGameLogs(
-                    season_nullable=self.season_str,
-                    measure_type_player_game_logs_nullable=boxscore_type_name,
-                    season_type_nullable=season_type
-                )
-                dfs = team_game_logs.get_data_frames()
-                return dfs[0] if dfs else pd.DataFrame()
+                try:
+                    team_game_logs = teamgamelogs.TeamGameLogs(
+                        season_nullable=self.season_str,
+                        measure_type_player_game_logs_nullable=boxscore_type_name,
+                        season_type_nullable=season_type,
+                        headers=get_header(),
+                        timeout=60
+                    )
+                    dfs = team_game_logs.get_data_frames()
+                    return dfs[0] if dfs else pd.DataFrame()
+                except Exception as e:
+                    logging.warning(f"TeamGameLogs fallback failed: {e}")
+                    return pd.DataFrame()
 
 
 if __name__ == '__main__':
-    for curr_season in (2025,):
-        logging.info(f'Processing season {curr_season}')
-        slp = StatsLoaderTeams(season=curr_season)
-        slp.call()
-        del slp
+    import argparse
+    parser = argparse.ArgumentParser(description="Update NBA stats data (teams, players, schedules)")
+    parser.add_argument('--season', type=int, default=None,
+                        help="Season to update (defaults to current season)")
+    parser.add_argument('--team-only', action='store_true',
+                        help="Only update team stats")
+    parser.add_argument('--player-only', action='store_true',
+                        help="Only update player stats")
+    parser.add_argument('--add-upcoming', action='store_true',
+                        help="Include today's upcoming games in player stats update")
+    args = parser.parse_args()
+
+    define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO, print_to_console=True)
+    target_season = args.season or get_current_season()
+    logging.info(f'Starting stats update for season {target_season}...')
+
+    if not args.player_only:
+        logging.info(f'Updating team boxscores for season {target_season}...')
+        slt = StatsLoaderTeams(season=target_season)
+        slt.call()
+        logging.info('Successfully updated team boxscores!')
+
+    if not args.team_only:
+        logging.info(f'Updating player boxscores for season {target_season}...')
+        players_list = load_and_cache_players_list(season=target_season)
+        slp = StatsLoaderPlayers(season=target_season)
+        slp.call(players_list=players_list, add_upcoming_games=args.add_upcoming)
+        logging.info('Successfully updated player boxscores!')
+
+    logging.info('Stats update completed successfully!')

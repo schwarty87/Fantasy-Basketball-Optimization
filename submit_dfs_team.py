@@ -11,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import SessionNotCreatedException, StaleElementReferenceException, TimeoutException
-from constants import DFS_POSITIONS, NY_TZ, BROWSER, Sites
+from constants import DFS_POSITIONS, NY_TZ, BROWSER, Sites, get_browser_profile_path
 from utils import get_current_time, get_current_date, get_next_game_time, FixPlayerNames, retry, remove_accents
 from enums import Browsers
 
@@ -50,14 +50,13 @@ class SubmitDFSTeamYahooByCSV:
         self._positions = DFS_POSITIONS[self._site]
 
         self.headless = headless
-        self.profile_path = profile_path
+        self.profile_path = profile_path or get_browser_profile_path(BROWSER)
         self.nbacom_names = nbacom_names
 
         self.template = self._get_template_df()
 
         if self.template is None:
             self.contest_ids = list()
-            self.driver.quit()
             return
 
         logging.info('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
@@ -79,7 +78,20 @@ class SubmitDFSTeamYahooByCSV:
         self.contest_ids = [contest_id for contest_id in self.template['Contest ID'].unique() if
                             isinstance(contest_id, int)]
 
+    @staticmethod
+    def _submitted_teams_dir() -> str:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'submitted_teams')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _download_dir() -> str:
+        d = os.path.join(SubmitDFSTeamYahooByCSV._submitted_teams_dir(), 'downloads')
+        os.makedirs(d, exist_ok=True)
+        return d
+
     def _create_browser_options(self) -> Options:
+        download_dir = self._download_dir()
         if BROWSER == Browsers.CHROME:
             chrome_options = Options()
             if self.profile_path is not None:
@@ -87,14 +99,37 @@ class SubmitDFSTeamYahooByCSV:
             if self.headless:
                 chrome_options.add_argument('--headless=new')
             chrome_options.add_argument('--profile-directory=Default')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--disable-infobars')
+            chrome_options.add_argument('--disable-notifications')
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
             chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.add_experimental_option("prefs", {
+                "download.default_directory": download_dir,
+                "download.prompt_for_download": False,
+                "download.directory_upgrade": True,
+                "safebrowsing.enabled": True,
+                "profile.default_content_setting_values.notifications": 2,
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False
+            })
+            chrome_options.page_load_strategy = 'eager'
             return chrome_options
         elif BROWSER == Browsers.FIREFOX:
             firefox_options = Options()
-            firefox_options.profile = self.profile_path
+            if self.profile_path is not None:
+                firefox_options.add_argument("-profile")
+                firefox_options.add_argument(self.profile_path)
             if self.headless:
                 firefox_options.add_argument('--headless')
+            firefox_options.set_preference("browser.download.folderList", 2)
+            firefox_options.set_preference("browser.download.dir", download_dir)
+            firefox_options.set_preference("browser.download.useDownloadDir", True)
+            firefox_options.set_preference("browser.helperApps.neverAsk.saveToDisk",
+                                           "text/csv,application/csv,text/comma-separated-values,application/vnd.ms-excel")
+            firefox_options.set_preference("dom.webnotifications.enabled", False)
+            firefox_options.set_preference("permissions.default.desktop-notification", 2)
+            firefox_options.page_load_strategy = 'eager'
             return firefox_options
         else:
             raise ValueError('BROWSER has to be one of the values in the Browsers enum!')
@@ -132,28 +167,52 @@ class SubmitDFSTeamYahooByCSV:
 
     def _navigate_to_submit_csv_page(self) -> bool:
         self.driver.get(EDIT_LINEUP_URL)
+        if 'login.yahoo.com' in self.driver.current_url.lower():
+            logging.error("Yahoo authentication required: browser was redirected to login page. "
+                          "Please ensure you are logged into Yahoo in your active browser profile.")
+            return False
         try:
             WebDriverWait(self.driver, 5).until(EC.element_to_be_clickable((By.LINK_TEXT, "Download a .csv template")))
             return True
         except TimeoutException:
-            WebDriverWait(self.driver, 5).until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT,
-                "Oops! We could not find any contest entries to edit. Head over to the Lobby or hit Create to enter"
-                " some contests.")))
-            logging.warning("we're not in any competitions!")
-            return False
+            try:
+                WebDriverWait(self.driver, 5).until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT,
+                    "Oops! We could not find any contest entries to edit. Head over to the Lobby or hit Create to enter"
+                    " some contests.")))
+                logging.warning("we're not in any competitions!")
+                return False
+            except TimeoutException:
+                if 'login.yahoo.com' in self.driver.current_url.lower():
+                    logging.error("Yahoo authentication required: redirected to login during navigation.")
+                    return False
+                raise
 
     @staticmethod
-    @retry(exceptions=FileNotFoundError, max_retries=10, delay_seconds=2)
+    @retry(exceptions=(FileNotFoundError, pd.errors.EmptyDataError, PermissionError), max_retries=10, delay_seconds=2)
     def _load_csv(filename: str, only_recent_downloads: Optional[Union[int, float]] = 300) -> Tuple[pd.DataFrame, str]:
-        template_paths = glob.glob(os.path.join(os.path.expanduser("~"), 'Downloads', f'{filename}*.csv'))
+        # Search both dedicated downloads directory and user Downloads folder
+        search_dirs = [
+            SubmitDFSTeamYahooByCSV._download_dir(),
+            os.path.join(os.path.expanduser("~"), 'Downloads')
+        ]
+        template_paths = []
+        for d in search_dirs:
+            if os.path.isdir(d):
+                template_paths.extend(glob.glob(os.path.join(d, f'{filename}*.csv')))
+
+        # Exclude temporary partially-downloaded files
+        template_paths = [p for p in template_paths if not p.endswith(('.part', '.crdownload', '.tmp'))]
+
         if len(template_paths) == 0:
             raise FileNotFoundError(f'there are no files with the name {filename}!')
         creation_times = [os.path.getctime(file_path) for file_path in template_paths]
         if only_recent_downloads is not None:
             max_time = datetime.datetime.fromtimestamp(np.max(creation_times))
-            if (get_current_time(tz=None) - max_time).seconds > only_recent_downloads:
+            if (get_current_time(tz=None) - max_time).total_seconds() > only_recent_downloads:
                 raise FileNotFoundError(f'there are no recent files with the name {filename}!')
         path_of_latest_template = template_paths[np.argmax(creation_times)]
+        if os.path.getsize(path_of_latest_template) == 0:
+            raise pd.errors.EmptyDataError(f"file {path_of_latest_template} is still being written")
         logging.info(f'loading downloaded template from {path_of_latest_template}...')
         return pd.read_csv(path_of_latest_template), path_of_latest_template
 
@@ -176,13 +235,16 @@ class SubmitDFSTeamYahooByCSV:
         template['Name'] = template['First Name'] + ' ' + template['Last Name']
         template['Name'] = FixPlayerNames(compare_names=nbacom_names).fix_names(template['Name'])
 
-        has_contest_id = template['Contest ID'].str.len() > 1
+        template['Contest ID'] = template['Contest ID'].astype(object)
+        template['Entry ID'] = template['Entry ID'].astype(object)
+        has_contest_id = template['Contest ID'].astype(str).str.strip().str.len() > 1
         template.loc[has_contest_id, 'Contest ID'] = template.loc[has_contest_id, 'Contest ID'].astype(int)
         template.loc[has_contest_id, 'Entry ID'] = template.loc[has_contest_id, 'Entry ID'].astype(int)
 
         # converting times to datetimes
         todays_date = get_current_date()
-        has_time = template['Time'].str.contains(':')
+        template['Time'] = template['Time'].astype(object)
+        has_time = template['Time'].astype(str).str.contains(':')
         date_strings = str(todays_date) + ' ' + template.loc[has_time, 'Time'].str.replace(r' E[S|D]T', '', regex=True)
         template.loc[has_time, 'Time'] = pd.to_datetime(date_strings, format='%Y-%m-%d %I:%M%p').dt.tz_localize(NY_TZ)
         template.loc[~has_time, 'Time'] = template.loc[has_time, 'Time'].max()
@@ -199,13 +261,15 @@ class SubmitDFSTeamYahooByCSV:
                 return None
             self._click_btn(by=By.LINK_TEXT, value='Download a .csv template')
             template = self.load_downloaded_csv(nbacom_names=self.nbacom_names)
-            self.driver.quit()
             logging.info('finished downloading and loading template df')
         except Exception as e:
             if os.path.isfile(self._template_path()):
                 template = pd.read_csv(self._template_path())
             else:
                 raise ValueError(f"we weren't able to load the template\n{e}")
+        finally:
+            if hasattr(self, 'driver') and self.driver:
+                self.driver.quit()
 
         # remove the row with the dfs league
         dfs_league_row = template['Contest Title'].str.contains('NBA Free 6-Team 155-Round League Round')
@@ -263,7 +327,8 @@ class SubmitDFSTeamYahooByCSV:
 
     @staticmethod
     def _template_path() -> str:
-        return os.path.join(os.getcwd(), 'submitted_teams', str(get_current_date()).replace('-', '_') + '.csv')
+        return os.path.join(SubmitDFSTeamYahooByCSV._submitted_teams_dir(),
+                            str(get_current_date()).replace('-', '_') + '.csv')
 
     def _sort_players_by_time(self, teams_df: pd.DataFrame):
         """Sorting each team so the players who play in the earlier games will be in the more restrictive positions"""
@@ -356,10 +421,15 @@ class SubmitDFSTeamYahooByCSV:
             if not on_submit_csv_page:
                 return
 
-            attribute_value = 'Choose file' if BROWSER == Browsers.CHROME else 'browse… no file selected.'
-            choose_file_button = self._find_element_by_two_markers(by1=By.TAG_NAME, value1='input',
-                                                                   attribute_name='accessible_name',
-                                                                   attribute_value=attribute_value)
+            # File upload: Try universal input[type='file'] first, then fallback to accessible_name
+            file_inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
+            if file_inputs:
+                choose_file_button = file_inputs[0]
+            else:
+                attribute_value = 'Choose file' if BROWSER == Browsers.CHROME else 'browse… no file selected.'
+                choose_file_button = self._find_element_by_two_markers(by1=By.TAG_NAME, value1='input',
+                                                                       attribute_name='accessible_name',
+                                                                       attribute_value=attribute_value)
             choose_file_button.send_keys(self._template_path())
             detected_txt = f"We have detected {len(self.contest_ids)} lineup"
             if len(self.contest_ids) > 1:
@@ -370,22 +440,21 @@ class SubmitDFSTeamYahooByCSV:
                                                                        attribute_name='text',
                                                                        attribute_value='Upload and edit entries')
 
-            # # making sure we're not submitting players who should be locked already
-            # game_times = self.template.iloc[:len(self.contest_ids)][self._positions].replace(self.id_to_game_time)
-            # games_already_started = game_times < get_current_time()
-            # was_already_in = (self.template.iloc[:len(self.contest_ids)][self._positions] == template_before).values
-            # if np.any(games_already_started & (~was_already_in)):
-            #     logging.info('not submitting team because at least one of the players game has already started')
-            #     self.driver.quit()
-            #     return
-
             upload_and_edit_button.click()
             entry_str = 'entries' if len(self.contest_ids) > 1 else 'entry'
-            WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT,
-                                                                            f"Contest {entry_str} edited successfully!")))
-            submitted_team = True
+            success_text = f"Contest {entry_str} edited successfully!"
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    lambda d: d.find_elements(By.PARTIAL_LINK_TEXT, success_text) or
+                              d.find_elements(By.XPATH, f"//*[contains(text(), '{success_text}') or contains(text(), 'edited successfully')]")
+                )
+                submitted_team = True
+            except TimeoutException:
+                logging.error("Success confirmation message element was not detected within 15s timeout.")
+                submitted_team = False
         except Exception as e:
             logging.exception('there was an exception in submit_best_set:')
+            submitted_team = False
         finally:
             self.driver.quit()
 
@@ -401,23 +470,51 @@ class SubmitDFSTeamYahooByCSV:
             logging.info(template_str)
             logging.info('<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
 
+    @classmethod
+    def interactive_login(cls, browser: Browsers = BROWSER, profile_path: Optional[str] = None):
+        """
+        Open a visible browser session for the user to log into Yahoo once.
+        Cookies and session tokens will be saved in the dedicated profile directory so that
+        all subsequent headless runs stay logged in.
+        """
+        resolved_path = profile_path or get_browser_profile_path(browser)
+        print("=" * 60)
+        print("Yahoo DFS Interactive Login Helper")
+        print("=" * 60)
+        print(f"Browser: {browser.name}")
+        print(f"Profile directory: {resolved_path}")
+        print("\nOpening browser window...")
+        print("Please log into Yahoo and make sure to check 'Stay signed in' / 'Keep me signed in'.")
+        print("Navigate until you reach your Yahoo account or contest page, then return here.")
+
+        instance = cls.__new__(cls)
+        instance.headless = False
+        instance.profile_path = resolved_path
+        instance._site = Sites.YAHOO
+        instance._positions = DFS_POSITIONS[instance._site]
+        instance._start_driver()
+        try:
+            instance.driver.get(EDIT_LINEUP_URL)
+            input("\n--> Press ENTER in this console when you have finished signing in... <--\n")
+            current_url = instance.driver.current_url
+            if 'login.yahoo.com' not in current_url.lower():
+                print("SUCCESS: Successfully signed into Yahoo! Profile saved.")
+            else:
+                print("WARNING: Current URL still indicates a login page. Please verify credentials.")
+        finally:
+            instance.driver.quit()
+
 
 if __name__ == '__main__':
-    # SubmitDFSTeamYahooByCSV()
+    import argparse
+    parser = argparse.ArgumentParser(description="Yahoo DFS Lineup Submission and Authentication")
+    parser.add_argument('--login', action='store_true',
+                        help="Open visible browser to log into Yahoo and save session in dedicated profile")
+    parser.add_argument('--headless', action='store_true', default=False,
+                        help="Run browser in headless mode")
+    args = parser.parse_args()
 
-    # chrome_options = Options()
-    # chrome_options.add_argument('user-data-dir=/home/danieli/.config/google-chrome/Default')
-    # # chrome_options.add_argument("--disable-extensions")
-    # # chrome_options.add_argument(f'--profile-directory=Yoni')
-    # # chrome_options.add_argument('--user-data-dir=/home/danieli/.config/google-chrome/Profile 1')
-    # # chrome_options.add_argument(f'user-data-dir=C:/Users/schwa/AppData/Local/Google/Chrome/User Data')
-    # # chrome_options.add_argument('--no-sandbox')
-    # # if self.profile_path is not None:
-    # #     chrome_options.add_argument(f"user-data-dir={self.profile_path}")
-    # # if self.headless:
-    # #     chrome_options.add_argument('--headless=new')
-    # driver = webdriver.Chrome(service=Service(), options=chrome_options)
-    # driver.get(EDIT_LINEUP_URL)
-    aaa = SubmitDFSTeamYahooByCSV(headless=False)
-    template = aaa._get_template_df()
-    aaa=1
+    if args.login:
+        SubmitDFSTeamYahooByCSV.interactive_login()
+    else:
+        SubmitDFSTeamYahooByCSV(headless=args.headless)

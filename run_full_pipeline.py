@@ -11,7 +11,8 @@ from utils import add_missing_points_columns_to_predictions, get_current_time, d
     get_current_date, load_and_cache_players_list, scrape_season_schedules, get_next_game_time, update_dir_name, DATA_DIR, \
     get_current_season, add_game_times_to_df
 from submit_dfs_team import SubmitDFSTeamYahooByCSV
-from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM
+from update_stats import update_all_stats
+from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM, get_browser_profile_path
 from enums import Browsers
 from machine_learning_fantasy_basketball_predictions.params.params import \
     MachineLearningParamsFantasyBasketballPredictions
@@ -192,12 +193,20 @@ class RunFullPipeline:
             self._run_times = None
 
         self.players_list = load_and_cache_players_list(season=self.season)
-        self.stats_loaders_players.call(players_list=self.players_list, add_upcoming_games=False)
-        self.stats_loaders_teams.call()
+        update_all_stats(
+            season=self.season,
+            add_upcoming_games=False,
+            stats_loader_players=self.stats_loaders_players,
+            stats_loader_teams=self.stats_loaders_teams,
+            calc_features=self.calc_features,
+            update_schedules=False,
+            players_list=self.players_list,
+        )
 
-        self.calc_features.call(players_list=self.players_list, add_upcoming_games=False)
-
-        # training/loading model
+        # Daily Model Retraining Architecture:
+        # Every morning the pipeline runs once to collect the previous day's results and
+        # train a brand new model incorporating the latest data (and extra weights on today's active players).
+        # TODO: Future investigation: evaluate fine-tuning an existing checkpoint vs. full daily retrain.
         params_path = os.path.join(DATA_DIR, f'machine_learning_fantasy_basketball_predictions/models/{self._load_params_from_model_id}/params.json')
         params = MachineLearningParamsFantasyBasketballPredictions.load_params(params_path)
         # params.features_params.extra_weight_on_certain_date = self._run_date
@@ -213,25 +222,12 @@ class RunFullPipeline:
                       os.path.join(os.path.dirname(model_dir), todays_model_name)
                       )
 
-
         params.continue_model_id = todays_model_name
         self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
 
     @staticmethod
-    def _browser_profile_path() -> str | None:
-        if BROWSER == Browsers.CHROME:
-            for p in ['/home/danieli/.config/google-chrome',
-                      "C:/Users/schwa/AppData/Local/Google/Chrome/User Data"]:
-                if os.path.isdir(p):
-                    return p
-            return None
-        elif BROWSER == Browsers.FIREFOX:
-            for p in ['/home/danieli/.mozilla/firefox/f0lpo4uh.default-release',
-                      'C:/Users/schwa/AppData/Roaming/Mozilla/Firefox/Profiles/irl9n0gn.default-release']:
-                if os.path.isdir(p):
-                    return p
-            return None
-        return None
+    def _browser_profile_path(browser: Browsers = BROWSER) -> str | None:
+        return get_browser_profile_path(browser)
 
     def run_full_pipeline(self):
         profile_path = self._browser_profile_path()
@@ -245,9 +241,15 @@ class RunFullPipeline:
         if len(contest_ids) == 0:
             return
 
-        self.stats_loaders_players.call(players_list=self.players_list)
-        self.stats_loaders_teams.call()
-        self.calc_features.call(players_list=self.players_list)
+        update_all_stats(
+            season=self.season,
+            add_upcoming_games=True,
+            stats_loader_players=self.stats_loaders_players,
+            stats_loader_teams=self.stats_loaders_teams,
+            calc_features=self.calc_features,
+            update_schedules=False,
+            players_list=self.players_list,
+        )
 
         self.train_nn.create_data_loaders()
         self.train_nn.update_categorical_params()
@@ -331,14 +333,11 @@ class RunFullPipeline:
                     if not min_acceptable_time < get_current_time() < max_acceptable_time:
                         continue
 
-                # try:
-                self.run_full_pipeline()
-                # except Exception as e:
-                #     logging.warning(f'There was an error when running run_full_pipeline {e}!!!\ncontinuing...')
-                #     traceback.print_exc()
-                #     import sys
-                #     sys.exit(0)
-                #     continue
+                try:
+                    self.run_full_pipeline()
+                except Exception as e:
+                    logging.exception(f'Error executing run_full_pipeline before game at {game_time}: {e}')
+                    continue
 
     @staticmethod
     def _get_game_times_by_day_dict() -> dict:

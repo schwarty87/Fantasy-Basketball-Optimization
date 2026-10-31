@@ -27,6 +27,9 @@ comments_nbacom/
 dfs_contests/
 nbacom_single_game_boxscores/
 machine_learning_fantasy_basketball_predictions/models/
+submitted_teams/*.csv
+submitted_teams/downloads/
+submitted_teams/browser_profile/
 
 # OS files
 .DS_Store

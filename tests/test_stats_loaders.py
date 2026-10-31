@@ -1,6 +1,6 @@
 import datetime
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import pandas as pd
 from data_collectors.stats_loaders import (
     StatsLoader,
@@ -8,7 +8,13 @@ from data_collectors.stats_loaders import (
     StatsLoaderTeams,
     _coalesce_merge_columns,
 )
-from utils import assert_valid_df_all, assert_valid_df_players, downcast_df
+from utils import (
+    assert_valid_df_all,
+    assert_valid_df_players,
+    assert_valid_player_stats_math,
+    assert_reconciled_player_team_stats,
+    downcast_df,
+)
 
 
 class TestStatsLoaders(unittest.TestCase):
@@ -473,6 +479,228 @@ class TestStatsLoaders(unittest.TestCase):
         df = pd.DataFrame(columns=["MIN", "PTS", "BLK"])
         result = downcast_df(df, print_usage=False)
         self.assertTrue(result.empty)
+
+    @patch("data_collectors.stats_loaders.load_schedule")
+    @patch("data_collectors.stats_loaders.data_collectors.ejections.Ejections")
+    @patch("data_collectors.stats_loaders.data_collectors.injuries.Injuries")
+    @patch("data_collectors.stats_loaders.data_collectors.starters.Starters")
+    @patch("data_collectors.stats_loaders.data_collectors.fantasy_data.LoadFantasyData")
+    @patch("data_collectors.stats_loaders.data_collectors.left_midgame.LeftMidgame")
+    def test_add_extra_data_left_midgame_filtering_and_clean_booleans(
+        self, mock_left_midgame, mock_fantasy, mock_starters, mock_injuries, mock_ejections, mock_schedule
+    ):
+        """Verify _add_extra_data_to_updates_df prevents full-minute players from false LEFT_MIDGAME flags."""
+        mock_schedule.return_value = pd.DataFrame()
+        test_date = datetime.date(2025, 1, 15)
+
+        # Setup mock injuries: both Player Healthy (36 min) and Player Short (8 min) on injury report
+        inj_instance = MagicMock()
+        inj_instance.out_players.return_value = ["Player Full", "Player Short"]
+        mock_injuries.return_value = inj_instance
+
+        # Setup mock left_midgame collector: detected Player Exit (12 min)
+        lm_instance = MagicMock()
+        lm_instance.collect_data.return_value = {"Player Exit"}
+        mock_left_midgame.return_value = lm_instance
+
+        # Setup mock starters and fantasy data
+        mock_starters.return_value.collect_data.return_value = pd.DataFrame({
+            "NAME": ["Player Full", "Player Short", "Player Exit"],
+            "TEAM": ["BOS", "BOS", "BOS"],
+            "START_POSITION": ["PG", "SG", "SF"],
+            "STARTER": [True, True, True],
+        })
+        mock_fantasy.return_value.collect_data.return_value = pd.DataFrame({
+            "NAME": ["Player Full", "Player Short", "Player Exit"],
+            "TEAM": ["BOS", "BOS", "BOS"],
+        })
+        mock_ejections.return_value.collect_data.return_value = pd.DataFrame(
+            columns=["NAME", "TEAM", "DATE"]
+        )
+
+        loader = StatsLoaderPlayers(season=2025)
+        loader.updates_df = pd.DataFrame({
+            "DATE": [test_date, test_date, test_date],
+            "GAME_ID": [22400001, 22400001, 22400001],
+            "NAME": ["Player Full", "Player Short", "Player Exit"],
+            "TEAM": ["BOS", "BOS", "BOS"],
+            "MIN": [36.0, 8.0, 12.0],
+            "PLAYER_ID": [101, 102, 103],
+            "TEAM_ID": [1610612738, 1610612738, 1610612738],
+            "COMMENT": ["", "", ""],
+        })
+        loader._read_single_game_boxscores_comments = MagicMock()
+        loader._add_extra_data_to_updates_df()
+
+        # Check results
+        df = loader.updates_df
+        self.assertFalse(df.loc[df["NAME"] == "Player Full", "LEFT_MIDGAME"].iloc[0],
+                         "Player Full (36 min) must NOT be marked LEFT_MIDGAME")
+        self.assertTrue(df.loc[df["NAME"] == "Player Short", "LEFT_MIDGAME"].iloc[0],
+                        "Player Short (8 min on injury report) should be marked LEFT_MIDGAME")
+        self.assertTrue(df.loc[df["NAME"] == "Player Exit", "LEFT_MIDGAME"].iloc[0],
+                        "Player Exit (detected via pbp/recap) should be marked LEFT_MIDGAME")
+
+        # Zero NaNs in boolean columns
+        for c in ("LEFT_MIDGAME", "EJECTED", "IS_OUT"):
+            self.assertFalse(df[c].isnull().any())
+            self.assertEqual(df[c].dtype, bool)
+
+    def test_assert_valid_player_stats_math_valid(self):
+        """Verify assert_valid_player_stats_math passes on mathematically consistent data."""
+        valid_df = pd.DataFrame({
+            "NAME": ["Player One", "Player Two"],
+            "DATE": [datetime.date(2025, 1, 1)] * 2,
+            "MIN": [30.0, 20.0],
+            "FGM": [10.0, 5.0],
+            "FGA": [20.0, 10.0],
+            "3PM": [2.0, 1.0],
+            "3PA": [6.0, 3.0],
+            "FTM": [5.0, 3.0],
+            "FTA": [6.0, 4.0],
+            "PTS": [27.0, 14.0],  # 2*(10-2)+3*2+5 = 27; 2*(5-1)+3*1+3 = 14
+            "OREB": [2.0, 1.0],
+            "DREB": [5.0, 3.0],
+            "REB": [7.0, 4.0],
+            "YAHOO_POINTS": [45.0, 25.0],
+        })
+        # Should execute cleanly without error
+        assert_valid_player_stats_math(valid_df)
+
+    def test_assert_valid_player_stats_math_catches_pts_discrepancy(self):
+        """Verify assert_valid_player_stats_math raises AssertionError when PTS != 2*2PM + 3*3PM + FTM."""
+        bad_pts_df = pd.DataFrame({
+            "NAME": ["Player Error"],
+            "DATE": [datetime.date(2025, 1, 1)],
+            "MIN": [30.0],
+            "FGM": [10.0],
+            "FGA": [20.0],
+            "3PM": [2.0],
+            "3PA": [5.0],
+            "FTM": [5.0],
+            "FTA": [6.0],
+            "PTS": [99.0],  # Should be 27, not 99
+        })
+        with self.assertRaises(AssertionError):
+            assert_valid_player_stats_math(bad_pts_df)
+
+    def test_assert_valid_player_stats_math_catches_reb_discrepancy(self):
+        """Verify assert_valid_player_stats_math raises AssertionError when REB != OREB + DREB."""
+        bad_reb_df = pd.DataFrame({
+            "NAME": ["Player Error"],
+            "DATE": [datetime.date(2025, 1, 1)],
+            "MIN": [25.0],
+            "OREB": [3.0],
+            "DREB": [4.0],
+            "REB": [15.0],  # Should be 7, not 15
+        })
+        with self.assertRaises(AssertionError):
+            assert_valid_player_stats_math(bad_reb_df)
+
+    def test_assert_valid_player_stats_math_catches_attempts_violations(self):
+        """Verify assert_valid_player_stats_math raises AssertionError when FGM > FGA or FTM > FTA."""
+        bad_fg_df = pd.DataFrame({
+            "NAME": ["Player Error"],
+            "DATE": [datetime.date(2025, 1, 1)],
+            "MIN": [25.0],
+            "FGM": [12.0],
+            "FGA": [10.0],  # Impossible: 12 made on 10 attempts
+        })
+        with self.assertRaises(AssertionError):
+            assert_valid_player_stats_math(bad_fg_df)
+
+        bad_ft_df = pd.DataFrame({
+            "NAME": ["Player Error"],
+            "DATE": [datetime.date(2025, 1, 1)],
+            "MIN": [25.0],
+            "FTM": [8.0],
+            "FTA": [6.0],  # Impossible: 8 made on 6 attempts
+        })
+        with self.assertRaises(AssertionError):
+            assert_valid_player_stats_math(bad_ft_df)
+
+    def test_assert_reconciled_player_team_stats_valid(self):
+        """Verify assert_reconciled_player_team_stats passes when sum of player stats equals team totals."""
+        player_df = pd.DataFrame({
+            "GAME_ID": [22400001, 22400001],
+            "TEAM_ID": [1610612738, 1610612738],
+            "PTS": [60.0, 50.0],
+            "FGM": [22.0, 18.0],
+            "AST": [15.0, 10.0],
+        })
+        team_df = pd.DataFrame({
+            "GAME_ID": [22400001],
+            "TEAM_ID": [1610612738],
+            "PTS": [110.0],
+            "FGM": [40.0],
+            "AST": [25.0],
+        })
+        # Should execute without error
+        assert_reconciled_player_team_stats(player_df, team_df)
+
+    def test_assert_reconciled_player_team_stats_catches_discrepancy(self):
+        """Verify assert_reconciled_player_team_stats raises AssertionError when player sum != team stats."""
+        player_df = pd.DataFrame({
+            "GAME_ID": [22400001, 22400001],
+            "TEAM_ID": [1610612738, 1610612738],
+            "PTS": [50.0, 50.0],  # Total = 100
+            "FGM": [20.0, 20.0],
+        })
+        team_df = pd.DataFrame({
+            "GAME_ID": [22400001],
+            "TEAM_ID": [1610612738],
+            "PTS": [115.0],  # Mismatch: 115 != 100
+            "FGM": [40.0],
+        })
+        with self.assertRaises(AssertionError):
+            assert_reconciled_player_team_stats(player_df, team_df)
+
+    @patch("data_collectors.stats_loaders.load_schedule")
+    def test_stats_loader_players_assert_valid_df_reconciles_team_boxscores(self, mock_schedule):
+        """Verify StatsLoaderPlayers.assert_valid_df automatically invokes team reconciliation."""
+        mock_schedule.return_value = pd.DataFrame()
+        loader = StatsLoaderPlayers(season=2026)
+
+        player_df = pd.DataFrame({
+            "GAME_ID": [22600001, 22600001],
+            "TEAM_ID": [1610612738, 1610612738],
+            "PLAYER_ID": [101, 102],
+            "NAME": ["Player One", "Player Two"],
+            "DATE": [datetime.date(2026, 11, 1), datetime.date(2026, 11, 1)],
+            "MIN": [20.0, 20.0],
+            "PTS": [50.0, 50.0],
+            "FGM": [20.0, 20.0],
+            "FGA": [30.0, 30.0],
+            "3PM": [5.0, 5.0],
+            "3PA": [10.0, 10.0],
+            "FTM": [5.0, 5.0],
+            "FTA": [6.0, 6.0],
+            "OREB": [2.0, 2.0],
+            "DREB": [3.0, 3.0],
+            "REB": [5.0, 5.0],
+            "AST": [10.0, 10.0],
+        })
+        mismatch_team_df = pd.DataFrame({
+            "GAME_ID": [22600001],
+            "TEAM_ID": [1610612738],
+            "PTS": [120.0],  # Mismatch: 120 != 100
+            "FGM": [40.0],
+            "AST": [20.0],
+        })
+        matching_team_df = pd.DataFrame({
+            "GAME_ID": [22600001],
+            "TEAM_ID": [1610612738],
+            "PTS": [100.0],  # Matches: 50 + 50 = 100
+            "FGM": [40.0],
+            "AST": [20.0],
+        })
+
+        with patch.object(loader, "_get_team_boxscores_df", return_value=mismatch_team_df):
+            with self.assertRaises(AssertionError):
+                loader.assert_valid_df(player_df, is_incremental=True)
+
+        with patch.object(loader, "_get_team_boxscores_df", return_value=matching_team_df):
+            loader.assert_valid_df(player_df, is_incremental=True)
 
 
 if __name__ == "__main__":

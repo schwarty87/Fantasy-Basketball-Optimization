@@ -261,7 +261,8 @@ FIX_PLAYER_NAMES = {
     'Ron Holland': 'Ronald Holland II',
     'Yongxi Cui': 'Cui Yongxi',
     'Kevin McCullar': 'Kevin McCullar Jr.',
-    'Terrence Shannon': 'Terrence Shannon Jr',
+    'Terrence Shannon': 'Terrence Shannon Jr.',
+    'Terrence Shannon Jr': 'Terrence Shannon Jr.',
     'Alex Sarr': 'Alexandre Sarr',
     'Tristan Da Silva': 'Tristan da Silva',
     'DaRon Holmes': 'DaRon Holmes II',
@@ -452,4 +453,48 @@ SUPERSTARS = ['LeBron James', 'Kevin Durant', 'Anthony Davis', 'Tim Duncan', 'Ko
               'Jaren Jackson Jr.', 'Tyrese Haliburton', 'Bam Adebayo', 'Mikal Bridges', 'Alperen Sengun', 'Myles Turner']
 
 
-BROWSER = Browsers.FIREFOX
+BROWSER = Browsers.CHROME
+
+BROWSER_PROFILE_PATHS: dict[Browsers, list[str]] = {
+    Browsers.CHROME: [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'submitted_teams', 'browser_profile'),
+        os.path.expandvars(r'%LOCALAPPDATA%\Google\Chrome\User Data'),
+        'C:/Users/schwa/AppData/Local/Google/Chrome/User Data',
+        '/home/danieli/.config/google-chrome',
+        os.path.expanduser('~/.config/google-chrome'),
+    ],
+    Browsers.FIREFOX: [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'submitted_teams', 'firefox_profile'),
+        os.path.expandvars(r'%APPDATA%\Mozilla\Firefox\Profiles'),
+        'C:/Users/schwa/AppData/Roaming/Mozilla/Firefox/Profiles',
+        '/home/danieli/.mozilla/firefox',
+        os.path.expanduser('~/.mozilla/firefox'),
+    ],
+}
+
+
+def get_browser_profile_path(browser: Browsers = BROWSER) -> str | None:
+    candidate_paths = BROWSER_PROFILE_PATHS.get(browser, [])
+    if browser == Browsers.CHROME:
+        for p in candidate_paths:
+            if p and os.path.isdir(p):
+                return p
+        return None
+    elif browser == Browsers.FIREFOX:
+        for base in candidate_paths:
+            if base and os.path.isdir(base):
+                # If the folder itself is directly a dedicated profile
+                if os.path.basename(base) == 'firefox_profile':
+                    return base
+                try:
+                    profiles = [p for p in os.listdir(base) if os.path.isdir(os.path.join(base, p))]
+                    for p in profiles:
+                        if 'default-release' in p:
+                            return os.path.join(base, p)
+                    for p in profiles:
+                        if 'default' in p:
+                            return os.path.join(base, p)
+                except Exception:
+                    continue
+        return None
+    return None

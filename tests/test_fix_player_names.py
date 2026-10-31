@@ -96,6 +96,15 @@ class TestFixPlayerNames(unittest.TestCase):
         # 4. Justin Anderson must NOT be mapped to Juan Toscano-Anderson
         self.assertNotIn("Justin Anderson", FIX_PLAYER_NAMES)
 
+    def test_fix_names_first_name_prefix_diminutives(self):
+        """Verify first-name prefix variations (Dom -> Dominick) resolve when surname is unique in compare_names."""
+        canonical = ["Dominick Barlow", "Alexandre Sarr", "Herbert Jones"]
+        fixer = FixPlayerNames(compare_names=canonical)
+
+        inputs = ["Dom Barlow", "Alex Sarr", "Herb Jones"]
+        result = fixer.fix_names(inputs)
+        self.assertEqual(list(result), ["Dominick Barlow", "Alexandre Sarr", "Herbert Jones"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -70,7 +70,11 @@ class CalcFeatures:
     def _add_data_from_nbacom_players_list(self, players_list: Optional[pd.DataFrame] = None):
         if players_list is None:
             players_list = load_and_cache_players_list(season=self.player_stats['SEASON_YEAR'].max())
-        players_list = players_list[['PLAYER_ID', 'HEIGHT', "WEIGHT", 'FROM_YEAR', 'DRAFT_NUMBER']]
+        players_list = players_list[['PLAYER_ID', 'HEIGHT', "WEIGHT", 'FROM_YEAR', 'DRAFT_NUMBER']].copy()
+        if 'FROM_YEAR' in players_list.columns:
+            players_list['FROM_YEAR'] = pd.to_numeric(players_list['FROM_YEAR'], errors='coerce')
+        if 'DRAFT_NUMBER' in players_list.columns:
+            players_list['DRAFT_NUMBER'] = pd.to_numeric(players_list['DRAFT_NUMBER'], errors='coerce')
         self.updates_df = self.updates_df.merge(players_list, on='PLAYER_ID', how='left')
 
         # fixing FROM_YEAR where possible
@@ -78,6 +82,9 @@ class CalcFeatures:
         from_year.rename(columns={'SEASON_YEAR': 'FROM_YEAR'}, inplace=True)
         from_year = from_year.loc[from_year['FROM_YEAR'] > self.player_stats['SEASON_YEAR'].min()]
         self.updates_df = self.updates_df.merge(from_year, on='PLAYER_ID', how='left', suffixes=(None, '_x'))
+        self.updates_df['FROM_YEAR'] = pd.to_numeric(self.updates_df['FROM_YEAR'], errors='coerce')
+        if 'FROM_YEAR_x' in self.updates_df.columns:
+            self.updates_df['FROM_YEAR_x'] = pd.to_numeric(self.updates_df['FROM_YEAR_x'], errors='coerce')
         replace_inds = self.updates_df['FROM_YEAR_x'].notnull() & \
                        (self.updates_df['FROM_YEAR'] > self.player_stats['SEASON_YEAR'].min() - 2)
         self.updates_df.loc[replace_inds, 'FROM_YEAR'] = self.updates_df.loc[replace_inds, 'FROM_YEAR_x'].values
@@ -270,7 +277,7 @@ class CalcFeatures:
         bench_df['START_POSITION_CALCULATED_BY_POSITION'] = \
             bench_df.assign(dummy=1).groupby(['DATE', 'TEAM_ID', 'SITE_POSITION_ROUNDED'])['dummy'].cumsum() + 1
         bench_df['START_POSITION_CALCULATED_BY_POSITION'] = \
-            bench_df['SITE_POSITION_ROUNDED'].replace(NUM_TO_POSITION) + \
+            bench_df['SITE_POSITION_ROUNDED'].replace(NUM_TO_POSITION).astype(str) + \
             bench_df['START_POSITION_CALCULATED_BY_POSITION'].astype(str)
 
         concatted = pd.concat([starter_df, bench_df], axis=0).set_index('index_in_stats_df')
@@ -294,13 +301,12 @@ class CalcFeatures:
 
         # calculating expected order by position
         self.updates_df['SITE_POSITION_ROUNDED'] = self.updates_df['SITE_POSITION'].fillna(1).round().astype(int)
-        starter_inds = self.updates_df['STARTER']
-        self.updates_df['SITE_POSITION_ROUNDED'] = np.where(starter_inds,
-                                                            self.updates_df['START_POSITION'].map(POSITION_TO_NUM).values,
-                                                            self.updates_df['START_POSITION']).astype(float)
-        # self.updates_df.loc[starter_inds, 'SITE_POSITION_ROUNDED'] = \
-        #     self.updates_df.loc[starter_inds, 'START_POSITION'].replace(POSITION_TO_NUM).values
-        self.updates_df['EXPECTED_ORDER_BY_POSITION'] = np.nan
+        starter_inds = self.updates_df['STARTER'].astype(bool)
+        if starter_inds.any():
+            mapped_starters = self.updates_df.loc[starter_inds, 'START_POSITION'].map(POSITION_TO_NUM)
+            self.updates_df.loc[starter_inds, 'SITE_POSITION_ROUNDED'] = (
+                mapped_starters.fillna(self.updates_df.loc[starter_inds, 'SITE_POSITION_ROUNDED']).astype(int)
+            )
         all_results = []
         for position_num, group_df in self.updates_df.groupby('SITE_POSITION_ROUNDED'):
             use_ids = group_df['PLAYER_ID'].unique()
@@ -314,6 +320,8 @@ class CalcFeatures:
             combined = combined[~combined.index.duplicated(keep='first')]
             combined = combined.rename(columns={'EXPECTED_ORDER': 'EXPECTED_ORDER_BY_POSITION'})
             self.updates_df = self.updates_df.merge(combined, left_on='index_in_stats_df', right_index=True, how='left')
+        else:
+            self.updates_df['EXPECTED_ORDER_BY_POSITION'] = np.nan
 
         self.updates_df.loc[starter_inds, 'EXPECTED_ORDER_BY_POSITION'] = \
             self.updates_df.loc[starter_inds, 'EXPECTED_ORDER_BY_POSITION'].fillna(1)
@@ -340,10 +348,10 @@ class CalcFeatures:
             all_team_ids = sorted(set(all_team_ids + list(self.df['TEAM_ID'].unique())))
         assert len(all_team_ids) == 30
         team_id_dict = {tid: i for i, tid in enumerate(sorted(all_team_ids))}
-        year_str = self.updates_df['SEASON_YEAR'].astype(str).str[2:]
+        year_str = self.updates_df['SEASON_YEAR'].astype(int).astype(str).str[2:]
 
         def id_to_str(x):
-            return x.replace(team_id_dict).apply(lambda y: f'{y:02d}')
+            return x.astype(int).replace(team_id_dict).apply(lambda y: f'{int(y):02d}')
 
         self.updates_df['SEASON_TEAM'] = (year_str + id_to_str(self.updates_df['TEAM_ID'])).astype(int)
         self.updates_df['SEASON_OPPONENT'] = (year_str + id_to_str(self.updates_df['OPPONENT_ID'])).astype(int)
