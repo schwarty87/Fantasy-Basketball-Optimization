@@ -530,7 +530,7 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    use_lightning = args.use_lightning or args.swa or args.auto_lr_find
+    use_lightning = args.use_lightning
     params = create_params()
     if args.fast_dev_run:
         params.training_params.fast_dev_run = True
