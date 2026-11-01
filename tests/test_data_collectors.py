@@ -790,12 +790,13 @@ class TestDataCollectors(unittest.TestCase):
         self, mock_load_players, mock_first_slate, mock_rg_salaries, mock_schedule
     ):
         """Verify rotogrinders fallback calls load_and_cache_players_list dynamically."""
-        mock_schedule.return_value = pd.DataFrame({"TEAM_ID": [1], "DATE": [datetime.date(2026, 11, 1)]})
+        historical_date = datetime.date(2023, 11, 15)
+        mock_schedule.return_value = pd.DataFrame({"TEAM_ID": [1], "DATE": [historical_date]})
         mock_rg_salaries.return_value = pd.DataFrame({"NAME": ["Player A"], "YAHOO_SALARY": [15]})
         mock_load_players.return_value = pd.DataFrame({"NAME": ["Player A"], "TEAM_ABBREVIATION": ["BOS"]})
 
         lfd = LoadFantasyData(nbacom_players_list=[])
-        res = lfd._load_data_rotogrinders(date=datetime.date(2026, 11, 1))
+        res = lfd._load_data_rotogrinders(date=historical_date)
 
         mock_load_players.assert_called_once_with()
         self.assertIn("TEAM", res.columns)

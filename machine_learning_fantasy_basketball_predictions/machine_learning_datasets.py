@@ -273,11 +273,15 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                 prev_lagged = [p for p in prev_lagged if p in features_df.columns]
                 prev_lagged_features = features_df[prev_lagged].rename(columns=lambda x: x.replace(f'_t-{lag - 1}', f'_t-{lag}'))
                 lagged_features = lagged_features.fillna(prev_lagged_features)
-
-            bfilled = lagged_features.bfill()
-            bfilled = bfilled.fillna(value=IGNORE_VAL)
-            bfilled.columns = [f'{stat}_t-{lag}' for stat in stats]
-            all_lagged_features.append(bfilled)
+            # If a player has no prior games in history (e.g. debut), fill with the role/position
+            # baseline rather than zeros or naive un-grouped bfill (which leaks stats across players)
+            role_group_cols = [c for c in ['START_POSITION_CALCULATED', 'STARTER'] if c in features_df.columns]
+            if role_group_cols:
+                role_means = features_df.groupby(role_group_cols)[stats].transform('mean')
+                lagged_features = lagged_features.fillna(role_means)
+            lagged_features = lagged_features.fillna(0.0)
+            lagged_features.columns = [f'{stat}_t-{lag}' for stat in stats]
+            all_lagged_features.append(lagged_features)
         features_df = pd.concat([features_df] + all_lagged_features, axis=1)
 
         return features_df

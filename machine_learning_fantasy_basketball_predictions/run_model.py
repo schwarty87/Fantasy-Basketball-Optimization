@@ -5,6 +5,7 @@ import datetime
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import spearmanr, pearsonr
 import lightning.pytorch as pl
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
@@ -127,8 +128,66 @@ class RunModelFantasyBasketballPredictions(RunModel):
     def predict(self, data_split_type: DataSplitType = DataSplitType.TRAIN, **kwargs) -> pd.DataFrame:
         return super().predict(data_split_type=data_split_type, trainer_cls=pl.Trainer, **kwargs)
 
+    @staticmethod
+    def _calculate_prediction_correlations(eval_results: pd.DataFrame, predict_results: pd.DataFrame) -> pd.DataFrame:
+        if predict_results is None or predict_results.empty:
+            return eval_results
+
+        preds = predict_results.copy()
+        try:
+            add_missing_points_columns_to_predictions(preds)
+        except Exception:
+            pass
+
+        true_col = 'YAHOO_POINTS_true' if 'YAHOO_POINTS_true' in preds.columns else 'YAHOO_POINTS'
+        if 'YAHOO_POINTS_pred' not in preds.columns or true_col not in preds.columns:
+            return eval_results
+
+        if 'NOT_IGNORE' in preds.columns:
+            preds = preds.loc[preds['NOT_IGNORE'].astype(bool)]
+
+        for split_type in DataSplitType.all_not_none_split_types():
+            split_name = split_type.name
+            split_mask = (preds['split_type'] == split_type) | (preds['split_type'] == split_name) | (preds['split_type'] == split_type.value)
+            split_df = preds[split_mask]
+            valid = split_df[split_df[true_col].notna() & split_df['YAHOO_POINTS_pred'].notna()]
+            if len(valid) < 5:
+                continue
+
+            p_corr, _ = pearsonr(valid['YAHOO_POINTS_pred'], valid[true_col])
+            s_corr, _ = spearmanr(valid['YAHOO_POINTS_pred'], valid[true_col])
+
+            daily_spearmans = []
+            if 'DATE' in valid.columns:
+                for _, day_df in valid.groupby('DATE'):
+                    if len(day_df) >= 10 and day_df[true_col].nunique() > 1 and day_df['YAHOO_POINTS_pred'].nunique() > 1:
+                        d_corr, _ = spearmanr(day_df['YAHOO_POINTS_pred'], day_df[true_col])
+                        if not np.isnan(d_corr):
+                            daily_spearmans.append(d_corr)
+
+            daily_spearman_mean = float(np.mean(daily_spearmans)) if daily_spearmans else float('nan')
+
+            if 'split_type' in eval_results.columns and not eval_results.empty:
+                target_mask = (eval_results['split_type'] == split_type) | (eval_results['split_type'] == split_name) | (eval_results['split_type'] == split_type.value)
+                idx = eval_results[target_mask].index[0] if target_mask.any() else split_name
+            else:
+                idx = split_name
+
+            eval_results.loc[idx, 'pearson_corr'] = p_corr
+            eval_results.loc[idx, 'spearman_corr'] = s_corr
+            eval_results.loc[idx, 'daily_spearman_corr'] = daily_spearman_mean
+
+            logging.info(
+                f"[{split_name}] Points Correlation: Pearson={p_corr:.4f}, "
+                f"Spearman={s_corr:.4f}, Mean Daily Spearman={daily_spearman_mean:.4f} (over {len(daily_spearmans)} days)"
+            )
+
+        return eval_results
+
     def _add_extra_metrics_to_eval_results(self, eval_results: pd.DataFrame, predict_results: pd.DataFrame
                                            ) -> pd.DataFrame:
+        eval_results = self._calculate_prediction_correlations(eval_results=eval_results, predict_results=predict_results)
+
         try:
             contests_df = self._load_contests_df()
         except FileNotFoundError as e:

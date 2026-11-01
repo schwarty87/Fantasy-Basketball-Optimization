@@ -151,15 +151,6 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
     tabular_features = CombineTensorsParams(input_tensor_name=['tabular', 'lagged'],
                                             output_tensor_name='all_tabular',
                                             combine_func_str='concat')
-    num_tabular_features = len(features_params.feature_name_to_machine_learning_dataset_params['tabular'].feature_names)
-    num_lagged_features = (
-        len(set([f.split('_t-')[0] for f in
-                 features_params.feature_name_to_machine_learning_dataset_params['lagged'].feature_names]
-                )))
-    tabular_dense = DenseLayersParams(input_tensor_name=tabular_features.output_tensor_name,
-                                      output_tensor_name='embedded_tabular',
-                                      num_nodes_per_layer=[num_tabular_features + num_lagged_features]
-                                      )
     combined_tabular_embeddings = CombineTensorsParams(input_tensor_name=embeddings.output_tensor_name +
                                                                          [tabular_features.output_tensor_name],
                                                        output_tensor_name='combined_tabular_embeddings',
@@ -170,7 +161,8 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
     num_positional_encoding_features = \
         len(features_params.feature_name_to_machine_learning_dataset_params[positional_encodings_name].feature_names)
     combined_embeddings_dim = (sum(embeddings.embeddings_dims) +
-                               tabular_dense.num_nodes_per_layer[-1]
+                               len(features_params.feature_name_to_machine_learning_dataset_params['tabular'].feature_names) +
+                               len(features_params.feature_name_to_machine_learning_dataset_params['lagged'].feature_names)
                                )
     # positional_encodings_embedding_dim = combined_embeddings_dim // 2
     positional_encodings_embedding_dim = [1, 11]  # HOME, START_POSITION_CALCULATED
@@ -227,9 +219,9 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
     output_dense = DenseLayersParams(input_tensor_name=transformer_encoder_params.output_tensor_name,
                                      #input_tensor_name=transformer_encoder_params_1.output_tensor_name,
                                      output_tensor_name='outputs_pred',
-                                     num_nodes_per_layer=[num_outputs, num_outputs],
+                                     num_nodes_per_layer=[64, num_outputs],
                                      use_batchnorm=True,
-                                     activation=ActivationFunction.RELU)
+                                     activation=ActivationFunction.GELU)
 
     calculate_fantasy_points_params = CalculateFantasyPointsParams(input_tensor_name='outputs_pred',
                                                                    output_tensor_name='fantasy_points',
@@ -316,7 +308,7 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
                                                )
 
     # layer_params_list = [embeddings, tabular_dense, lagged_embedding, combined_tabular_embeddings,
-    layer_params_list = [embeddings, tabular_features, tabular_dense, combined_tabular_embeddings,
+    layer_params_list = [embeddings, tabular_features, combined_tabular_embeddings,
                          positional_encodings, with_positional_encoding, inputs_encoder_params,
                          # tsmixer_params, output_dense]
                          transformer_encoder_params_1,
@@ -387,7 +379,7 @@ def create_training_params(features_params: FeaturesParamsFantasyBasketballPredi
     save_predictions_path = os.path.join(models_dir(PROJECT_NAME), str(model_id), 'predictions.arrow')
     callbacks_params = (ModelCheckpointParams(),
                         EarlyStoppingParams(),
-                        ReduceLearningRateOnPlateauParams(),
+                        ReduceLearningRateOnPlateauParams(patience=5),
                         LogModelResultsParams(),
                         CollectTruePredictedOutputsParamsFantasyBasketballPredictions(
                             column_names={'true_label': [f'{c}_true' for c in true_label_names],
