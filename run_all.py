@@ -198,7 +198,7 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
                                                                     d_model=d_model,
                                                                     n_heads=n_heads,
                                                                     ffdim=d_model * 4,
-                                                                    dropout_rate=0.15,
+                                                                    dropout_rate=0.25,
                                                                     norm_at_beginning=True,
                                                                     n_bench_players=features_params.num_bench_players,
                                                                     num_layers=1
@@ -210,7 +210,7 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
                                                                  d_model=d_model,
                                                                  nhead=n_heads,
                                                                  dim_feedforward=d_model * 4,
-                                                                 dropout=0.15,
+                                                                 dropout=0.25,
                                                                  norm_first=True,
                                                                  num_layers=2,
                                                                  activation=ActivationFunction.GELU,
@@ -221,7 +221,8 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
                                      output_tensor_name='outputs_pred',
                                      num_nodes_per_layer=[64, num_outputs],
                                      use_batchnorm=True,
-                                     activation=ActivationFunction.GELU)
+                                     activation=ActivationFunction.GELU,
+                                     dropout_rate=0.15)
 
     calculate_fantasy_points_params = CalculateFantasyPointsParams(input_tensor_name='outputs_pred',
                                                                    output_tensor_name='fantasy_points',
@@ -529,7 +530,7 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    use_lightning = args.use_lightning
+    use_lightning = args.use_lightning or args.swa or args.auto_lr_find
     params = create_params()
     if args.fast_dev_run:
         params.training_params.fast_dev_run = True
