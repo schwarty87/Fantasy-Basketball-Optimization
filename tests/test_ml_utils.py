@@ -6,9 +6,19 @@ import unittest
 from unittest.mock import patch
 
 import pandas as pd
+import torch
 
+from machine_learning.enums import Reduction
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
+from machine_learning.metrics.abstract_metrics import AbstractMetric
+from machine_learning.params.abstract_params import AbstractMetricParams
 from machine_learning.utils import get_next_model_id
+from machine_learning_fantasy_basketball_predictions.machine_learning_datasets import (
+    MachineLearningDatasetCombinedFantasyBasketballPredictions,
+)
+from machine_learning_fantasy_basketball_predictions.params.params import (
+    FeaturesParamsFantasyBasketballPredictions,
+)
 
 
 class TestGetNextModelId(unittest.TestCase):
@@ -94,6 +104,90 @@ class TestConvertDatetimeToEpochTime(unittest.TestCase):
         df = pd.DataFrame({"DATE": pd.to_datetime(["2021-10-19"])})
         result = MachineLearningDatasetCombined._convert_datetime_to_epoch_time(df)
         self.assertNotIn("EPOCH_DATE", result.columns)
+
+
+class DummyScalarMetricParams(AbstractMetricParams):
+    name_for_logs: str = "dummy_scalar"
+    accumulate: bool = True
+    reduction: Reduction = Reduction.MEAN
+    reduction_dim: int = -1
+
+
+class DummyScalarMetric(AbstractMetric):
+    def _error_unreduced(self, y_true, y_pred):
+        return (y_true - y_pred) ** 2
+
+
+class TestAbstractMetricAccumulation(unittest.TestCase):
+    def test_accumulate_with_0d_scalar_tensors_does_not_raise(self):
+        """Tests that 0-D scalar metrics can accumulate across batches without concatenation errors."""
+        params = DummyScalarMetricParams(
+            name_for_logs="dummy",
+            accumulate=True,
+            reduction=Reduction.MEAN,
+            reduction_dim=-1,
+        )
+        metric = DummyScalarMetric(params=params)
+
+        # Batch 1 with 0-D scalar reduction
+        metric._add_batch_results_to_epoch_results(torch.tensor(2.0), torch.tensor(1.0))
+        # Batch 2 with 0-D scalar reduction
+        metric._add_batch_results_to_epoch_results(torch.tensor(4.0), torch.tensor(1.0))
+
+        metric.summarize()
+        self.assertIsInstance(metric.epoch_results, pd.DataFrame)
+        self.assertEqual(len(metric.epoch_results), 2)
+        self.assertListEqual(metric.epoch_results["dummy"].tolist(), [2.0, 4.0])
+
+
+class TestLaggedFeaturesFallback(unittest.TestCase):
+    def test_missing_lag_falls_back_to_previous_lag(self):
+        """Player with 2 career games requesting 3 lags: t-2 and t-3 should carry forward t-1."""
+        df = pd.DataFrame({
+            "PLAYER_ID": [10, 10],
+            "DATE": [datetime.date(2023, 11, 1), datetime.date(2023, 11, 3)],
+            "GAME_ID": [101, 102],
+            "TEAM_ID": [1, 1],
+            "TEAM": ["BOS", "BOS"],
+            "SEASON_YEAR": [2023, 2023],
+            "STARTER": [True, True],
+            "START_POSITION_CALCULATED": ["PG", "PG"],
+            "EJECTED": [False, False],
+            "LEFT_MIDGAME": [False, False],
+            "PTS": [20.0, 30.0],
+        })
+        params = FeaturesParamsFantasyBasketballPredictions()
+        params.all_feature_names_list = ["PTS_t-1", "PTS_t-2", "PTS_t-3"]
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_additional_columns(df.copy(), params)
+
+        # Game 2 (index 1) has game 1 prior (PTS=20.0). Lags 2 and 3 should fall back to 20.0
+        self.assertEqual(res.loc[1, "PTS_t-1"], 20.0)
+        self.assertEqual(res.loc[1, "PTS_t-2"], 20.0)
+        self.assertEqual(res.loc[1, "PTS_t-3"], 20.0)
+
+    def test_debut_player_uses_role_baseline(self):
+        """Debut game with no prior history fills with role mean instead of 0.0."""
+        df = pd.DataFrame({
+            "PLAYER_ID": [10, 10],
+            "DATE": [datetime.date(2023, 11, 1), datetime.date(2023, 11, 3)],
+            "GAME_ID": [101, 102],
+            "TEAM_ID": [1, 1],
+            "TEAM": ["BOS", "BOS"],
+            "SEASON_YEAR": [2023, 2023],
+            "STARTER": [True, True],
+            "START_POSITION_CALCULATED": ["PG", "PG"],
+            "EJECTED": [False, False],
+            "LEFT_MIDGAME": [False, False],
+            "PTS": [20.0, 30.0],
+        })
+        params = FeaturesParamsFantasyBasketballPredictions()
+        params.all_feature_names_list = ["PTS_t-1", "PTS_t-2", "PTS_t-3"]
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_additional_columns(df.copy(), params)
+
+        # Debut game (index 0) has no prior history -> role mean for Starting PG is (20+30)/2 = 25.0
+        self.assertEqual(res.loc[0, "PTS_t-1"], 25.0)
+        self.assertEqual(res.loc[0, "PTS_t-2"], 25.0)
+        self.assertEqual(res.loc[0, "PTS_t-3"], 25.0)
 
 
 if __name__ == "__main__":
