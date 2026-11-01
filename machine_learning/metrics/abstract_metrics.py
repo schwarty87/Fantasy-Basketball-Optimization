@@ -135,8 +135,14 @@ class AbstractMetric(torch.nn.Module, ABC):
                Should be the same size as batch_error_sums
         """
         if self.params.accumulate:
+            batch_error_sums = torch.atleast_1d(batch_error_sums)
+            if self._epoch_error_sums.device != batch_error_sums.device:
+                self._epoch_error_sums = self._epoch_error_sums.to(batch_error_sums.device)
             self._epoch_error_sums = torch.concat([self._epoch_error_sums, batch_error_sums])
             if batch_num_samples is not None:
+                batch_num_samples = torch.atleast_1d(batch_num_samples)
+                if self._epoch_num_samples.device != batch_num_samples.device:
+                    self._epoch_num_samples = self._epoch_num_samples.to(batch_num_samples.device)
                 self._epoch_num_samples = torch.concat([self._epoch_num_samples, batch_num_samples])
         else:
             self._epoch_error_sums = self._epoch_error_sums + batch_error_sums
