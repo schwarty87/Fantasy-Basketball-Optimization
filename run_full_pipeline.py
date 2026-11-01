@@ -64,12 +64,7 @@ class RunFullPipeline:
         self.stats_loaders_teams = StatsLoaderTeams(season=self.season)
         self.calc_features = CalcFeatures()
 
-        if isinstance(run_date, datetime.date):
-            self._run_date = run_date
-        elif isinstance(run_date, str) and run_date == 'today':
-            self._run_date = get_current_date()
-        else:
-            self._run_date = get_current_date()
+        self._run_date = self._resolve_run_date(run_date)
 
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
                       filename=os.path.join(DATA_DIR, 'logs', f"logs_{self._run_date}.txt"), print_to_console=True, filemode='a')
@@ -82,6 +77,24 @@ class RunFullPipeline:
         self.submit_teams = None
         # self.google_drive_driver = None    # driver for reading data from Google Drive
 
+    @staticmethod
+    def _resolve_run_date(run_date: datetime.date | str) -> datetime.date:
+        """
+        Parses run_date into a datetime.date object.
+        Supports datetime.date instances, the string 'today', or 'YYYY-MM-DD' strings.
+        """
+        if isinstance(run_date, datetime.date):
+            return run_date
+        if isinstance(run_date, str):
+            if run_date == 'today':
+                return get_current_date()
+            try:
+                return datetime.date.fromisoformat(run_date)
+            except ValueError:
+                pass
+        logging.error(f'Invalid run_date: {run_date!r}. Expected datetime.date, "today", or "YYYY-MM-DD". Defaulting to today.')
+        return get_current_date()
+
     def _reset(self, run_date: datetime.date | str):
         """
         Should be called at the beginning of each run, and every time we start a new day. Calculate all the relevant
@@ -91,12 +104,7 @@ class RunFullPipeline:
         previous day's results.
         :param run_date: The date that we're running now
         """
-        if isinstance(run_date, datetime.date):
-            self._run_date = run_date
-        elif isinstance(run_date, str) and run_date == 'today':
-            self._run_date = get_current_date()
-        else:
-            logging.error('run_date has to be either a datetime.date or "today"!!!')
+        self._run_date = self._resolve_run_date(run_date)
 
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
                       filename=os.path.join(DATA_DIR, 'logs', f"logs_{self._run_date}.txt"), print_to_console=True, filemode='a')

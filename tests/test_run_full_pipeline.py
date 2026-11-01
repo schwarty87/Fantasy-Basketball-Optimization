@@ -72,6 +72,14 @@ class TestRunFullPipeline(unittest.TestCase):
             pipeline._reset("today")
             self.assertEqual(pipeline._run_date, get_current_date())
 
+            # ISO date string
+            pipeline._reset("2026-11-15")
+            self.assertEqual(pipeline._run_date, datetime.date(2026, 11, 15))
+
+            # Invalid string fallback
+            pipeline._reset("not-a-date")
+            self.assertEqual(pipeline._run_date, get_current_date())
+
     def test_has_games_today(self):
         """Verify _has_games_today returns True when games are scheduled for _run_date."""
         pipeline = RunFullPipeline(
