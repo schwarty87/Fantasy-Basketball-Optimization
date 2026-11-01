@@ -408,8 +408,7 @@ class MachineLearningDatasetMetadata(MachineLearningDatasetTabular):
         if 'split_type' in df.columns:
             df['split_type'] = df['split_type'].apply(lambda x: DataSplitType(x).name)
         if 'DATE' in df.columns:
-            # TODO convert the date numbers back to dates!
-            aaa=1
+            df['DATE'] = pd.to_datetime(df['DATE'], unit='D').dt.date
         return df
 
 

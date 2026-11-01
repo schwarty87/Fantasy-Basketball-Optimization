@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import numpy as np
@@ -347,8 +348,13 @@ class CollectTruePredictedOutputs(AbstractCallback):
                                     raise ValueError(f'not all scaler features are in results_df {tt}!')
                                 results_df[cols] = np.where(results_df[cols] != IGNORE, scaler.inverse_transform(results_df[cols].values), IGNORE)
 
-        if 'DATE' in results_df.columns and results_df['DATE'].dtype == np.dtype('float'):
-            results_df['DATE'] = pd.to_datetime(results_df['DATE'], unit='D').dt.date
+        if 'DATE' in results_df.columns:
+            if pd.api.types.is_numeric_dtype(results_df['DATE']):
+                first_val = results_df['DATE'].dropna().iloc[0] if not results_df['DATE'].dropna().empty else None
+                unit = 's' if float(first_val or 0) > 1e7 else 'D'
+                results_df['DATE'] = pd.to_datetime(results_df['DATE'], unit=unit).dt.date
+            elif not results_df.empty and not isinstance(results_df['DATE'].iloc[0], datetime.date):
+                results_df['DATE'] = pd.to_datetime(results_df['DATE']).dt.date
 
         if metric_name_to_results_df is not None:
             results_df = pd.concat([results_df] + list(metric_name_to_results_df.values()), axis=1)

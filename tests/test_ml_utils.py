@@ -190,5 +190,36 @@ class TestLaggedFeaturesFallback(unittest.TestCase):
         self.assertEqual(res.loc[0, "PTS_t-3"], 25.0)
 
 
+class TestDateConversion(unittest.TestCase):
+    """Tests date conversion from days, seconds, strings, and tensors."""
+
+    def test_convert_date_col_from_days_float32(self):
+        from utils import convert_date_col_to_date
+        s = pd.Series([19676.0, 19677.0], dtype="float32")
+        converted = convert_date_col_to_date(s)
+        self.assertEqual(converted.iloc[0], datetime.date(2023, 11, 15))
+        self.assertEqual(converted.iloc[1], datetime.date(2023, 11, 16))
+
+    def test_convert_date_col_from_seconds_int64(self):
+        from utils import convert_date_col_to_date
+        s = pd.Series([1700006400, 1700092800], dtype="int64")
+        converted = convert_date_col_to_date(s)
+        self.assertEqual(converted.iloc[0], datetime.date(2023, 11, 15))
+        self.assertEqual(converted.iloc[1], datetime.date(2023, 11, 16))
+
+    def test_convert_date_col_from_strings(self):
+        from utils import convert_date_col_to_date
+        s = pd.Series(["2023-11-15", "2023-11-16"])
+        converted = convert_date_col_to_date(s)
+        self.assertEqual(converted.iloc[0], datetime.date(2023, 11, 15))
+        self.assertEqual(converted.iloc[1], datetime.date(2023, 11, 16))
+
+    def test_metadata_tensor_to_df_converts_date_days(self):
+        from machine_learning.machine_learning_datasets import MachineLearningDatasetMetadata
+        tensor = torch.tensor([[19676.0, 1.0]], dtype=torch.float32)
+        df = MachineLearningDatasetMetadata.tensor_to_df(tensor, column_names=["DATE", "split_type"])
+        self.assertEqual(df["DATE"].iloc[0], datetime.date(2023, 11, 15))
+
+
 if __name__ == "__main__":
     unittest.main()

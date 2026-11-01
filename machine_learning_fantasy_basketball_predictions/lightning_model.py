@@ -14,20 +14,9 @@ from machine_learning_fantasy_basketball_predictions.params.params import (
     MachineLearningParamsFantasyBasketballPredictions,
 )
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
-from utils import add_missing_points_columns_to_predictions
+from utils import add_missing_points_columns_to_predictions, convert_date_col_to_date
 
-
-def _convert_date_col_to_date(date_series: pd.Series) -> pd.Series:
-    """Robustly converts date series from seconds, days, strings, or datetimes to datetime.date."""
-    if date_series.empty:
-        return date_series
-    first_val = date_series.dropna().iloc[0] if not date_series.dropna().empty else None
-    if isinstance(first_val, datetime.date) and not isinstance(first_val, datetime.datetime):
-        return date_series
-    if pd.api.types.is_numeric_dtype(date_series):
-        unit = "s" if float(first_val or 0) > 1e7 else "D"
-        return pd.to_datetime(date_series, unit=unit).dt.date
-    return pd.to_datetime(date_series).dt.date
+_convert_date_col_to_date = convert_date_col_to_date
 
 
 class FantasyBasketballLightningModule(MachineLearningLightningModule):

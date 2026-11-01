@@ -786,6 +786,20 @@ def epoch_to_dates(epoch_times: pd.Series) -> pd.Series:
     return pd.to_datetime(epoch_times, unit='s')
 
 
+def convert_date_col_to_date(date_series: pd.Series) -> pd.Series:
+    """Robustly converts date series from seconds, days, strings, or datetimes to datetime.date."""
+    if date_series.empty:
+        return date_series
+    first_val = date_series.dropna().iloc[0] if not date_series.dropna().empty else None
+    if isinstance(first_val, datetime.date) and not isinstance(first_val, datetime.datetime):
+        return date_series
+    if pd.api.types.is_numeric_dtype(date_series):
+        unit = "s" if float(first_val or 0) > 1e7 else "D"
+        return pd.to_datetime(date_series, unit=unit).dt.date
+    return pd.to_datetime(date_series).dt.date
+
+
+
 def get_column_names_from_feather_file(path: str, return_dtypes: bool = False):
     try:
         reader = pyarrow.ipc.open_file(path)

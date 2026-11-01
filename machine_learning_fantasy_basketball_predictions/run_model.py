@@ -19,7 +19,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
-from utils import add_missing_points_columns_to_predictions, sharpe, DATA_DIR
+from utils import add_missing_points_columns_to_predictions, sharpe, DATA_DIR, convert_date_col_to_date
 from machine_learning.constants import IGNORE
 from machine_learning.enums import DataSplitType
 from machine_learning.run_model import RunModel
@@ -95,9 +95,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
         true_cols = [c for c in predictions_df if '_true' in c]
         predictions_df = predictions_df.loc[(predictions_df[true_cols] != IGNORE).all(axis=1)]
-        not_date = [not isinstance(d, datetime.date) for d in predictions_df['DATE']]
-        if any(not_date):
-            predictions_df.loc[not_date, 'DATE'] = pd.to_datetime(predictions_df.loc[not_date, 'DATE'], unit='s').dt.date
+        predictions_df['DATE'] = convert_date_col_to_date(predictions_df['DATE'])
         predictions_df = predictions_df.loc[predictions_df['DATE'].isin(contests_df['DATE'].unique())]
 
         # adding yahoo points if needed
