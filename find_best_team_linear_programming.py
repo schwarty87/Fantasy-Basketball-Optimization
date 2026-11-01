@@ -18,7 +18,19 @@ from pulp.apis.core import LpSolver
 from constants import DFS_POSITIONS, DFS_MAX_TEAM_SALARY, NUM_TO_POSITION
 from enums import Sites
 
-DEFAULT_LP_SOLVER = getattr(pulp, 'COIN_CMD', getattr(pulp, 'PULP_CBC_CMD', None))
+def _get_default_lp_solver():
+    for solver_name in ('PULP_CBC_CMD', 'COIN_CMD', 'HiGHS_CMD'):
+        solver_cls = getattr(pulp, solver_name, None)
+        if solver_cls is not None:
+            try:
+                if solver_cls().available():
+                    return solver_cls
+            except Exception:
+                continue
+    return getattr(pulp, 'PULP_CBC_CMD', getattr(pulp, 'COIN_CMD', None))
+
+
+DEFAULT_LP_SOLVER = _get_default_lp_solver()
 
 NUM_PLAYERS_PER_POSITION = {Sites.YAHOO: {'PG': {'min_amount': 1, 'max_amount': 3},
                                           'SG': {'min_amount': 1, 'max_amount': 3},
