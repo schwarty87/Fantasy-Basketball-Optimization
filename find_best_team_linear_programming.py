@@ -162,12 +162,16 @@ class FindBestSetOfTeamsLinearProgramming(ABC):
             else:
                 logging.info("couldn't find the optimal linear programming solution!")
 
-    def _filter(self, points: np.ndarray, salaries: np.ndarray, positions: np.ndarray, player_ids: np.ndarray
+    def _filter(self, points: np.ndarray, salaries: np.ndarray, positions: np.ndarray, player_ids: np.ndarray,
+                locked_player_ids: Set | None = None
                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if locked_player_ids is None:
+            locked_player_ids = set()
         positive_salary = salaries > 0
         in_positions = np.isin(positions, self._positions)
         points_is_finite = np.isfinite(points)
-        mask = positive_salary & in_positions & points_is_finite
+        is_locked = np.isin(player_ids, list(locked_player_ids))
+        mask = (positive_salary & in_positions & points_is_finite) | is_locked
 
         if not np.any(mask):
             return points[mask], salaries[mask], positions[mask], player_ids[mask], np.array([])
@@ -187,9 +191,14 @@ class FindBestSetOfTeamsLinearProgramming(ABC):
 
             group_indices = group.index.values
             group_points = group['points'].values
+            group_pids = group['player_ids'].values
             top_scores = []
             seen_scores = []
-            for idx, pts in zip(group_indices, group_points):
+            for idx, pts, pid in zip(group_indices, group_points, group_pids):
+                if pid in locked_player_ids:
+                    keep_indices.append(idx)
+                    domination_counts.append(0)
+                    continue
                 # How many scores seen so far are strictly greater than current pts?
                 # seen_scores is sorted ascending. bisect_right finds the insertion point after equal values.
                 # All values to the right are strictly greater.
@@ -218,7 +227,14 @@ class FindBestSetOfTeamsLinearProgramming(ABC):
         if player_ids is None:
             player_ids = np.arange(len(points))
         self._player_id_to_index = {pid: i for i, pid in enumerate(player_ids)}
-        points, salaries, positions, self._players, dom_counts = self._filter(points, salaries, positions, player_ids)
+        locked_player_ids = set()
+        if locked_dfs_list:
+            for ldf in locked_dfs_list:
+                if ldf is not None and not ldf.empty and self._player_col in ldf.columns:
+                    locked_player_ids.update(ldf[self._player_col].values)
+        points, salaries, positions, self._players, dom_counts = self._filter(
+            points, salaries, positions, player_ids, locked_player_ids=locked_player_ids
+        )
 
         self._player_id_to_points = \
             {player_id: player_points for player_id, player_points in zip(self._players, points)}
@@ -426,15 +442,16 @@ class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgrammi
 
         # filling unlocked players
         for player, teamnum in self._player_teamnum_set:
-            if self._player_variables[player, teamnum].varValue == 0:
+            val = getattr(self._player_variables[player, teamnum], 'varValue', self._player_variables[player, teamnum])
+            if val == 0:
                 continue
             if (locked_dfs_list is not None) and (player in locked_dfs_list[teamnum][self._player_col].values):
                 continue
             pos = self._player_id_to_position[player]
-            if np.isnan(selected_df.loc[teamnum, pos]):
+            if pd.isna(selected_df.loc[teamnum, pos]):
                 selected_df.loc[teamnum, pos] = player
             else:
-                new_pos = pos[1] if pos != 'C' and np.isnan(selected_df.loc[teamnum, pos[1]]) else 'UTIL'
+                new_pos = pos[1] if pos != 'C' and pd.isna(selected_df.loc[teamnum, pos[1]]) else 'UTIL'
                 selected_df.loc[teamnum, new_pos] = player
 
         if self._num_teams_in_set > 1:
@@ -475,12 +492,20 @@ class FindBestSetOfTeamsLinearProgrammingYahooScipy(FindBestSetOfTeamsLinearProg
         self._player_id_to_index = {pid: i for i, pid in enumerate(player_ids)}
 
         # 1. Filter out dominated or irrelevant players
-        points, salaries, positions, self._players, dom_counts = self._filter(points, salaries, positions, player_ids)
+        locked_player_ids = set()
+        if locked_dfs_list:
+            for ldf in locked_dfs_list:
+                if ldf is not None and not ldf.empty and self._player_col in ldf.columns:
+                    locked_player_ids.update(ldf[self._player_col].values)
+        points, salaries, positions, self._players, dom_counts = self._filter(
+            points, salaries, positions, player_ids, locked_player_ids=locked_player_ids
+        )
 
         # --- STATE INITIALIZATION ---
         self._player_id_to_points = {pid: pts for pid, pts in zip(self._players, points)}
         self._player_id_to_salary = {pid: sal for pid, sal in zip(self._players, salaries)}
         self._player_id_to_position = {pid: pos for pid, pos in zip(self._players, positions)}
+        self._player_teamnum_set = self.create_player_team_sets(players=self._players, num_teams_in_set=self._num_teams_in_set)
 
         n_players = len(self._players)
         num_teams = self._num_teams_in_set
