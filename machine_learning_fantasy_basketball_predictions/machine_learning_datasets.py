@@ -257,6 +257,7 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         lags = [int(c.split('_t-')[-1]) for c in lag_missing_cols]
         lag_stats = [c.split('_t-')[0] for c in lag_missing_cols]
         all_lagged_features = list()
+        prev_lag_features_df = None
         for lag in sorted(set(lags)):
             inds = [ii for ii, v in enumerate(lags) if v == lag]
             stats = [lag_stats[ii] for ii in inds]
@@ -269,10 +270,10 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                 lagged_features2.loc[~starter_inds] = lagged_features2.loc[~starter_inds] * 0.75
                 lagged_features = lagged_features.fillna(lagged_features2)
             else:
-                prev_lagged = [f'{stat}_t-{lag - 1}' for stat in stats]
-                prev_lagged = [p for p in prev_lagged if p in features_df.columns]
-                prev_lagged_features = features_df[prev_lagged].rename(columns=lambda x: x.replace(f'_t-{lag - 1}', f'_t-{lag}'))
-                lagged_features = lagged_features.fillna(prev_lagged_features)
+                if prev_lag_features_df is not None:
+                    available_stats = [s for s in stats if s in prev_lag_features_df.columns]
+                    lagged_features[available_stats] = lagged_features[available_stats].fillna(prev_lag_features_df[available_stats])
+
             # If a player has no prior games in history (e.g. debut), fill with the role/position
             # baseline rather than zeros or naive un-grouped bfill (which leaks stats across players)
             role_group_cols = [c for c in ['START_POSITION_CALCULATED', 'STARTER'] if c in features_df.columns]
@@ -280,8 +281,11 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                 role_means = features_df.groupby(role_group_cols)[stats].transform('mean')
                 lagged_features = lagged_features.fillna(role_means)
             lagged_features = lagged_features.fillna(0.0)
-            lagged_features.columns = [f'{stat}_t-{lag}' for stat in stats]
-            all_lagged_features.append(lagged_features)
+
+            prev_lag_features_df = lagged_features.copy()
+
+            lagged_features_renamed = lagged_features.rename(columns={stat: f'{stat}_t-{lag}' for stat in stats})
+            all_lagged_features.append(lagged_features_renamed)
         features_df = pd.concat([features_df] + all_lagged_features, axis=1)
 
         return features_df

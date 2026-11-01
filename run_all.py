@@ -198,7 +198,7 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
                                                                     d_model=d_model,
                                                                     n_heads=n_heads,
                                                                     ffdim=d_model * 4,
-                                                                    dropout_rate=0.4,
+                                                                    dropout_rate=0.15,
                                                                     norm_at_beginning=True,
                                                                     n_bench_players=features_params.num_bench_players,
                                                                     num_layers=1
@@ -210,10 +210,10 @@ def create_architecture_params(features_params: FeaturesParamsFantasyBasketballP
                                                                  d_model=d_model,
                                                                  nhead=n_heads,
                                                                  dim_feedforward=d_model * 4,
-                                                                 dropout=0.4,
+                                                                 dropout=0.15,
                                                                  norm_first=True,
                                                                  num_layers=2,
-                                                                 activation=ActivationFunction.RELU,
+                                                                 activation=ActivationFunction.GELU,
                                                                  )
 
     output_dense = DenseLayersParams(input_tensor_name=transformer_encoder_params.output_tensor_name,
@@ -405,10 +405,11 @@ def create_training_params(features_params: FeaturesParamsFantasyBasketballPredi
                                                       num_epochs=None,
                                                       training_dtype=training_dtype,
                                                       dataloader_num_workers=dataloader_num_workers,
+                                                      gradient_clip_val=1.0,
                                                       loss_params=(loss_params,
                                                                    # optimize_teams_loss_params,
                                                                    # pairwise_rank_loss_params,
-                                                                   bradley_terry_rank_loss_params
+                                                                   # bradley_terry_rank_loss_params
                                                                    ),
                                                       callbacks_params=callbacks_params,
                                                       metrics_params=metrics_params,
