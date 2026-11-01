@@ -249,28 +249,33 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
         # saving dfs results to tensorboard
         try:
-            summary_writer = SummaryWriter(os.path.join(self._tensorboard_dir(), DataSplitType.TRAIN.name.lower()))
-            for global_step, split_type in enumerate(DataSplitType.all_not_none_split_types()):
-                for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050']:
-                    for c in [cc for cc in eval_results.columns if cc.startswith(m)]:
-                        summary_writer.add_scalar(tag=f'DFS_Results/{c}',
-                                                  scalar_value=eval_results.loc[split_type.name, c],
-                                                  global_step=global_step)
-                        time.sleep(0.01)
+            for split_type in DataSplitType.all_not_none_split_types():
+                if split_type.name not in eval_results.index:
+                    continue
+                writer = SummaryWriter(os.path.join(self._tensorboard_dir(), split_type.name.lower()))
 
-                summary_writer2 = SummaryWriter(os.path.join(self._tensorboard_dir(), split_type.name.lower()))
                 for suffix in ['all', 'paid']:
                     col_5050 = f'portfolio_value_5050_{suffix}'
                     col_top10 = f'portfolio_value_top10_{suffix}'
                     if col_5050 in eval_results.columns and col_top10 in eval_results.columns:
                         portfolio_value_5050 = eval_results.loc[split_type.name, col_5050]
                         portfolio_value_top10 = eval_results.loc[split_type.name, col_top10]
-                        if isinstance(portfolio_value_5050, list) and isinstance(portfolio_value_top10, list):
-                            for global_step2, (curr_5050, curr_top10) in enumerate(zip(portfolio_value_5050, portfolio_value_top10)):
-                                summary_writer2.add_scalar(tag=f'DFS_Results/portfolio_value_5050_{split_type.name.lower()}_{suffix}',
-                                                           scalar_value=curr_5050, global_step=global_step2)
-                                summary_writer2.add_scalar(tag=f'DFS_Results/portfolio_value_top10_{split_type.name.lower()}_{suffix}',
-                                                           scalar_value=curr_top10, global_step=global_step2)
+                        if hasattr(portfolio_value_5050, '__iter__') and hasattr(portfolio_value_top10, '__iter__'):
+                            for step, (curr_5050, curr_top10) in enumerate(zip(portfolio_value_5050, portfolio_value_top10)):
+                                writer.add_scalar(tag=f'DFS_Profit/portfolio_5050_{suffix}',
+                                                  scalar_value=float(curr_5050), global_step=step)
+                                writer.add_scalar(tag=f'DFS_Profit/portfolio_top10_{suffix}',
+                                                  scalar_value=float(curr_top10), global_step=step)
+
+                for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050']:
+                    for c in [cc for cc in eval_results.columns if cc.startswith(m)]:
+                        val = eval_results.loc[split_type.name, c]
+                        if pd.notna(val):
+                            writer.add_scalar(tag=f'DFS_Contests/{c}',
+                                              scalar_value=float(val),
+                                              global_step=0)
+                writer.flush()
+                writer.close()
         except Exception as e:
             logging.warning(f"Could not save DFS results to tensorboard: {e}")
 
