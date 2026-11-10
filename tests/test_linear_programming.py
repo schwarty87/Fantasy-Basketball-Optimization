@@ -77,6 +77,7 @@ class TestYahooLinearProgrammingSingleTeam(unittest.TestCase):
 
         # 1. Output shape & status
         self.assertEqual(len(team), 1)
+        self.assertTrue(self.solver.last_result.success)
         self.assertEqual(self.solver.prob.status, pulp.LpStatusOptimal)
 
         # 2. Salary Cap ($200)
@@ -206,6 +207,113 @@ class TestYahooLinearProgrammingScipy(unittest.TestCase):
         slots = ['PG', 'SG', 'G', 'SF', 'PF', 'F', 'C', 'UTIL']
         self.assertEqual(len(set(team[slots].iloc[0].values)), 8)
         self.assertGreater(team['points'].iloc[0], 0)
+
+
+class TestYahooLinearProgrammingLateSwapAndResidualMilp(unittest.TestCase):
+    """Tests for late swap residual MILP, slot locking, and entry_id output."""
+
+    def test_late_swap_partial_slot_locks(self):
+        """Verify partial locks in UTIL and C correctly reduce residual cap and fill remaining slots."""
+        df = _generate_synthetic_dfs_pool(n_players=60, seed=101)
+
+        # Early game locked players: Jokic in C ($55, 60 pts) and Brunson in UTIL ($40, 45 pts)
+        locked_c_id = 9001
+        locked_util_id = 9002
+        locked_df = pd.DataFrame([
+            {'PLAYER_ID': locked_c_id, 'Pos': 'C', 'YAHOO_POSITION': 'C', 'YAHOO_SALARY': 55.0, 'YAHOO_POINTS': 60.0},
+            {'PLAYER_ID': locked_util_id, 'Pos': 'UTIL', 'YAHOO_POSITION': 'PG', 'YAHOO_SALARY': 40.0, 'YAHOO_POINTS': 45.0},
+        ])
+
+        solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+            position_col='YAHOO_POSITION',
+            salary_col='YAHOO_SALARY',
+            points_col='YAHOO_POINTS',
+            player_col='PLAYER_ID',
+            num_teams_in_set=1,
+            verbose=False,
+        )
+
+        team = solver.run(df=df, locked_dfs={777: locked_df})
+
+        self.assertEqual(len(team), 1)
+        self.assertEqual(team['C'].iloc[0], locked_c_id)
+        self.assertEqual(team['UTIL'].iloc[0], locked_util_id)
+
+        # Total salary must be <= 200 (residual cap 200 - 95 = 105 for remaining 6 slots)
+        self.assertLessEqual(team['salary'].iloc[0], 200.0)
+        self.assertGreater(team['points'].iloc[0], 105.0)  # At least 60 + 45
+
+        slots = ['PG', 'SG', 'G', 'SF', 'PF', 'F', 'C', 'UTIL']
+        chosen = team[slots].iloc[0].values
+        self.assertEqual(len(set(chosen)), 8)
+        self.assertIn('entry_id', team.columns)
+        self.assertIn('contest_id', team.columns)
+        self.assertEqual(team['entry_id'].iloc[0], 777)
+        self.assertEqual(team['contest_id'].iloc[0], 777)
+
+    def test_fully_locked_entry_returns_gracefully(self):
+        """Verify an entry with all 8 slots locked returns immediately without MILP failure."""
+        slots = ['PG', 'SG', 'G', 'SF', 'PF', 'F', 'C', 'UTIL']
+        locked_records = []
+        for i, s in enumerate(slots):
+            locked_records.append({
+                'PLAYER_ID': 8000 + i,
+                'Pos': s,
+                'YAHOO_POSITION': s if s in ['PG', 'SG', 'SF', 'PF', 'C'] else 'PG',
+                'YAHOO_SALARY': 22.0,
+                'YAHOO_POINTS': 30.0,
+            })
+        locked_df = pd.DataFrame(locked_records)
+
+        df = _generate_synthetic_dfs_pool(n_players=40, seed=55)
+        solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+            position_col='YAHOO_POSITION',
+            salary_col='YAHOO_SALARY',
+            points_col='YAHOO_POINTS',
+            player_col='PLAYER_ID',
+            num_teams_in_set=1,
+            verbose=False,
+        )
+
+        team = solver.run(df=df, locked_dfs={999: locked_df})
+        self.assertEqual(len(team), 1)
+        self.assertTrue(solver.last_result.success)
+        self.assertEqual(team['entry_id'].iloc[0], 999)
+        self.assertEqual(team['salary'].iloc[0], 22.0 * 8)
+        self.assertEqual(team['points'].iloc[0], 30.0 * 8)
+
+    def test_three_teams_avoid_single_player_in_all_sets(self):
+        """Verify avoid_single_player_in_all_sets prevents any single player from appearing in all 3 sets."""
+        df = _generate_synthetic_dfs_pool(n_players=80, seed=888)
+
+        # Make one superstar exceptionally good so every team would naturally choose him
+        superstar_id = 99999
+        superstar_row = pd.DataFrame([{
+            'PLAYER_ID': superstar_id,
+            'YAHOO_POSITION': 'PG',
+            'YAHOO_SALARY': 30.0,
+            'YAHOO_POINTS': 100.0,  # Dominant
+        }])
+        df = pd.concat([df, superstar_row], ignore_index=True)
+
+        solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+            position_col='YAHOO_POSITION',
+            salary_col='YAHOO_SALARY',
+            points_col='YAHOO_POINTS',
+            player_col='PLAYER_ID',
+            num_teams_in_set=3,
+            avoid_single_player_in_all_sets=True,
+            max_shared_players_in_teams_pairs=5,
+            verbose=False,
+        )
+
+        teams = solver.run(df=df)
+        self.assertEqual(len(teams), 3)
+
+        slots = ['PG', 'SG', 'G', 'SF', 'PF', 'F', 'C', 'UTIL']
+        all_chosen = [set(teams[slots].iloc[t].values) for t in range(3)]
+        in_all_three = all_chosen[0] & all_chosen[1] & all_chosen[2]
+        self.assertEqual(len(in_all_three), 0, f"Expected no player in all 3 teams, but got {in_all_three}")
 
 
 if __name__ == '__main__':

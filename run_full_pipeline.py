@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+import re
 import shutil
 import time
 from typing import Any
@@ -380,8 +381,8 @@ class RunFullPipeline:
             nbacom_names = self.players_list['NAME'].unique()
         submit_teams = SubmitDFSTeamYahooByCSV(headless=self.headless, profile_path=profile_path,
                                                nbacom_names=nbacom_names)
-        contest_ids = submit_teams.contest_ids
-        if len(contest_ids) == 0:
+        if len(submit_teams.entry_ids) == 0:
+            logging.info("No active contest entries found to optimize or submit.")
             return
 
         update_todays_schedule_from_scoreboard(date=self._run_date, season=self.season)
@@ -401,43 +402,62 @@ class RunFullPipeline:
 
         locked_dfs = submit_teams.get_locked_dfs()
 
+        if len(submit_teams.entry_ids) == 0 or len(locked_dfs) == 0:
+            logging.info("No active contest entries found to optimize or submit.")
+            return
+
         player_name_to_id = self.stats_loaders_players.get_player_name_to_id()
         player_id_to_name = {player_id: player_name for player_name, player_id in player_name_to_id.items()}
-        locked_dfs = \
-            {contest_id: locked_df.assign(PLAYER_ID=locked_df['NAME'].replace(player_name_to_id))
-             for contest_id, locked_df in locked_dfs.items()}
+        locked_dfs = {
+            entry_id: locked_df.assign(PLAYER_ID=locked_df['NAME'].replace(player_name_to_id))
+            for entry_id, locked_df in locked_dfs.items()
+        }
 
-        locked_df_shapes = {contest_id: df.shape[0] for contest_id, df in locked_dfs.items()}
-        logging.info(f'number of locked players per contest:{locked_df_shapes}')
-        logging.info(f'predictions shape before callingFindBestTeamGA :\n{predictions.shape[0]}')
+        locked_df_shapes = {entry_id: df.shape[0] for entry_id, df in locked_dfs.items()}
+        logging.info(f'number of locked players per contest entry: {locked_df_shapes}')
+        logging.info(f'predictions shape before optimization: {predictions.shape[0]}')
 
-        # all_ga_results = dict()
-        # for contest_id, locked_df in locked_dfs.items():
-        #     find_best_teams = FindBestTeamGA(points_col='YAHOO_POINTS_pred', at_least_one_min_player=False,
-        #                                      n_teams_in_df=2500, keep_top_n=300, mutate_pct=0.3)
-        #     find_best_teams.call(df=predictions, definitely_in=locked_df)
-        #     all_ga_results[contest_id] = find_best_teams.summarize(player_id_to_name=player_id_to_name)
-        #
-        # if len(all_ga_results) == 1:
-        #     best_set2 = list(all_ga_results.values())[0].iloc[[0]].assign(contest_id=contest_ids[0])
-        # else:
-        #      # TODO move constants to params
-        #     best_set2 = \
-        #          FindBestTeamGA.find_best_set(ga_results=[all_ga_results[contest_id] for contest_id in contest_ids],
-        #                                       max_allowed_joint_players=4,
-        #                                       avoid_single_player_in_all_sets=len(contest_ids) >= 3)
-        #     best_set2['contest_id'] = contest_ids
-        # best_set2[DFS_POSITIONS[Sites.YAHOO]] = best_set2[DFS_POSITIONS[Sites.YAHOO]].replace(player_id_to_name)
-        # best_set =best_set2
+        # Route Cash vs. GPP entries separately
+        entry_titles = submit_teams.get_entry_titles()
+        cash_eids = []
+        gpp_eids = []
+        for eid in locked_dfs.keys():
+            title = entry_titles.get(eid, '')
+            if re.search(r'(?i)(?:50/50|double\s*up|head-to-head|\bh2h\b)', title):
+                cash_eids.append(eid)
+            else:
+                gpp_eids.append(eid)
 
-        # finding best set using linear programming
-        # locked_dfs = {k: v for i, (k, v) in enumerate(locked_dfs.items()) if i == 0}
-        num_teams_in_set = len(locked_dfs)
-        find_best_team_lp = FindBestSetOfTeamsLinearProgrammingYahoo(points_col='YAHOO_POINTS_pred',
-                                                                     num_teams_in_set=num_teams_in_set,
-                                                                     avoid_single_player_in_all_sets=num_teams_in_set >= 3,
-                                                                     max_shared_players_in_teams_pairs=4)
-        best_set = find_best_team_lp.run(predictions, locked_dfs)
+        sets_to_combine = []
+
+        # 1. Solve Cash entries independently (single-entry optimal, no forced artificial cross-entry diversity)
+        for eid in cash_eids:
+            cash_solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+                points_col='YAHOO_POINTS_pred',
+                num_teams_in_set=1,
+                avoid_single_player_in_all_sets=False,
+                max_shared_players_in_teams_pairs=None,
+            )
+            sets_to_combine.append(cash_solver.run(predictions, {eid: locked_dfs[eid]}))
+
+        # 2. Solve GPP entries jointly with diversity constraints
+        if len(gpp_eids) > 0:
+            gpp_solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+                points_col='YAHOO_POINTS_pred',
+                num_teams_in_set=len(gpp_eids),
+                avoid_single_player_in_all_sets=len(gpp_eids) >= 3,
+                max_shared_players_in_teams_pairs=4,
+            )
+            sets_to_combine.append(gpp_solver.run(predictions, {eid: locked_dfs[eid] for eid in gpp_eids}))
+
+        best_set = pd.concat(sets_to_combine, ignore_index=True)
+
+        # Reorder to match submit_teams.entry_ids
+        if 'entry_id' in best_set.columns and len(submit_teams.entry_ids) > 0:
+            eid_to_order = {eid: idx for idx, eid in enumerate(submit_teams.entry_ids)}
+            best_set['_sort_order'] = best_set['entry_id'].map(eid_to_order)
+            best_set = best_set.sort_values('_sort_order').drop(columns=['_sort_order']).reset_index(drop=True)
+
         position_cols = DFS_POSITIONS[Sites.YAHOO]
         best_set[position_cols] = best_set[position_cols].apply(lambda col: col.map(player_id_to_name))
 

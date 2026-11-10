@@ -41,6 +41,11 @@
 - **Metadata Column Collisions**: Model predictions include metadata columns (`YAHOO_POSITION`, `YAHOO_SALARY`). In `_get_todays_predictions()`, overlapping columns (`GAME_ID`, `TEAM_ID`, `YAHOO_POSITION`, `YAHOO_SALARY`) are stripped from `predictions` before merging with `stats_loaders_players.df` to prevent pandas `_x` / `_y` duplicate column suffixes.
 - **Authoritative DFS Salaries & Positions**: Missing or placeholder (`-999.0` / `<= 0`) salaries and unmapped positions in `predictions` are authoritatively resolved using the downloaded Yahoo `teams_template`. Positions are mapped to integer codes (`POSITION_TO_NUM`) and unmapped fallback positions are handled gracefully.
 
+### Residual MILP Late-Swap & Multi-Entry Keying (`find_best_team_linear_programming.py` & `submit_dfs_team.py`)
+- **Exact (Player, Slot, Team) Formulation**: `FindBestSetOfTeamsLinearProgrammingYahoo.run` implements an exact mixed-integer linear program using `scipy.optimize.milp` and sparse `csc_matrix`. Open slots $O_t$ and residual cap $C_t = 200.0 - \text{locked\_salary}_t$ are modeled directly without post-hoc heuristic slot filling.
+- **Multi-Entry `Entry ID` Keying**: `SubmitDFSTeamYahooByCSV` keys lineup sets by `Entry ID` rather than `Contest ID`. Multiple lineups submitted into the same contest (e.g. multi-entry GPPs) preserve independent row identity without colliding or overwriting each other in the Yahoo upload template.
+- **Cash vs. GPP Strategy Routing**: In `run_full_pipeline()`, cash contests (50/50, Double Up, Head-to-Head) are solved independently to maximize expected median/floor without forced diversity, whereas tournament (GPP) entries are solved jointly with pairwise overlap constraints (`max_shared_players_in_teams_pairs = 4`) and single-player set avoidance (`avoid_single_player_in_all_sets = True` when $\ge 3$).
+
 ## Data Consistency & Validation Guidelines
 
 ### Feather & PyArrow Type Strictness (Pandas 2.2+ / PyArrow 19+)

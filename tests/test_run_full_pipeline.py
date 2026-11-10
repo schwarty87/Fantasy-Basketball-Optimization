@@ -398,6 +398,88 @@ class TestRunFullPipeline(unittest.TestCase):
         self.assertEqual(mock_params.continue_model_id, "model_2026_11_07")
         self.assertIs(pipeline.train_nn, mock_fallback_runner)
 
+    @patch("run_full_pipeline.SubmitDFSTeamYahooByCSV")
+    @patch("run_full_pipeline.update_todays_schedule_from_scoreboard")
+    @patch("run_full_pipeline.update_all_stats")
+    def test_run_full_pipeline_routes_cash_vs_gpp_entries_separately(
+        self,
+        mock_update_stats,
+        mock_update_scoreboard,
+        mock_submit_cls,
+    ):
+        """Verify run_full_pipeline separates 50/50 cash from GPP tournaments and orders submissions."""
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=0,
+            run_immediately=True,
+            initialize_daily_job=False
+        )
+        pipeline.players_list = pd.DataFrame({"NAME": ["Player A"], "TO_YEAR": [2026]})
+
+        mock_submit_inst = MagicMock()
+        mock_submit_inst.entry_ids = [5001, 6001, 6002]
+        mock_submit_inst.contest_ids = [101, 102]
+        mock_submit_inst.get_entry_titles.return_value = {
+            5001: "NBA 50/50 Baller ($5)",
+            6001: "NBA $10K Multi-Entry Slam",
+            6002: "NBA $5K Baller GPP",
+        }
+        mock_submit_inst.get_locked_dfs.return_value = {
+            5001: pd.DataFrame(columns=["Pos", "NAME", "YAHOO_SALARY", "YAHOO_POSITION"]),
+            6001: pd.DataFrame(columns=["Pos", "NAME", "YAHOO_SALARY", "YAHOO_POSITION"]),
+            6002: pd.DataFrame(columns=["Pos", "NAME", "YAHOO_SALARY", "YAHOO_POSITION"]),
+        }
+        mock_submit_cls.return_value = mock_submit_inst
+
+        pipeline.stats_loaders_players = MagicMock()
+        pipeline.stats_loaders_players.get_player_name_to_id.return_value = {"Player A": 101}
+        pipeline.train_nn = MagicMock()
+        pipeline.train_nn.create_data_loaders = MagicMock()
+
+        dummy_preds = pd.DataFrame({"PLAYER_ID": [101], "YAHOO_POINTS_pred": [30.0]})
+        pipeline._get_todays_predictions = MagicMock(return_value=dummy_preds)
+
+        lp_solver_inits = []
+        lp_solver_runs = []
+
+        class MockSolver:
+            def __init__(self, **kwargs):
+                lp_solver_inits.append(kwargs)
+
+            def run(self, df, locked):
+                eids = list(locked.keys())
+                lp_solver_runs.append((eids, df))
+                slots = ["PG", "SG", "G", "SF", "PF", "F", "C", "UTIL"]
+                rows = []
+                for eid in eids:
+                    row = {s: 101 for s in slots}
+                    row["salary"] = 180.0
+                    row["points"] = 240.0
+                    row["entry_id"] = eid
+                    row["contest_id"] = eid
+                    rows.append(row)
+                return pd.DataFrame(rows)
+
+        with patch("run_full_pipeline.FindBestSetOfTeamsLinearProgrammingYahoo", side_effect=MockSolver):
+            pipeline.run_full_pipeline()
+
+        # Check solver invocations:
+        # 1st solver call: Cash entry 5001 solved individually
+        self.assertEqual(len(lp_solver_inits), 2)
+        self.assertEqual(lp_solver_inits[0]["num_teams_in_set"], 1)
+        self.assertFalse(lp_solver_inits[0]["avoid_single_player_in_all_sets"])
+        self.assertIsNone(lp_solver_inits[0]["max_shared_players_in_teams_pairs"])
+        self.assertEqual(lp_solver_runs[0][0], [5001])
+
+        # 2nd solver call: GPP entries 6001 & 6002 solved jointly with diversity constraints
+        self.assertEqual(lp_solver_inits[1]["num_teams_in_set"], 2)
+        self.assertEqual(lp_solver_inits[1]["max_shared_players_in_teams_pairs"], 4)
+        self.assertEqual(set(lp_solver_runs[1][0]), {6001, 6002})
+
+        # Check submit_best_set was called with ordered rows
+        mock_submit_inst.submit_best_set.assert_called_once()
+        submitted_df = mock_submit_inst.submit_best_set.call_args[0][0]
+        self.assertEqual(list(submitted_df["entry_id"]), [5001, 6001, 6002])
+
 
 if __name__ == "__main__":
     unittest.main()

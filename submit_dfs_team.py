@@ -57,6 +57,7 @@ class SubmitDFSTeamYahooByCSV:
 
         if self.template is None:
             self.contest_ids = list()
+            self.entry_ids = list()
             return
 
         logging.info('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
@@ -79,6 +80,22 @@ class SubmitDFSTeamYahooByCSV:
             int(contest_id) for contest_id in self.template['Contest ID'].unique()
             if self._is_valid_contest_id(contest_id)
         ]
+        self.entry_ids = [
+            int(eid) for eid, cid in zip(self.template['Entry ID'], self.template['Contest ID'])
+            if self._is_valid_contest_id(cid) and pd.notna(eid)
+        ]
+
+    def get_entry_titles(self) -> Dict[int, str]:
+        """Returns a mapping of entry_id -> Contest Title."""
+        if self.template is None or 'Entry ID' not in self.template.columns or 'Contest Title' not in self.template.columns:
+            return {}
+        entry_titles = {}
+        for _, row in self.template.iterrows():
+            cid = row.get('Contest ID')
+            eid = row.get('Entry ID')
+            if self._is_valid_contest_id(cid) and pd.notna(eid):
+                entry_titles[int(eid)] = str(row.get('Contest Title', ''))
+        return entry_titles
 
     @staticmethod
     def _is_valid_contest_id(val: Any) -> bool:
@@ -273,10 +290,7 @@ class SubmitDFSTeamYahooByCSV:
             template = self.load_downloaded_csv(nbacom_names=self.nbacom_names)
             logging.info('finished downloading and loading template df')
         except Exception as e:
-            if os.path.isfile(self._template_path()):
-                template = pd.read_csv(self._template_path())
-            else:
-                raise ValueError(f"we weren't able to load the template\n{e}")
+            raise ValueError(f"we weren't able to load the template\n{e}")
         finally:
             if hasattr(self, 'driver') and self.driver:
                 self.driver.quit()
@@ -329,15 +343,16 @@ class SubmitDFSTeamYahooByCSV:
         raise KeyError(f"couldn't find {id} in dict!")
 
     def get_locked_dfs(self) -> Dict[int, pd.DataFrame]:
-        """get a df with the locked players for each contest"""
+        """get a df with the locked players for each contest entry"""
         locked_dfs = dict()
         next_game_time = get_next_game_time(template=self.template)
         for _, curr_row in self.template.iterrows():
             locked_players = list()
             contest_id = curr_row['Contest ID']
-            if not isinstance(contest_id, int):
+            entry_id = curr_row.get('Entry ID')
+            if not self._is_valid_contest_id(contest_id) or pd.isna(entry_id):
                 continue
-            contest_id = int(contest_id)
+            entry_id = int(entry_id)
             for p in self._positions:
                 if len(curr_row[p]) <= 1:
                     continue
@@ -352,9 +367,9 @@ class SubmitDFSTeamYahooByCSV:
                                            'YAHOO_POSITION': self.template.loc[self.template['Name'] == name, 'Position'].values[0]
                                            })
             if len(locked_players) > 0:
-                locked_dfs[contest_id] = pd.DataFrame(locked_players)
+                locked_dfs[entry_id] = pd.DataFrame(locked_players)
             else:
-                locked_dfs[contest_id] = pd.DataFrame(columns=['Pos', 'NAME', 'YAHOO_SALARY', 'YAHOO_POSITION'])
+                locked_dfs[entry_id] = pd.DataFrame(columns=['Pos', 'NAME', 'YAHOO_SALARY', 'YAHOO_POSITION'])
         return locked_dfs
 
     @staticmethod
@@ -364,7 +379,9 @@ class SubmitDFSTeamYahooByCSV:
 
     def _sort_players_by_time(self, teams_df: pd.DataFrame):
         """Sorting each team so the players who play in the earlier games will be in the more restrictive positions"""
-        if 'contest_id' in teams_df.columns:
+        if 'entry_id' in teams_df.columns:
+            teams_df = teams_df.set_index('entry_id')
+        elif 'contest_id' in teams_df.columns:
             teams_df = teams_df.set_index('contest_id')
 
         teams_df_sorted = teams_df.copy()
@@ -372,30 +389,31 @@ class SubmitDFSTeamYahooByCSV:
                        for p in self._positions}
 
         next_game_time = get_next_game_time(template=self.template)
-        for contest_id, team_row in teams_df.iterrows():
+        for entry_id, team_row in teams_df.iterrows():
             row_players = set([pp for pp in team_row[self._positions].values if
                                self._id_to_value(self.id_to_game_time, pp) >= next_game_time])
             for p in self._positions:
                 is_locked = self._id_to_value(self.id_to_game_time, team_row[p]) < next_game_time
                 if is_locked:
-                    teams_df_sorted.loc[contest_id, p] = team_row[p]
+                    teams_df_sorted.loc[entry_id, p] = team_row[p]
                 else:
                     options = sorted(set(eligibility[p]) & set(row_players))
                     options_game_times = [self._id_to_value(self.id_to_game_time, option) for option in options]
                     earliest_game_player = options[np.argmin(options_game_times)]
-                    teams_df_sorted.loc[contest_id, p] = earliest_game_player
+                    teams_df_sorted.loc[entry_id, p] = earliest_game_player
                     row_players.remove(earliest_game_player)
         return teams_df_sorted.reset_index()
 
     def _assert_template_csv_finished_saving(self):
         # making sure that the csv finished saving before moving on
+        n_entries = len(self.entry_ids)
         template_for_comparison = \
-            self.template.iloc[:len(self.contest_ids)][['Contest ID', 'Entry ID'] + self._positions]
+            self.template.iloc[:n_entries][['Contest ID', 'Entry ID'] + self._positions]
         template_for_comparison[['Contest ID', 'Entry ID']] = \
             template_for_comparison[['Contest ID', 'Entry ID']].astype(int)
         for i in range(5):
             template2 = pd.read_csv(self._template_path())
-            template2 = template2.iloc[:len(self.contest_ids)]
+            template2 = template2.iloc[:n_entries]
             template2[['Contest ID', 'Entry ID']] = template2[['Contest ID', 'Entry ID']].astype(int)
             if template_for_comparison.equals(template2[['Contest ID', 'Entry ID'] + self._positions]):
                 break
@@ -406,9 +424,16 @@ class SubmitDFSTeamYahooByCSV:
 
     def _fill_template_with_predicted_teams(self, best_set_with_ids: pd.DataFrame):
         for _, curr_row in best_set_with_ids.iterrows():
-            contest_id = curr_row['contest_id']
-            ind_in_template = self.template.loc[self.template['Contest ID'] == contest_id].index[0]
-            self.template.loc[ind_in_template, self._positions] = curr_row[self._positions].values
+            if 'entry_id' in curr_row and pd.notna(curr_row['entry_id']):
+                key_col = 'Entry ID'
+                key_val = int(curr_row['entry_id'])
+            else:
+                key_col = 'Contest ID'
+                key_val = int(curr_row['contest_id'])
+            matches = self.template.loc[self.template[key_col] == key_val].index
+            if len(matches) > 0:
+                ind_in_template = matches[0]
+                self.template.loc[ind_in_template, self._positions] = curr_row[self._positions].values
 
     def submit_best_set(self, best_set: pd.DataFrame):
         """
@@ -439,7 +464,7 @@ class SubmitDFSTeamYahooByCSV:
         logging.info('<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
 
         # filling the template with the predicted teams
-        template_before = self.template.iloc[:len(self.contest_ids)][self._positions].copy()
+        template_before = self.template.iloc[:len(self.entry_ids)][self._positions].copy()
         self._fill_template_with_predicted_teams(best_set_with_ids)
 
         self.template.to_csv(self._template_path(), index=False)

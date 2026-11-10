@@ -12,8 +12,9 @@ import pulp
 import numpy as np
 import pandas as pd
 from abc import ABC, abstractmethod
-from scipy.optimize import milp, LinearConstraint, Bounds
-from typing import Union, Dict, List, Set, Tuple
+from scipy.optimize import milp, LinearConstraint, Bounds, OptimizeResult
+from scipy.sparse import csc_matrix
+from typing import Union, Dict, List, Set, Tuple, Optional, Any
 from pulp.apis.core import LpSolver
 from constants import DFS_POSITIONS, DFS_MAX_TEAM_SALARY, NUM_TO_POSITION
 from enums import Sites
@@ -326,9 +327,19 @@ class FindBestSetOfTeamsLinearProgramming(ABC):
                         results[team_num, self._player_id_to_index[player_num]] = 1
         return results
 
+YAHOO_SLOTS: List[str] = ['PG', 'SG', 'G', 'SF', 'PF', 'F', 'C', 'UTIL']
+BASE_POS_TO_ELIGIBLE_SLOTS: Dict[str, Tuple[str, ...]] = {
+    'PG': ('PG', 'G', 'UTIL'),
+    'SG': ('SG', 'G', 'UTIL'),
+    'SF': ('SF', 'F', 'UTIL'),
+    'PF': ('PF', 'F', 'UTIL'),
+    'C': ('C', 'UTIL'),
+}
+
+
 class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgramming):
     """
-    Use the pulp package to use linear programming to find the optimal set of DFS teams for Yahoo
+    Use linear programming to find the optimal set of DFS teams for Yahoo
     """
     def __init__(self, position_col: str | None = 'YAHOO_POSITION', salary_col: str | None = 'YAHOO_SALARY',
                  points_col: str | None = 'YAHOO_POINTS', num_teams_in_set: int = 1,
@@ -341,6 +352,342 @@ class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgrammi
                          avoid_single_player_in_all_sets=avoid_single_player_in_all_sets,
                          max_shared_players_in_teams_pairs=max_shared_players_in_teams_pairs,
                          player_col=player_col, verbose=verbose, gap_rel=gap_rel)
+
+    def run(self, df: pd.DataFrame, locked_dfs: Dict[int, pd.DataFrame] | None = None) -> pd.DataFrame:
+        """
+        Runs exact residual (Player, Slot, Team) MILP using scipy.optimize.milp with csc_matrix.
+        Guarantees that every player is assigned to a legally valid slot, accurately respecting
+        residual salary caps and slot locks across multi-entry late swap slates.
+        """
+        if df.empty:
+            raise ValueError("Input DataFrame df is empty.")
+
+        # 1. Normalize and clean input positions, salaries, points
+        df_clean = df.copy()
+        if df_clean[self._position_col].dtype.kind in ('i', 'u', 'f'):
+            pos_series = df_clean[self._position_col].map(NUM_TO_POSITION)
+        else:
+            pos_series = df_clean[self._position_col].replace(NUM_TO_POSITION)
+
+        df_clean['_pos_clean'] = pos_series
+        df_clean[self._salary_col] = pd.to_numeric(df_clean[self._salary_col], errors='coerce')
+        df_clean[self._points_col] = pd.to_numeric(df_clean[self._points_col], errors='coerce')
+
+        # Filter valid player pool
+        valid_mask = (df_clean[self._salary_col] > 0) & df_clean['_pos_clean'].notna() & np.isfinite(df_clean[self._points_col])
+        pool_df = df_clean.loc[valid_mask].drop_duplicates(subset=[self._player_col], keep='first')
+
+        pool_salary_map: Dict[Any, float] = dict(zip(pool_df[self._player_col], pool_df[self._salary_col].astype(float)))
+        pool_points_map: Dict[Any, float] = dict(zip(pool_df[self._player_col], pool_df[self._points_col].astype(float)))
+        pool_pos_map: Dict[Any, str] = dict(zip(pool_df[self._player_col], pool_df['_pos_clean'].astype(str)))
+
+        # 2. Process locked_dfs and setup entry keys
+        num_teams = self._num_teams_in_set
+        if locked_dfs is not None:
+            if len(locked_dfs) != num_teams:
+                raise ValueError(f"the length of locked_dfs ({len(locked_dfs)}) has to equal self._num_teams_in_set ({num_teams})!")
+            entry_keys = list(locked_dfs.keys())
+            locked_dfs_list = [locked_dfs[k] for k in entry_keys]
+        else:
+            entry_keys = list(range(num_teams))
+            locked_dfs_list = [pd.DataFrame() for _ in range(num_teams)]
+
+        all_locked_slots: List[Dict[str, Any]] = []
+        all_locked_players: List[Set[Any]] = []
+        all_open_slots: List[List[str]] = []
+        all_residual_caps: List[float] = []
+
+        for t in range(num_teams):
+            ldf = locked_dfs_list[t]
+            locked_slots_t: Dict[str, Any] = {}
+            locked_players_t: Set[Any] = set()
+            locked_salary_t = 0.0
+
+            if ldf is not None and not ldf.empty and 'Pos' in ldf.columns and self._player_col in ldf.columns:
+                for _, lrow in ldf.iterrows():
+                    slot = lrow['Pos']
+                    pid = lrow[self._player_col]
+                    locked_slots_t[slot] = pid
+                    locked_players_t.add(pid)
+
+                    # Determine salary and points for locked player
+                    if self._salary_col in lrow and pd.notna(lrow[self._salary_col]):
+                        sal = float(lrow[self._salary_col])
+                    elif pid in pool_salary_map:
+                        sal = pool_salary_map[pid]
+                    else:
+                        sal = 0.0
+                    locked_salary_t += sal
+
+                    if pid not in pool_salary_map:
+                        pool_salary_map[pid] = sal
+                    if self._points_col in lrow and pd.notna(lrow[self._points_col]):
+                        pool_points_map[pid] = float(lrow[self._points_col])
+                    elif pid not in pool_points_map:
+                        pool_points_map[pid] = 0.0
+
+            open_slots_t = [s for s in YAHOO_SLOTS if s not in locked_slots_t]
+            residual_cap_t = max(0.0, float(self._max_salary_per_team) - locked_salary_t)
+
+            all_locked_slots.append(locked_slots_t)
+            all_locked_players.append(locked_players_t)
+            all_open_slots.append(open_slots_t)
+            all_residual_caps.append(residual_cap_t)
+
+        # 3. Fast-path: if all slots in all teams are already locked, return immediately
+        if all(len(slots) == 0 for slots in all_open_slots):
+            rows = []
+            for t in range(num_teams):
+                row = dict(all_locked_slots[t])
+                row['salary'] = sum(pool_salary_map.get(row[s], 0.0) for s in YAHOO_SLOTS)
+                row['points'] = sum(pool_points_map.get(row[s], 0.0) for s in YAHOO_SLOTS)
+                row['entry_id'] = entry_keys[t]
+                row['contest_id'] = entry_keys[t]
+                rows.append(row)
+            self.last_result = OptimizeResult(success=True, status=0, message="all slots locked")
+            class DummyProb:
+                status = pulp.LpStatusOptimal
+            self.prob = DummyProb()
+            return pd.DataFrame(rows)[YAHOO_SLOTS + ['salary', 'points', 'entry_id', 'contest_id']]
+
+        # 4. Define candidate player pools per team P_t and variable index map
+        def _get_eligible_slots(pos_str: str) -> Set[str]:
+            slots = set()
+            for base in pos_str.split('/'):
+                base = base.strip()
+                if base in BASE_POS_TO_ELIGIBLE_SLOTS:
+                    slots.update(BASE_POS_TO_ELIGIBLE_SLOTS[base])
+            return slots
+
+        all_P: List[List[Any]] = []
+        for t in range(num_teams):
+            unlocked = [p for p in pool_df[self._player_col] if p not in all_locked_players[t]]
+            all_P.append(unlocked)
+
+        y_vars: Dict[Tuple[Any, str, int], int] = {}
+        c_list: List[float] = []
+        lb_list: List[float] = []
+        ub_list: List[float] = []
+        integrality_list: List[int] = []
+
+        for t in range(num_teams):
+            if len(all_open_slots[t]) == 0:
+                continue
+            for p in all_P[t]:
+                pos = pool_pos_map.get(p, '')
+                elig = _get_eligible_slots(pos)
+                for s in all_open_slots[t]:
+                    if s in elig:
+                        var_idx = len(c_list)
+                        y_vars[(p, s, t)] = var_idx
+                        c_list.append(-float(pool_points_map[p]))
+                        lb_list.append(0.0)
+                        ub_list.append(1.0)
+                        integrality_list.append(1)
+
+        # 5. Overlap auxiliary variables z_{p,i,j} for pairwise constraints
+        z_vars: Dict[Tuple[Any, int, int], int] = {}
+        pair_common_players: Dict[Tuple[int, int], List[Any]] = {}
+
+        if self._max_shared_players_in_teams_pairs is not None and num_teams > 1:
+            for i in range(num_teams):
+                for j in range(i + 1, num_teams):
+                    if len(all_open_slots[i]) > 0 and len(all_open_slots[j]) > 0:
+                        common = [
+                            p for p in pool_df[self._player_col]
+                            if any((p, s, i) in y_vars for s in all_open_slots[i])
+                            and any((p, s, j) in y_vars for s in all_open_slots[j])
+                        ]
+                        pair_common_players[(i, j)] = common
+                        for p in common:
+                            var_idx = len(c_list)
+                            z_vars[(p, i, j)] = var_idx
+                            c_list.append(0.0)
+                            lb_list.append(0.0)
+                            ub_list.append(1.0)
+                            integrality_list.append(0)
+
+        # 6. Build constraint matrix using COO triples (row, col, data)
+        row_ind: List[int] = []
+        col_ind: List[int] = []
+        data: List[float] = []
+        b_l: List[float] = []
+        b_u: List[float] = []
+        current_row = 0
+
+        # (a) Open-slot fill: sum_p y_{p,s,t} = 1
+        for t in range(num_teams):
+            for s in all_open_slots[t]:
+                cols = [y_vars[(p, s, t)] for p in all_P[t] if (p, s, t) in y_vars]
+                for col in cols:
+                    row_ind.append(current_row)
+                    col_ind.append(col)
+                    data.append(1.0)
+                b_l.append(1.0)
+                b_u.append(1.0)
+                current_row += 1
+
+        # (b) Player uniqueness per team: sum_s y_{p,s,t} <= 1
+        for t in range(num_teams):
+            for p in all_P[t]:
+                cols = [y_vars[(p, s, t)] for s in all_open_slots[t] if (p, s, t) in y_vars]
+                if len(cols) > 1:
+                    for col in cols:
+                        row_ind.append(current_row)
+                        col_ind.append(col)
+                        data.append(1.0)
+                    b_l.append(0.0)
+                    b_u.append(1.0)
+                    current_row += 1
+
+        # (c) Residual salary cap: sum_{p,s} salary_p * y_{p,s,t} <= C_t
+        for t in range(num_teams):
+            if len(all_open_slots[t]) > 0:
+                for p in all_P[t]:
+                    sal = float(pool_salary_map[p])
+                    for s in all_open_slots[t]:
+                        if (p, s, t) in y_vars:
+                            row_ind.append(current_row)
+                            col_ind.append(y_vars[(p, s, t)])
+                            data.append(sal)
+                b_l.append(0.0)
+                b_u.append(float(all_residual_caps[t]))
+                current_row += 1
+
+        # (d) Pairwise overlap constraints
+        if self._max_shared_players_in_teams_pairs is not None and num_teams > 1:
+            max_shared = self._max_shared_players_in_teams_pairs
+            for i in range(num_teams):
+                for j in range(i + 1, num_teams):
+                    # Linearization: z_{p,i,j} - sum_s y_{p,s,i} - sum_s y_{p,s,j} >= -1
+                    if (i, j) in pair_common_players:
+                        for p in pair_common_players[(i, j)]:
+                            z_col = z_vars[(p, i, j)]
+                            row_ind.append(current_row)
+                            col_ind.append(z_col)
+                            data.append(1.0)
+                            for s in all_open_slots[i]:
+                                if (p, s, i) in y_vars:
+                                    row_ind.append(current_row)
+                                    col_ind.append(y_vars[(p, s, i)])
+                                    data.append(-1.0)
+                            for s in all_open_slots[j]:
+                                if (p, s, j) in y_vars:
+                                    row_ind.append(current_row)
+                                    col_ind.append(y_vars[(p, s, j)])
+                                    data.append(-1.0)
+                            b_l.append(-1.0)
+                            b_u.append(np.inf)
+                            current_row += 1
+
+                    # Overlap limit constraint
+                    L_i = all_locked_players[i]
+                    L_j = all_locked_players[j]
+                    shared_locked = len(L_i & L_j)
+                    allowed = max(0, max_shared - shared_locked)
+
+                    if (i, j) in pair_common_players:
+                        for p in pair_common_players[(i, j)]:
+                            row_ind.append(current_row)
+                            col_ind.append(z_vars[(p, i, j)])
+                            data.append(1.0)
+
+                    # Open in i, locked in j
+                    for p in (set(all_P[i]) & L_j):
+                        for s in all_open_slots[i]:
+                            if (p, s, i) in y_vars:
+                                row_ind.append(current_row)
+                                col_ind.append(y_vars[(p, s, i)])
+                                data.append(1.0)
+
+                    # Open in j, locked in i
+                    for p in (set(all_P[j]) & L_i):
+                        for s in all_open_slots[j]:
+                            if (p, s, j) in y_vars:
+                                row_ind.append(current_row)
+                                col_ind.append(y_vars[(p, s, j)])
+                                data.append(1.0)
+
+                    b_l.append(0.0)
+                    b_u.append(float(allowed))
+                    current_row += 1
+
+        # (e) Diversity across sets: avoid single player in all sets
+        if self._avoid_single_player_in_all_sets and num_teams >= 3:
+            for p in pool_df[self._player_col]:
+                c_lock = sum(1 for t in range(num_teams) if p in all_locked_players[t])
+                if c_lock < num_teams:
+                    max_allowed_unlocked = (num_teams - 1) - c_lock
+                    cols_p = [y_vars[(p, s, t)] for t in range(num_teams) for s in all_open_slots[t] if (p, s, t) in y_vars]
+                    if len(cols_p) > 0:
+                        for col in cols_p:
+                            row_ind.append(current_row)
+                            col_ind.append(col)
+                            data.append(1.0)
+                        b_l.append(0.0)
+                        b_u.append(float(max_allowed_unlocked))
+                        current_row += 1
+
+        # 7. Solve with scipy.optimize.milp
+        n_total_vars = len(c_list)
+        A_csc = csc_matrix((data, (row_ind, col_ind)), shape=(current_row, n_total_vars))
+        constraints = LinearConstraint(A_csc, np.array(b_l), np.array(b_u))
+        bounds = Bounds(np.array(lb_list), np.array(ub_list))
+
+        solver_options = {'presolve': True}
+        if self._gap_rel is not None:
+            solver_options['mip_rel_gap'] = self._gap_rel
+        else:
+            solver_options['mip_rel_gap'] = 0.01
+
+        res = milp(
+            c=np.array(c_list),
+            integrality=np.array(integrality_list),
+            bounds=bounds,
+            constraints=constraints,
+            options=solver_options
+        )
+
+        if not res.success or res.x is None:
+            raise ValueError(f"MILP solver failed: status={res.status}, message='{res.message}'")
+
+        self.last_result = res
+        class DummyProb:
+            status = pulp.LpStatusOptimal
+        self.prob = DummyProb()
+
+        # 8. Reconstruct solution DataFrame
+        self._player_variables = {}
+        for (p, s, t), col_idx in y_vars.items():
+            if res.x[col_idx] > 0.5:
+                self._player_variables[(p, t)] = 1
+        for t in range(num_teams):
+            for p in all_locked_players[t]:
+                self._player_variables[(p, t)] = 1
+
+        rows = []
+        for t in range(num_teams):
+            team_lineup = dict(all_locked_slots[t])
+            for s in all_open_slots[t]:
+                chosen_p = None
+                for p in all_P[t]:
+                    if (p, s, t) in y_vars and res.x[y_vars[(p, s, t)]] > 0.5:
+                        chosen_p = p
+                        break
+                if chosen_p is None:
+                    raise RuntimeError(f"Slot {s} in team {t} was not assigned by the solver.")
+                team_lineup[s] = chosen_p
+
+            team_lineup['salary'] = sum(pool_salary_map[team_lineup[s]] for s in YAHOO_SLOTS)
+            team_lineup['points'] = sum(pool_points_map[team_lineup[s]] for s in YAHOO_SLOTS)
+            team_lineup['entry_id'] = entry_keys[t]
+            team_lineup['contest_id'] = entry_keys[t]
+            rows.append(team_lineup)
+
+        results_df = pd.DataFrame(rows)[YAHOO_SLOTS + ['salary', 'points', 'entry_id', 'contest_id']]
+        if self._verbose:
+            logging.info(f'\n{results_df.to_string()}')
+        return results_df
 
     def _get_current_num_players_per_position_dict(self, locked_df: pd.DataFrame | None = None
                                                    ) -> Dict[str, Dict[str, int]]:
