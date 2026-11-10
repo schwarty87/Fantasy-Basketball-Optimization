@@ -100,7 +100,7 @@ class TestRunFullPipeline(unittest.TestCase):
         self.assertTrue(pipeline._has_games_today())
 
     def test_todays_model_already_trained(self):
-        """Verify _todays_model_already_trained detects model.pt and .ckpt files in model directory."""
+        """Verify _todays_model_already_trained detects complete models (weights, params, and transformers)."""
         pipeline = RunFullPipeline(
             load_params_from_model_id=1,
             run_immediately=True,
@@ -121,13 +121,26 @@ class TestRunFullPipeline(unittest.TestCase):
             os.makedirs(target_model_dir, exist_ok=True)
             self.assertFalse(pipeline._todays_model_already_trained())
 
-            # 3. model.pt exists -> True
+            # 3. Model weights only without params and scalers -> False
             pt_file = os.path.join(target_model_dir, "model.pt")
             with open(pt_file, "w") as f:
                 f.write("model")
+            self.assertFalse(pipeline._todays_model_already_trained())
+
+            # 4. Add params.json, scalers, and encoders -> True
+            with open(os.path.join(target_model_dir, "params.json"), "w") as f:
+                f.write("{}")
+            scalers_dir = os.path.join(target_model_dir, "scalers")
+            os.makedirs(scalers_dir, exist_ok=True)
+            with open(os.path.join(scalers_dir, "true_label.pkl"), "w") as f:
+                f.write("scaler")
+            encoders_dir = os.path.join(target_model_dir, "categorical_encoder")
+            os.makedirs(encoders_dir, exist_ok=True)
+            with open(os.path.join(encoders_dir, "embedding_features.pkl"), "w") as f:
+                f.write("encoder")
             self.assertTrue(pipeline._todays_model_already_trained())
 
-            # 4. Checkpoint exists -> True
+            # 5. Checkpoint (.ckpt) instead of model.pt -> True
             os.remove(pt_file)
             ckpt_file = os.path.join(target_model_dir, "epoch_1.ckpt")
             with open(ckpt_file, "w") as f:
@@ -191,6 +204,18 @@ class TestRunFullPipeline(unittest.TestCase):
         mock_runner = MagicMock()
         mock_runner._model_dir = os.path.join(self.temp_dir, "temp_model_dir")
         os.makedirs(mock_runner._model_dir, exist_ok=True)
+        with open(os.path.join(mock_runner._model_dir, "params.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(mock_runner._model_dir, "model.pt"), "w") as f:
+            f.write("weights")
+        scalers_dir = os.path.join(mock_runner._model_dir, "scalers")
+        os.makedirs(scalers_dir, exist_ok=True)
+        with open(os.path.join(scalers_dir, "true_label.pkl"), "w") as f:
+            f.write("scaler")
+        encoders_dir = os.path.join(mock_runner._model_dir, "categorical_encoder")
+        os.makedirs(encoders_dir, exist_ok=True)
+        with open(os.path.join(encoders_dir, "embedding_features.pkl"), "w") as f:
+            f.write("encoder")
         mock_run_model_cls.return_value = mock_runner
 
         with patch.object(pipeline, "_todays_model_already_trained", return_value=False):

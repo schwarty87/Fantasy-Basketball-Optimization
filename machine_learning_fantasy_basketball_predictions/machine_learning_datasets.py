@@ -25,8 +25,7 @@ from machine_learning_fantasy_basketball_predictions.samplers import ByDateBatch
 
 
 class AbstractCategoricalEncodingMachineLearningDatasetFantasyBasketballPredictions(AbstractCategoricalEncodingMachineLearningDataset):
-    def num_unique_values_per_feature(self) -> np.ndarray:
-        return np.array([len(np.unique(self._features_numpy[..., i])) for i in range(self._features_numpy.shape[-1])])
+    pass
 
 
 @datasets_registry.register

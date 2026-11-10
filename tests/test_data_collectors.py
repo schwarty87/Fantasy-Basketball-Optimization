@@ -711,22 +711,29 @@ class TestDataCollectors(unittest.TestCase):
         RunFullPipeline._wait_until_certain_time(future_naive)
         self.assertTrue(mock_sleep.called)
 
-    @patch("run_full_pipeline.os.path.isdir")
-    @patch("run_full_pipeline.os.path.isfile")
-    def test_todays_model_already_trained_respects_custom_run_date(self, mock_isfile, mock_isdir):
+    def test_todays_model_already_trained_respects_custom_run_date(self):
         """Verify _todays_model_already_trained respects self._run_date and custom date argument."""
         pipeline = MagicMock(spec=RunFullPipeline)
         pipeline._run_date = datetime.date(2026, 11, 15)
-        mock_isdir.return_value = True
-        mock_isfile.return_value = True
+        mock_is_valid = MagicMock(return_value=True)
+        pipeline._is_valid_trained_model_dir = mock_is_valid
 
         # Call the actual unbound method with our mock instance
         is_trained = RunFullPipeline._todays_model_already_trained(pipeline)
         self.assertTrue(is_trained)
-        mock_isdir.assert_called_with(
+        mock_is_valid.assert_called_with(
             os.path.join(
                 DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
                 'model_2026_11_15'
+            )
+        )
+
+        is_trained_custom = RunFullPipeline._todays_model_already_trained(pipeline, date=datetime.date(2026, 12, 1))
+        self.assertTrue(is_trained_custom)
+        mock_is_valid.assert_called_with(
+            os.path.join(
+                DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
+                'model_2026_12_01'
             )
         )
 

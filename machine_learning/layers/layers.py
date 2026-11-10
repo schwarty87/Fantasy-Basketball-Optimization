@@ -125,8 +125,9 @@ class EmbeddingsLayer(AbstractLayer):
         super().__init__(params=params, input_shape=input_shape)
         self.embedding_layers = nn.ModuleList()
         for num_embeddings, embedding_dim in zip(params.num_embeddings, params.embeddings_dims):
+            pad_idx = (num_embeddings - 1) if num_embeddings > 0 else None
             self.embedding_layers.append(nn.Embedding(num_embeddings=num_embeddings, embedding_dim=embedding_dim,
-                                                      max_norm=self.params.max_norm))
+                                                      max_norm=self.params.max_norm, padding_idx=pad_idx))
 
     def forward(self, x) -> Dict[str, torch.Tensor]:
         x_split = torch.split(x, 1, dim=-1)

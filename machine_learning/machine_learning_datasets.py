@@ -287,7 +287,10 @@ class AbstractCategoricalEncodingMachineLearningDataset(AbstractMachineLearningD
         super()._convert_features_dtype(to_type=to_type)
 
     def num_unique_values_per_feature(self) -> np.ndarray:
-        return np.apply_along_axis(lambda x: len(np.unique(x)), axis=0, arr=self._features_numpy)
+        if self.categorical_encoder is not None and hasattr(self.categorical_encoder, 'categories_'):
+            return np.array([len(cats) + 1 for cats in self.categorical_encoder.categories_])
+        features_flat = self._features_numpy.reshape(-1, self._features_numpy.shape[-1])
+        return np.array([len(np.unique(features_flat[:, i])) + 1 for i in range(features_flat.shape[-1])])
 
 
 @datasets_registry.register
@@ -866,6 +869,30 @@ class MachineLearningDatasetCombined:
             AbstractCategoricalEncodingMachineLearningDataset.load_categorical_encoder)
 
         return dataset_name_to_scaler, dataset_name_to_categorical_encoder
+
+    @staticmethod
+    def assert_transformers_complete(features_params: FeaturesParams, scalers: Optional[Dict], encoders: Optional[Dict]) -> None:
+        """Verify that all required scalers and categorical encoders exist when continuing from a model checkpoint."""
+        if not hasattr(features_params, 'feature_name_to_machine_learning_dataset_params'):
+            return
+        scalers = scalers or {}
+        encoders = encoders or {}
+        missing_scalers = []
+        missing_encoders = []
+        for name, ds_params in features_params.feature_name_to_machine_learning_dataset_params.items():
+            if isinstance(ds_params, (MachineLearningDatasetTabularScalingParams, MachineLearningDatasetTimeseriesScalingParams)):
+                if name not in scalers or scalers[name] is None:
+                    missing_scalers.append(name)
+            elif isinstance(ds_params, MachineLearningDatasetTabularCategoricalEncodingParams):
+                if name not in encoders or encoders[name] is None:
+                    missing_encoders.append(name)
+        if missing_scalers or missing_encoders:
+            err_msgs = []
+            if missing_scalers:
+                err_msgs.append(f"Missing scalers for datasets: {missing_scalers}")
+            if missing_encoders:
+                err_msgs.append(f"Missing encoders for datasets: {missing_encoders}")
+            raise FileNotFoundError("; ".join(err_msgs))
 
     @staticmethod
     def move_batch_data_to_device(batch_data: Dict[str, Union[Dict[str, torch.Tensor], torch.tensor]],

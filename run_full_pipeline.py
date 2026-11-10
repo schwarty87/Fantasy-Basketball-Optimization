@@ -134,17 +134,35 @@ class RunFullPipeline:
             logging.info(f'sleeping until {wait_until}')
             time.sleep(wait_seconds)
 
+    @staticmethod
+    def _is_valid_trained_model_dir(model_dir: str) -> bool:
+        """
+        Check that model_dir exists and contains params.json, weights (model.pt or *.ckpt),
+        and essential transformer artifacts (scalers and categorical encoders).
+        """
+        if not (model_dir and os.path.isdir(model_dir)):
+            return False
+        has_params = os.path.isfile(os.path.join(model_dir, 'params.json'))
+        try:
+            entries = os.listdir(model_dir)
+        except OSError:
+            return False
+        has_weights = os.path.isfile(os.path.join(model_dir, 'model.pt')) or any(f.endswith('.ckpt') for f in entries)
+        has_scalers = os.path.isdir(os.path.join(model_dir, 'scalers')) and os.path.isfile(
+            os.path.join(model_dir, 'scalers', 'true_label.pkl')
+        )
+        has_encoders = os.path.isdir(os.path.join(model_dir, 'categorical_encoder')) and os.path.isfile(
+            os.path.join(model_dir, 'categorical_encoder', 'embedding_features.pkl')
+        )
+        return has_params and has_weights and has_scalers and has_encoders
+
     def _todays_model_already_trained(self, date: datetime.date | str | None = None) -> bool:
         target_date = date or self._run_date
         todays_model_dir = os.path.join(
             DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models',
             f'model_{str(target_date).replace("-", "_")}'
         )
-        if not os.path.isdir(todays_model_dir):
-            return False
-        return os.path.isfile(os.path.join(todays_model_dir, 'model.pt')) or any(
-            f.endswith('.ckpt') for f in os.listdir(todays_model_dir)
-        )
+        return self._is_valid_trained_model_dir(todays_model_dir)
 
     def _has_games_today(self):
         return self._run_date in self.dates_to_game_times.keys()
@@ -278,17 +296,55 @@ class RunFullPipeline:
         todays_model_name = 'model_' + str(self._run_date).replace('-', '_')
         already_trained = self._todays_model_already_trained()
 
+        models_base = os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models')
+        target_dir = os.path.join(models_base, todays_model_name)
+        active_model_name = todays_model_name
+
         if (not already_trained or self.force_retrain) and self._has_games_today():
             logging.info(f"Training fresh model for today ({todays_model_name})...")
-            self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
-            self.train_nn.train()
+            temp_model_dir = None
+            try:
+                self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
+                temp_model_dir = self.train_nn._model_dir
+                self.train_nn.train()
+                if not self._is_valid_trained_model_dir(temp_model_dir):
+                    raise RuntimeError(f"Trained model in {temp_model_dir} is invalid or incomplete.")
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                os.rename(temp_model_dir, target_dir)
+            except Exception as e:
+                logging.exception(f"Daily model retraining for {todays_model_name} failed: {e}")
+                if temp_model_dir and os.path.exists(temp_model_dir):
+                    base_models = {'0', '1', '2', '3'}
+                    if os.path.basename(temp_model_dir) not in base_models:
+                        shutil.rmtree(temp_model_dir, ignore_errors=True)
 
-            # change the model name from the model id to today's date
-            model_dir = self.train_nn._model_dir
-            target_dir = os.path.join(os.path.dirname(model_dir), todays_model_name)
-            if os.path.exists(target_dir):
-                shutil.rmtree(target_dir, ignore_errors=True)
-            os.rename(model_dir, target_dir)
+                candidate_models = []
+                if os.path.isdir(models_base):
+                    for entry in os.listdir(models_base):
+                        if entry.startswith('model_') and entry != todays_model_name:
+                            full_path = os.path.join(models_base, entry)
+                            if self._is_valid_trained_model_dir(full_path):
+                                candidate_models.append(entry)
+
+                if candidate_models:
+                    fallback_name = sorted(candidate_models)[-1]
+                elif self._is_valid_trained_model_dir(os.path.join(models_base, str(self._load_params_from_model_id))):
+                    fallback_name = str(self._load_params_from_model_id)
+                else:
+                    fallback_name = None
+
+                if fallback_name is not None:
+                    logging.warning(f"Falling back to latest valid model: {fallback_name}")
+                    active_model_name = fallback_name
+                    fallback_params_path = os.path.join(models_base, fallback_name, 'params.json')
+                    params = MachineLearningParamsFantasyBasketballPredictions.load_params(fallback_params_path)
+                    params.training_params.fast_dev_run = False
+                    params.features_params.last_month_in_train = True
+                else:
+                    raise RuntimeError(
+                        f"Retraining {todays_model_name} failed and no valid fallback model was found."
+                    ) from e
         elif already_trained:
             logging.info(
                 f"Today's model '{todays_model_name}' has already been trained. "
@@ -296,8 +352,20 @@ class RunFullPipeline:
             )
         elif not self._has_games_today():
             logging.info(f"No games scheduled for today ({self._run_date}). Skipping model training.")
+            if not self._is_valid_trained_model_dir(target_dir):
+                candidate_models = []
+                if os.path.isdir(models_base):
+                    for entry in os.listdir(models_base):
+                        if entry.startswith('model_') and entry != todays_model_name:
+                            full_path = os.path.join(models_base, entry)
+                            if self._is_valid_trained_model_dir(full_path):
+                                candidate_models.append(entry)
+                if candidate_models:
+                    active_model_name = sorted(candidate_models)[-1]
+                elif self._is_valid_trained_model_dir(os.path.join(models_base, str(self._load_params_from_model_id))):
+                    active_model_name = str(self._load_params_from_model_id)
 
-        params.continue_model_id = todays_model_name
+        params.continue_model_id = active_model_name
         self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
 
     @staticmethod
@@ -329,9 +397,6 @@ class RunFullPipeline:
         )
 
         self.train_nn.create_data_loaders()
-        self.train_nn.update_categorical_params()
-        if not self._todays_model_already_trained():
-            self.train_nn.train()
         predictions = self._get_todays_predictions(teams_template=submit_teams.template)
 
         locked_dfs = submit_teams.get_locked_dfs()

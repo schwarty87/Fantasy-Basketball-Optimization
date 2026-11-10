@@ -387,7 +387,7 @@ class CalcFeatures:
 
     @timeit
     def _drop_nans(self):
-        check_cols = ['PLAYER_ID', 'TEAM_ID', 'DATE', 'YEARS_SINCE_DRAFT', 'DAYS_REST', 'MIN_mean5',
+        check_cols = ['PLAYER_ID', 'TEAM_ID', 'DATE', 'DAYS_REST', 'MIN_mean5',
                       'START_POSITION_CALCULATED'] + COUNTING_STATS
         check_cols = sorted(set(check_cols) & set(self.updates_df.columns))
         self.updates_df.dropna(subset=check_cols, inplace=True)

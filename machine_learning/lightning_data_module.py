@@ -7,7 +7,7 @@ from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 
 from machine_learning.enums import DataSplitType
 from machine_learning.params.layers_params import EmbeddingsLayerParams
-from machine_learning.params.params import MachineLearningParams
+from machine_learning.params.params import MachineLearningParams, FeaturesParams
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
 
 
@@ -59,6 +59,15 @@ class MachineLearningDataModule(pl.LightningDataModule):
                 logging.info(f"Loaded transformers from {load_dir}")
             except Exception as e:
                 logging.warning(f"Could not load transformers from {load_dir}: {e}")
+                if self.params is not None and getattr(self.params, "continue_model_id", None) is not None:
+                    raise
+
+            if (
+                self.params is not None
+                and getattr(self.params, "continue_model_id", None) is not None
+                and isinstance(getattr(self.params, "features_params", None), FeaturesParams)
+            ):
+                dataset_cls.assert_transformers_complete(self.params.features_params, scalers, label_encoders)
 
         if self.params is not None:
             self.dataset_combined = dataset_cls(

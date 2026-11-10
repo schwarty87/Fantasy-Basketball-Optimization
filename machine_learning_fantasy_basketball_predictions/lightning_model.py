@@ -10,6 +10,7 @@ from machine_learning.constants import DATA_DIR, METADATA, IGNORE
 from machine_learning.architecture import ModelArchitecture
 from machine_learning.metrics.combined_metrics import LossesCombined, MetricsCombined
 from machine_learning.lightning_model import MachineLearningLightningModule
+from machine_learning.params.machine_learning_dataset_params import MachineLearningDatasetTabularScalingParams
 from machine_learning_fantasy_basketball_predictions.params.params import (
     MachineLearningParamsFantasyBasketballPredictions,
 )
@@ -122,6 +123,16 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
 
         # Unscale targets if fitted scaler is available
         scaler = self._load_target_scaler()
+        if (
+            isinstance(
+                self.params.features_params.feature_name_to_machine_learning_dataset_params.get("true_label"),
+                MachineLearningDatasetTabularScalingParams,
+            )
+            and self.scaler_dir is not None
+            and scaler is None
+        ):
+            raise FileNotFoundError(f"Target scaler true_label.pkl not found under {self.scaler_dir}")
+
         if scaler:
             if all_preds.size > 0:
                 all_preds = scaler.inverse_transform(all_preds)

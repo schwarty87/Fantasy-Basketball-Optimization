@@ -287,10 +287,9 @@ class EarlyStopping(TrackBestValue):
 @callbacks_registry.register
 class CollectTruePredictedOutputs(AbstractCallback):
     """Collect the model outputs"""
-    def __init__(self, params: CollectTruePredictedOutputsParams, **kwargs):
-        self.model_dir = kwargs.get('model_dir', None)
-        del kwargs
-        super().__init__(params=params)
+    def __init__(self, params: CollectTruePredictedOutputsParams, model_dir: Optional[str] = None, **kwargs):
+        super().__init__(params=params, model_dir=model_dir, **kwargs)
+        self.model_dir = model_dir
         self.reset()
 
     @staticmethod
@@ -326,16 +325,20 @@ class CollectTruePredictedOutputs(AbstractCallback):
         self.results.append(df)
 
     def _resolve_scaler_dir(self) -> Optional[str]:
-        """Resolve scaler directory from callback params or fallback to model_dir/scalers."""
-        scaler_dir = self.params.scaler_dir
-        if (scaler_dir is None or not os.path.isdir(scaler_dir)) and self.model_dir is not None:
-            candidate = os.path.join(self.model_dir, 'scalers')
-            if os.path.isdir(candidate):
-                return candidate
-        return scaler_dir
+        """Resolve scaler directory from callback params or model_dir/scalers."""
+        if self.params.scaler_dir is None:
+            return None
+        active_model_dir = self._model_dir if self._model_dir is not None else self.model_dir
+        if active_model_dir is None:
+            raise ValueError("CollectTruePredictedOutputs requires model_dir when scaler_dir is enabled")
+        return os.path.join(active_model_dir, 'scalers')
 
     def _unscale_results(self, results_df: pd.DataFrame, scaler_dir: str):
         """Unscale standardized target and prediction columns back to physical units."""
+        if not os.path.isdir(scaler_dir):
+            raise FileNotFoundError(f"Expected scaler directory does not exist: {scaler_dir}")
+
+        applied_any_scaler = False
         for tensor_name in self.params.all_tensor_names:
             scaler_path = os.path.join(scaler_dir, f'{tensor_name}.pkl')
             if os.path.isfile(scaler_path):
@@ -352,10 +355,14 @@ class CollectTruePredictedOutputs(AbstractCallback):
                             scaler.inverse_transform(results_df[cols].values),
                             IGNORE,
                         )
+                        applied_any_scaler = True
             elif self.params.scaler_dir is not None and tensor_name == 'true_label':
                 logging.warning(
                     f"Scaler file '{scaler_path}' not found in scaler_dir '{scaler_dir}'. Predictions not unscaled."
                 )
+
+        if not applied_any_scaler:
+            raise FileNotFoundError(f"No target scaler .pkl found in {scaler_dir} for {self.params.all_tensor_names}")
 
     @staticmethod
     def _normalize_date_column(results_df: pd.DataFrame):

@@ -29,7 +29,7 @@ from machine_learning.params.abstract_params import AbstractMetricParams, Abstra
     AbstractMetricsAndCallbacksParams
 from machine_learning.params.callbacks_params import ModelCheckpointParams
 from machine_learning.params.layers_params import EmbeddingsLayerParams
-from machine_learning.params.params import MachineLearningParams
+from machine_learning.params.params import MachineLearningParams, FeaturesParams
 from machine_learning.registries import callbacks_registry
 from machine_learning.utils import RANDOM_SEED, models_dir, get_next_model_id
 
@@ -140,6 +140,10 @@ class RunModel:
         else:
             if self.params.continue_model_id is not None:
                 scalers, label_encoders = data_cls.load_transformers(self._continue_model_dir)
+                if isinstance(getattr(self.params, "features_params", None), FeaturesParams):
+                    MachineLearningDatasetCombined.assert_transformers_complete(
+                        self.params.features_params, scalers, label_encoders
+                    )
             self.dataset_combined = data_cls(
                 params=self.params.features_params,
                 training_params=self.params.training_params,
@@ -662,8 +666,8 @@ class RunModel:
 
             callbacks.on_train_end()
         except Exception as e:
-            logging.warning(f'There was an error during model training {e}!!!')
-            traceback.print_exc()
+            logging.exception(f'Error during model training for model {self.model_id}: {e}')
+            raise
         finally:
             model_checkpoint = [c for c in callbacks.callbacks if isinstance(c, ModelCheckpoint)]
             epochs = epoch_num if len(model_checkpoint) == 0 else model_checkpoint[0].best_epoch
