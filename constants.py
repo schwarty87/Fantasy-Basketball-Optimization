@@ -287,7 +287,8 @@ FIX_PLAYER_NAMES = {
     'Hansen Yang': 'Yang Hansen',
     'L.J. Cryer': 'LJ Cryer',
     "Eli N'Diaye": 'Eli John Ndiaye',
-    'Bobby Portis Jr.': 'Bobby Portis'
+    'Bobby Portis Jr.': 'Bobby Portis',
+    'Sergio De Larrea': 'Sergio de Larrea'
 }
 
 FIX_TEAM_NAMES = {'NOR': 'NOP',

@@ -240,6 +240,17 @@ class RunModel:
     def _callbacks_combined_class() -> Type[CallbacksManager]:
         return CallbacksManager
 
+    @staticmethod
+    def _resolve_lightning_monitor_and_mode(p: Any) -> Tuple[str, str]:
+        """Translate legacy metric tracking names (e.g. 'eval_loss', 'eval_mae') to Lightning logger keys ('val/loss', 'val/mae')."""
+        monitor = getattr(p, "value_to_track", "eval_loss")
+        if monitor in ("eval_loss", "loss", "loss_function"):
+            monitor = "val/loss"
+        elif monitor.startswith("eval_"):
+            monitor = f"val/{monitor[5:]}"
+        mode = "min" if getattr(p, "track_min_or_max", True) else "max"
+        return monitor, mode
+
     def _build_lightning_callbacks(self) -> List[Any]:
         callbacks = [LearningRateMonitor(logging_interval="epoch")]
         callbacks_params = getattr(self.params.training_params, "callbacks_params", ())
@@ -250,12 +261,7 @@ class RunModel:
             class_name = p.__class__.__name__
             if "ModelCheckpoint" in class_name:
                 has_checkpoint = True
-                monitor = getattr(p, "value_to_track", "eval_loss")
-                if monitor in ("eval_loss", "loss", "loss_function"):
-                    monitor = "val/loss"
-                elif monitor.startswith("eval_"):
-                    monitor = f"val/{monitor[5:]}"
-                mode = "min" if getattr(p, "track_min_or_max", True) else "max"
+                monitor, mode = self._resolve_lightning_monitor_and_mode(p)
                 callbacks.append(
                     PLModelCheckpoint(
                         dirpath=self._model_dir,
@@ -268,12 +274,7 @@ class RunModel:
                 )
             elif "EarlyStopping" in class_name:
                 has_early_stopping = True
-                monitor = getattr(p, "value_to_track", "eval_loss")
-                if monitor in ("eval_loss", "loss", "loss_function"):
-                    monitor = "val/loss"
-                elif monitor.startswith("eval_"):
-                    monitor = f"val/{monitor[5:]}"
-                mode = "min" if getattr(p, "track_min_or_max", True) else "max"
+                monitor, mode = self._resolve_lightning_monitor_and_mode(p)
                 patience = getattr(p, "patience", 10)
                 callbacks.append(
                     PLEarlyStopping(
@@ -433,14 +434,18 @@ class RunModel:
             metrics_params = self.params.training_params.metrics_params
         return self._metrics_combined_class()(all_params=metrics_params, name=name, device=self.device)
 
-    def _update_model_checkpoint_save_dir(self, callbacks_params: Tuple[AbstractMetricsAndCallbacksParams]):
+    def _update_callbacks_params(self, callbacks_params: Tuple[AbstractMetricsAndCallbacksParams]):
         for callback_params in callbacks_params:
             if isinstance(callback_params, ModelCheckpointParams):
                 callback_params.save_dir = self._model_dir
-                break
+            if hasattr(callback_params, 'scaler_dir'):
+                model_scalers_dir = os.path.join(self._model_dir, 'scalers')
+                if callback_params.scaler_dir is not None or os.path.isdir(model_scalers_dir):
+                    callback_params.scaler_dir = model_scalers_dir
 
     def _define_callbacks_manager(self, is_training: bool, optimizer: OPTIMIZER_TYPE = None) -> CallbacksManager:
         callbacks_params = copy.deepcopy(self.params.training_params.callbacks_params)
+        self._update_callbacks_params(callbacks_params)
         callbacks_combined_class = self._callbacks_combined_class()
         if not is_training:
             callbacks_params = tuple([p for p in callbacks_params if callbacks_registry.get(p.key_to_class_for_registry)
@@ -647,7 +652,7 @@ class RunModel:
 
                 callbacks.on_epoch_end(epoch_num=epoch_num, metric_name_to_result=metric_name_to_result)
 
-                if self._stop_training(callbacks=callbacks, epoch_num=epoch_num):
+                if self._stop_training(callbacks=callbacks, epoch_num=epoch_num) or getattr(self.params.training_params, "fast_dev_run", False):
                     break
 
                 epoch_num = epoch_num + 1
@@ -800,7 +805,9 @@ class RunModel:
                                                        callback_results_df.columns))
                 results_dfs.append(callback_results_df)
         if len(results_dfs) > 0:
-            return pd.concat(results_dfs, axis=0)
+            df = pd.concat(results_dfs, axis=0)
+            df['split_type'] = data_split_type.name
+            return df
 
     def predict_all_data(self, loss_params: Optional[Tuple[AbstractLossParams, ...]] = None,
                          metrics_params: Optional[Tuple[AbstractMetricParams, ...]] = None, **kwargs) -> pd.DataFrame:

@@ -124,53 +124,45 @@ class CallbacksManager:
     def stop_training(self) -> bool:
         return any(callback.stop_training() for callback in self.callbacks)
 
-    def on_epoch_begin(self, epoch_num: int):
+    def _dispatch(self, method_name: str, *args, **kwargs):
         for callback in self.callbacks:
-            callback.on_epoch_begin(epoch_num)
+            getattr(callback, method_name)(*args, **kwargs)
+
+    def on_epoch_begin(self, epoch_num: int):
+        self._dispatch('on_epoch_begin', epoch_num)
 
     def on_epoch_end(self, epoch_num: int, metric_name_to_result: Dict[str, Union[float, Dict]]):
-        for callback in self.callbacks:
-            callback.on_epoch_end(epoch_num=epoch_num, metric_name_to_result=metric_name_to_result)
+        self._dispatch('on_epoch_end', epoch_num=epoch_num, metric_name_to_result=metric_name_to_result)
 
     def on_train_epoch_end(self, epoch_num, metric_name_to_result: Dict[str, float]):
-        for callback in self.callbacks:
-            callback.on_train_epoch_end(epoch_num=epoch_num, metric_name_to_result=metric_name_to_result)
+        self._dispatch('on_train_epoch_end', epoch_num=epoch_num, metric_name_to_result=metric_name_to_result)
 
     def on_train_begin(self):
-        for callback in self.callbacks:
-            callback.on_train_begin()
+        self._dispatch('on_train_begin')
 
     def on_train_end(self):
-        for callback in self.callbacks:
-            callback.on_train_end()
+        self._dispatch('on_train_end')
 
     def on_train_batch_begin(self, batch_num: int):
-        for callback in self.callbacks:
-            callback.on_train_batch_begin(batch_num=batch_num)
+        self._dispatch('on_train_batch_begin', batch_num=batch_num)
 
     def on_train_batch_end(self, batch_num, all_tensors: Dict[str, torch.Tensor]):
-        for callback in self.callbacks:
-            callback.on_train_batch_end(batch_num=batch_num, all_tensors=all_tensors)
+        self._dispatch('on_train_batch_end', batch_num=batch_num, all_tensors=all_tensors)
 
     def on_eval_begin(self):
-        for callback in self.callbacks:
-            callback.on_eval_begin()
+        self._dispatch('on_eval_begin')
 
     def on_eval_end(self, metric_name_to_result: Optional[Dict[str, float]] = None):
-        for callback in self.callbacks:
-            callback.on_eval_end(metric_name_to_result=metric_name_to_result)
+        self._dispatch('on_eval_end', metric_name_to_result=metric_name_to_result)
 
     def on_eval_batch_begin(self, batch_num):
-        for callback in self.callbacks:
-            callback.on_eval_batch_begin(batch_num=batch_num)
+        self._dispatch('on_eval_batch_begin', batch_num=batch_num)
 
     def on_eval_batch_end(self, batch_num, all_tensors: Dict[str, torch.Tensor]):
-        for callback in self.callbacks:
-            callback.on_eval_batch_end(batch_num=batch_num, all_tensors=all_tensors)
+        self._dispatch('on_eval_batch_end', batch_num=batch_num, all_tensors=all_tensors)
 
     def on_predict_begin(self):
-        for callback in self.callbacks:
-            callback.on_predict_begin()
+        self._dispatch('on_predict_begin')
 
     def on_predict_end(self, metric_name_to_results_df: Optional[Dict[str, pd.DataFrame]] = None
                        ) -> Dict[str, Optional[pd.DataFrame]]:
@@ -183,28 +175,30 @@ class CallbacksManager:
                 for callback in self.callbacks}
 
     def on_predict_batch_begin(self, batch_num):
-        for callback in self.callbacks:
-            callback.on_predict_batch_begin(batch_num=batch_num)
+        self._dispatch('on_predict_batch_begin', batch_num=batch_num)
 
     def on_predict_batch_end(self, batch_num, all_tensors: Dict[str, torch.Tensor]):
-        for callback in self.callbacks:
-            callback.on_predict_batch_end(batch_num=batch_num, all_tensors=all_tensors)
+        self._dispatch('on_predict_batch_end', batch_num=batch_num, all_tensors=all_tensors)
 
     def on_batch_begin(self, training_mode: ModelMode, batch_num: int):
-        if training_mode == ModelMode.TRAIN:
-            self.on_train_batch_begin(batch_num=batch_num)
-        elif training_mode == ModelMode.EVAL:
-            self.on_eval_batch_begin(batch_num=batch_num)
-        elif training_mode == ModelMode.PREDICT:
-            self.on_predict_batch_begin(batch_num=batch_num)
+        hook_map = {
+            ModelMode.TRAIN: 'on_train_batch_begin',
+            ModelMode.EVAL: 'on_eval_batch_begin',
+            ModelMode.PREDICT: 'on_predict_batch_begin',
+        }
+        hook = hook_map.get(training_mode)
+        if hook:
+            self._dispatch(hook, batch_num=batch_num)
 
     def on_batch_end(self, training_mode: ModelMode, batch_num: int, all_tensors: Dict[str, torch.Tensor]):
-        if training_mode == ModelMode.TRAIN:
-            self.on_train_batch_end(batch_num=batch_num, all_tensors=all_tensors)
-        elif training_mode == ModelMode.EVAL:
-            self.on_eval_batch_end(batch_num=batch_num, all_tensors=all_tensors)
-        elif training_mode == ModelMode.PREDICT:
-            self.on_predict_batch_end(batch_num=batch_num, all_tensors=all_tensors)
+        hook_map = {
+            ModelMode.TRAIN: 'on_train_batch_end',
+            ModelMode.EVAL: 'on_eval_batch_end',
+            ModelMode.PREDICT: 'on_predict_batch_end',
+        }
+        hook = hook_map.get(training_mode)
+        if hook:
+            self._dispatch(hook, batch_num=batch_num, all_tensors=all_tensors)
 
 
 class TrackBestValue(AbstractCallback, ABC):
@@ -294,6 +288,7 @@ class EarlyStopping(TrackBestValue):
 class CollectTruePredictedOutputs(AbstractCallback):
     """Collect the model outputs"""
     def __init__(self, params: CollectTruePredictedOutputsParams, **kwargs):
+        self.model_dir = kwargs.get('model_dir', None)
         del kwargs
         super().__init__(params=params)
         self.reset()
@@ -330,38 +325,78 @@ class CollectTruePredictedOutputs(AbstractCallback):
         df = self._convert_dict_of_tensors_to_df(tensors_dict=all_tensors, column_names_dict=self.params.column_names)
         self.results.append(df)
 
+    def _resolve_scaler_dir(self) -> Optional[str]:
+        """Resolve scaler directory from callback params or fallback to model_dir/scalers."""
+        scaler_dir = self.params.scaler_dir
+        if (scaler_dir is None or not os.path.isdir(scaler_dir)) and self.model_dir is not None:
+            candidate = os.path.join(self.model_dir, 'scalers')
+            if os.path.isdir(candidate):
+                return candidate
+        return scaler_dir
+
+    def _unscale_results(self, results_df: pd.DataFrame, scaler_dir: str):
+        """Unscale standardized target and prediction columns back to physical units."""
+        for tensor_name in self.params.all_tensor_names:
+            scaler_path = os.path.join(scaler_dir, f'{tensor_name}.pkl')
+            if os.path.isfile(scaler_path):
+                with open(scaler_path, 'rb') as f:
+                    scaler = pkl.load(f)
+                for tt in ('true', 'pred'):
+                    cols = [f'{c}_{tt}' for c in scaler.feature_names_in_]
+                    num_in_df = len(set(cols).intersection(set(results_df.columns)))
+                    if num_in_df > 0:
+                        if num_in_df < len(cols):
+                            raise ValueError(f'not all scaler features are in results_df {tt}!')
+                        results_df[cols] = np.where(
+                            results_df[cols] != IGNORE,
+                            scaler.inverse_transform(results_df[cols].values),
+                            IGNORE,
+                        )
+            elif self.params.scaler_dir is not None and tensor_name == 'true_label':
+                logging.warning(
+                    f"Scaler file '{scaler_path}' not found in scaler_dir '{scaler_dir}'. Predictions not unscaled."
+                )
+
+    @staticmethod
+    def _normalize_date_column(results_df: pd.DataFrame):
+        """Standardize the DATE column into datetime.date objects."""
+        if 'DATE' not in results_df.columns or results_df.empty:
+            return
+        if pd.api.types.is_numeric_dtype(results_df['DATE']):
+            first_val = results_df['DATE'].dropna().iloc[0] if not results_df['DATE'].dropna().empty else None
+            unit = 's' if float(first_val or 0) > 1e7 else 'D'
+            results_df['DATE'] = pd.to_datetime(results_df['DATE'], unit=unit).dt.date
+        elif not isinstance(results_df['DATE'].iloc[0], datetime.date):
+            results_df['DATE'] = pd.to_datetime(results_df['DATE']).dt.date
+
+    @staticmethod
+    def _merge_metric_results(
+        results_df: pd.DataFrame, metric_name_to_results_df: Optional[Dict[str, pd.DataFrame]] = None
+    ) -> pd.DataFrame:
+        """Concatenate auxiliary metric results dataframes onto the predictions dataframe."""
+        if metric_name_to_results_df is None:
+            return results_df
+        dfs_to_concat = [results_df]
+        for v in metric_name_to_results_df.values():
+            if isinstance(v, (pd.DataFrame, pd.Series)):
+                dfs_to_concat.append(v)
+        return pd.concat(dfs_to_concat, axis=1)
+
     def on_predict_end(self, metric_name_to_results_df: Optional[Dict[str, pd.DataFrame]] = None) -> Optional[pd.DataFrame]:
         results_df = pd.concat(self.results, axis=0).reset_index(drop=True)
 
-        # if we scaled the true labels, we'll want to unscale them before saving the results
-        if self.params.scaler_dir is not None:
-            for tensor_name in self.params.all_tensor_names:
-                scaler_path = os.path.join(self.params.scaler_dir, f'{tensor_name}.pkl')
-                if os.path.isfile(scaler_path):
-                    with open(scaler_path, 'rb') as f:
-                        scaler = pkl.load(f)
-                        for tt in ('true', 'pred'):
-                            cols = [f'{c}_{tt}' for c in scaler.feature_names_in_]
-                            num_in_df = len(set(cols).intersection(set(results_df.columns)))
-                            if num_in_df > 0:
-                                if num_in_df < len(cols):
-                                    raise ValueError(f'not all scaler features are in results_df {tt}!')
-                                results_df[cols] = np.where(results_df[cols] != IGNORE, scaler.inverse_transform(results_df[cols].values), IGNORE)
+        scaler_dir = self._resolve_scaler_dir()
+        if scaler_dir is not None:
+            self._unscale_results(results_df, scaler_dir)
 
-        if 'DATE' in results_df.columns:
-            if pd.api.types.is_numeric_dtype(results_df['DATE']):
-                first_val = results_df['DATE'].dropna().iloc[0] if not results_df['DATE'].dropna().empty else None
-                unit = 's' if float(first_val or 0) > 1e7 else 'D'
-                results_df['DATE'] = pd.to_datetime(results_df['DATE'], unit=unit).dt.date
-            elif not results_df.empty and not isinstance(results_df['DATE'].iloc[0], datetime.date):
-                results_df['DATE'] = pd.to_datetime(results_df['DATE']).dt.date
+        self._normalize_date_column(results_df)
+        results_df = self._merge_metric_results(results_df, metric_name_to_results_df)
 
-        if metric_name_to_results_df is not None:
-            results_df = pd.concat([results_df] + list(metric_name_to_results_df.values()), axis=1)
         if self.params.save_path is not None:
             results_df.to_feather(self.params.save_path)
 
-        return results_df.sort_values(['DATE', 'PLAYER_ID'])
+        sort_cols = [c for c in ['DATE', 'PLAYER_ID'] if c in results_df.columns]
+        return results_df.sort_values(sort_cols) if sort_cols else results_df
 
     def reset(self):
         super().reset()

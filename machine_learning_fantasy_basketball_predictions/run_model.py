@@ -1,7 +1,14 @@
+import sys
 import os
+# Ensure project root is in sys.path when script is invoked directly
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import time
 import logging
 import datetime
+import pickle as pkl
 import numpy as np
 import pandas as pd
 import torch
@@ -83,18 +90,77 @@ class RunModelFantasyBasketballPredictions(RunModel):
             contests_df.drop(columns='DATE').merge(date_per_contest.reset_index(), on='contestId', how='left')
         return contests_df[['contestId', 'score', 'DATE', 'entry_fee']]
 
-    @staticmethod
-    def _process_predictions_df(predictions_df: pd.DataFrame, contests_df: pd.DataFrame) -> pd.DataFrame:
+    @classmethod
+    def _unscale_if_needed(cls, df: pd.DataFrame, model_dir: Optional[str] = None) -> pd.DataFrame:
+        """Defensively unscale prediction and true target stats if they appear standard-scaled."""
+        stat_cols = [c for c in df.columns if c.endswith('_pred') and 'YAHOO_POINTS' not in c and 'PTS' not in c]
+        if not stat_cols:
+            return df
+        # Real NBA stats: MIN has mean ~21, 2PM has mean ~2.6, REB has mean ~4.0.
+        # Standardized z-scores have mean ~0.0 and standard deviation ~1.0, with ~40% negative values.
+        # If MIN_pred has mean > 5.0 or 2PM_pred has mean > 1.0, the data is already in real NBA units and must NOT be unscaled again.
+        if 'MIN_pred' in df.columns:
+            is_standardized = df['MIN_pred'].mean() < 5.0
+        elif '2PM_pred' in df.columns:
+            is_standardized = df['2PM_pred'].mean() < 0.8 and (df['2PM_pred'] < -0.2).mean() > 0.15
+        else:
+            is_standardized = df[stat_cols[0]].mean() < 0.8 and (df[stat_cols[0]] < -0.2).mean() > 0.15
+
+        if not is_standardized:
+            return df
+
+        scaler = None
+        candidate_paths = []
+        if model_dir:
+            candidate_paths.append(os.path.join(model_dir, 'scalers', 'true_label.pkl'))
+        proj_models = models_dir(PROJECT_NAME)
+        if os.path.isdir(proj_models):
+            for m_id in sorted(os.listdir(proj_models), reverse=True):
+                candidate_paths.append(os.path.join(proj_models, m_id, 'scalers', 'true_label.pkl'))
+
+        for p in candidate_paths:
+            if os.path.isfile(p):
+                try:
+                    with open(p, 'rb') as f:
+                        scaler = pkl.load(f)
+                    logging.info(f"Loaded target scaler for defensive unscaling from: {p}")
+                    break
+                except Exception as e:
+                    logging.warning(f"Failed loading scaler from {p}: {e}")
+
+        if scaler is not None and hasattr(scaler, 'feature_names_in_'):
+            for tt in ('true', 'pred'):
+                cols = [f'{c}_{tt}' for c in scaler.feature_names_in_]
+                if all(c in df.columns for c in cols):
+                    valid_mask = (df[cols] != IGNORE).all(axis=1)
+                    if valid_mask.any():
+                        unscaled_vals = scaler.inverse_transform(df.loc[valid_mask, cols].values)
+                        df.loc[valid_mask, cols] = unscaled_vals
+            # Recalculate fantasy points with unscaled stats
+            add_missing_points_columns_to_predictions(df, overwrite=True)
+
+        return df
+
+    @classmethod
+    def _process_predictions_df(cls, predictions_df: pd.DataFrame, contests_df: pd.DataFrame,
+                                model_dir: Optional[str] = None) -> pd.DataFrame:
         collect_cols = [c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]
         if collect_cols:
-            predictions_df = predictions_df[collect_cols]
+            predictions_df = predictions_df[collect_cols].copy()
             predictions_df.rename(columns={c: '_'.join(c.split('_')[1:]) for c in predictions_df.columns}, inplace=True)
+        else:
+            predictions_df = predictions_df.copy()
 
         if 'NOT_IGNORE' in predictions_df.columns:
             predictions_df = predictions_df.loc[predictions_df['NOT_IGNORE'].astype(bool)].drop(columns='NOT_IGNORE')
 
         true_cols = [c for c in predictions_df if '_true' in c]
-        predictions_df = predictions_df.loc[(predictions_df[true_cols] != IGNORE).all(axis=1)]
+        if true_cols:
+            predictions_df = predictions_df.loc[(predictions_df[true_cols] != IGNORE).all(axis=1)]
+
+        # Defensive unscaling before filtering/calculating points
+        predictions_df = cls._unscale_if_needed(predictions_df, model_dir=model_dir)
+
         predictions_df['DATE'] = convert_date_col_to_date(predictions_df['DATE'])
         predictions_df = predictions_df.loc[predictions_df['DATE'].isin(contests_df['DATE'].unique())]
 
@@ -126,12 +192,18 @@ class RunModelFantasyBasketballPredictions(RunModel):
     def predict(self, data_split_type: DataSplitType = DataSplitType.TRAIN, **kwargs) -> pd.DataFrame:
         return super().predict(data_split_type=data_split_type, trainer_cls=pl.Trainer, **kwargs)
 
-    @staticmethod
-    def _calculate_prediction_correlations(eval_results: pd.DataFrame, predict_results: pd.DataFrame) -> pd.DataFrame:
+    @classmethod
+    def _calculate_prediction_correlations(cls, eval_results: pd.DataFrame, predict_results: pd.DataFrame,
+                                           model_dir: Optional[str] = None) -> pd.DataFrame:
         if predict_results is None or predict_results.empty:
             return eval_results
 
         preds = predict_results.copy()
+        collect_cols = [c for c in preds.columns if c.startswith('CollectTruePredicted')]
+        if collect_cols:
+            preds = preds[collect_cols].copy()
+            preds.rename(columns={c: '_'.join(c.split('_')[1:]) for c in preds.columns}, inplace=True)
+        preds = cls._unscale_if_needed(preds, model_dir=model_dir)
         try:
             add_missing_points_columns_to_predictions(preds)
         except Exception:
@@ -144,9 +216,14 @@ class RunModelFantasyBasketballPredictions(RunModel):
         if 'NOT_IGNORE' in preds.columns:
             preds = preds.loc[preds['NOT_IGNORE'].astype(bool)]
 
+        split_series = preds['split_type'].astype(str) if 'split_type' in preds.columns else pd.Series([], dtype=str)
+        eval_split_series = eval_results['split_type'].astype(str) if 'split_type' in eval_results.columns else None
+
         for split_type in DataSplitType.all_not_none_split_types():
             split_name = split_type.name
-            split_mask = (preds['split_type'] == split_type) | (preds['split_type'] == split_name) | (preds['split_type'] == split_type.value)
+            split_val = str(split_type.value)
+            valid_splits = {split_name, split_val, split_name.lower(), split_name.upper()}
+            split_mask = split_series.isin(valid_splits)
             split_df = preds[split_mask]
             valid = split_df[split_df[true_col].notna() & split_df['YAHOO_POINTS_pred'].notna()]
             if len(valid) < 5:
@@ -165,8 +242,8 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
             daily_spearman_mean = float(np.mean(daily_spearmans)) if daily_spearmans else float('nan')
 
-            if 'split_type' in eval_results.columns and not eval_results.empty:
-                target_mask = (eval_results['split_type'] == split_type) | (eval_results['split_type'] == split_name) | (eval_results['split_type'] == split_type.value)
+            if eval_split_series is not None and not eval_results.empty:
+                target_mask = eval_split_series.isin(valid_splits)
                 idx = eval_results[target_mask].index[0] if target_mask.any() else split_name
             else:
                 idx = split_name
@@ -184,7 +261,8 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
     def _add_extra_metrics_to_eval_results(self, eval_results: pd.DataFrame, predict_results: pd.DataFrame
                                            ) -> pd.DataFrame:
-        eval_results = self._calculate_prediction_correlations(eval_results=eval_results, predict_results=predict_results)
+        eval_results = self._calculate_prediction_correlations(
+            eval_results=eval_results, predict_results=predict_results, model_dir=self._model_dir)
 
         try:
             contests_df = self._load_contests_df()
@@ -192,7 +270,8 @@ class RunModelFantasyBasketballPredictions(RunModel):
             logging.warning(f"Could not load DFS contest results: {e}. Skipping extra DFS contest metrics.")
             return eval_results
 
-        predict_results = self._process_predictions_df(predictions_df=predict_results, contests_df=contests_df)
+        predict_results = self._process_predictions_df(
+            predictions_df=predict_results, contests_df=contests_df, model_dir=self._model_dir)
 
         find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(points_col='YAHOO_POINTS_pred',
                                                                   num_teams_in_set=1,
@@ -230,17 +309,20 @@ class RunModelFantasyBasketballPredictions(RunModel):
         for ppc, df_name in zip([percentile_per_contest, percentile_per_contest.query('entry_fee.notnull() & (entry_fee > 0)')], ['all', 'paid']):
             eval_results[f'portfolio_value_5050_{df_name}'] = [list()] * eval_results.shape[0]
             eval_results[f'portfolio_value_top10_{df_name}'] = [list()] * eval_results.shape[0]
-            for split_type, group_df in ppc.groupby('split_type', sort=False):
+            for raw_split, group_df in ppc.groupby('split_type', sort=False):
+                split_key = raw_split.name if hasattr(raw_split, 'name') else str(raw_split)
+                if split_key not in eval_results.index and split_key.upper() in eval_results.index:
+                    split_key = split_key.upper()
                 one_per_date = group_df.groupby('DATE').agg({'profit_5050': 'mean', 'profit_top10': 'mean',
                                                              'percentile': 'mean', 'predicted_score': 'mean'})
                 one_per_date[f'portfolio_value_5050'] = one_per_date['profit_5050'].cumsum()
                 one_per_date['portfolio_value_top10'] = one_per_date['profit_top10'].cumsum()
-                eval_results.at[split_type, f'portfolio_value_5050_{df_name}'] = one_per_date['portfolio_value_5050'].values.tolist()
-                eval_results.at[split_type, f'portfolio_value_top10_{df_name}'] = one_per_date['portfolio_value_top10'].values.tolist()
-                eval_results.loc[split_type, f'mean_percentile_{df_name}'] = one_per_date['percentile'].mean()
-                eval_results.loc[split_type, f'mean_score_{df_name}'] = one_per_date['predicted_score'].mean()
-                eval_results.loc[split_type, f'top10_pct_{df_name}'] = (one_per_date['percentile'] >= 0.9).mean()
-                eval_results.loc[split_type, f'sharpe_5050_{df_name}'] = sharpe(one_per_date['portfolio_value_5050'])
+                eval_results.at[split_key, f'portfolio_value_5050_{df_name}'] = one_per_date['portfolio_value_5050'].values.tolist()
+                eval_results.at[split_key, f'portfolio_value_top10_{df_name}'] = one_per_date['portfolio_value_top10'].values.tolist()
+                eval_results.loc[split_key, f'mean_percentile_{df_name}'] = one_per_date['percentile'].mean()
+                eval_results.loc[split_key, f'mean_score_{df_name}'] = one_per_date['predicted_score'].mean()
+                eval_results.loc[split_key, f'top10_pct_{df_name}'] = (one_per_date['percentile'] >= 0.9).mean()
+                eval_results.loc[split_key, f'sharpe_5050_{df_name}'] = sharpe(one_per_date['portfolio_value_5050'])
 
         return eval_results
 
@@ -250,7 +332,8 @@ class RunModelFantasyBasketballPredictions(RunModel):
         # saving dfs results to tensorboard
         try:
             for split_type in DataSplitType.all_not_none_split_types():
-                if split_type.name not in eval_results.index:
+                split_key = split_type.name if split_type.name in eval_results.index else str(split_type.value)
+                if split_key not in eval_results.index:
                     continue
                 writer = SummaryWriter(os.path.join(self._tensorboard_dir(), split_type.name.lower()))
 
@@ -258,8 +341,8 @@ class RunModelFantasyBasketballPredictions(RunModel):
                     col_5050 = f'portfolio_value_5050_{suffix}'
                     col_top10 = f'portfolio_value_top10_{suffix}'
                     if col_5050 in eval_results.columns and col_top10 in eval_results.columns:
-                        portfolio_value_5050 = eval_results.loc[split_type.name, col_5050]
-                        portfolio_value_top10 = eval_results.loc[split_type.name, col_top10]
+                        portfolio_value_5050 = eval_results.loc[split_key, col_5050]
+                        portfolio_value_top10 = eval_results.loc[split_key, col_top10]
                         if hasattr(portfolio_value_5050, '__iter__') and hasattr(portfolio_value_top10, '__iter__'):
                             for step, (curr_5050, curr_top10) in enumerate(zip(portfolio_value_5050, portfolio_value_top10)):
                                 writer.add_scalar(tag=f'DFS_Profit/portfolio_5050_{suffix}',
@@ -280,3 +363,9 @@ class RunModelFantasyBasketballPredictions(RunModel):
             logging.warning(f"Could not save DFS results to tensorboard: {e}")
 
         return eval_results, predict_results
+
+
+if __name__ == '__main__':
+    from run_all import main, create_params
+    params = create_params()
+    main(use_lightning=True, params=params)

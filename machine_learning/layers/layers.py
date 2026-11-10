@@ -260,7 +260,8 @@ class SplitAttentionCombine(AbstractLayer):
         transformer_encoder_params = TransformerEncoderCustomParams(input_tensor_name='', output_tensor_name=None,
                                                                     d_model=params.d_model, n_heads=params.n_heads,
                                                                     ffdim=params.ffdim, dropout_rate=params.dropout_rate,
-                                                                    norm_at_beginning=params.norm_at_beginning)
+                                                                    norm_at_beginning=params.norm_at_beginning,
+                                                                    activation=params.activation)
         transformer_encoder_input_shape = (input_shape[0] // 2, input_shape[-1])
         self.transformer_encoder_within = TransformerEncoderCustom(params=transformer_encoder_params,
                                                                    input_shape=transformer_encoder_input_shape)
@@ -311,8 +312,19 @@ class TransformerEncoderCustom(AbstractLayer):
 
         # --- Feed-Forward Block ---
         self.norm2 = nn.LayerNorm(normalized_shape=params.d_model)
+        activation_layer = (
+            ActivationFunction.member_to_function(params.activation)
+            if isinstance(params.activation, ActivationFunction)
+            else (
+                ActivationFunction.member_to_function(ActivationFunction[params.activation.upper()])
+                if isinstance(params.activation, str) and hasattr(ActivationFunction, params.activation.upper())
+                else nn.ReLU()
+            )
+        )
+        if activation_layer is None:
+            activation_layer = nn.Identity()
         self.feedforward = nn.Sequential(nn.Linear(in_features=params.d_model, out_features=params.ffdim),
-                                         nn.ReLU(),
+                                         activation_layer,
                                          nn.Dropout(p=params.dropout_rate),
                                          nn.Linear(in_features=params.ffdim, out_features=params.d_model)
                                          )

@@ -225,11 +225,13 @@ class SplitAttentionCombineWrapperParams(LayerParams):
     dropout_rate: float = 0.
     norm_at_beginning: bool = True
     n_bench_players: int = 6
-    activation: str = 'relu'
+    activation: Union[ActivationFunction, str] = ActivationFunction.RELU
     num_layers: int = 2
 
     def __post_init__(self):
         super().__post_init__()
+        if isinstance(self.activation, str):
+            self.activation = ActivationFunction[self.activation.upper()]
         self.ffdim = max(self.ffdim, self.d_model)
 
         self.single_layer_kwargs = dataclasses.asdict(self)
@@ -245,11 +247,12 @@ class SplitAttentionCombineParams(LayerParams):
     dropout_rate: float = 0.
     norm_at_beginning: bool = True
     n_bench_players: int = 6
-    activation: str = 'relu'
+    activation: Union[ActivationFunction, str] = ActivationFunction.RELU
 
     def __post_init__(self):
         super().__post_init__()
-
+        if isinstance(self.activation, str):
+            self.activation = ActivationFunction[self.activation.upper()]
         self.ffdim = max(self.ffdim, self.d_model)
 
 
@@ -264,11 +267,12 @@ class TransformerEncoderCustomParams(LayerParams):
     # some papers report that they get better results without layernorm on the input of the first encoder layer
     # https://arxiv.org/pdf/2106.11959v2.pdf
     norm_at_beginning: bool = True
-    activation: str = 'relu'
+    activation: Union[ActivationFunction, str] = ActivationFunction.RELU
 
     def __post_init__(self):
         super().__post_init__()
-
+        if isinstance(self.activation, str):
+            self.activation = ActivationFunction[self.activation.upper()]
         if self.d_v is None:
             self.d_v = self.d_model
 

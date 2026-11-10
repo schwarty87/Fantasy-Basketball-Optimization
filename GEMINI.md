@@ -14,12 +14,21 @@
 - **Upcoming Games Flag**:
   - `add_upcoming_games=False`: Used during 8:00 AM daily model retraining so models train only on completed games.
   - `add_upcoming_games=True`: Used right before game times in `run_full_pipeline()` to incorporate today's rosters, salaries, and matchups for prediction.
+- **Season Schedule Caching & Resilience**:
+  - Season schedules are static full-season files cached in `data/season_schedules/{season}.feather` with a 24-hour TTL.
+  - When `stats.nba.com` times out or fails, `scrape_season_schedules()` automatically falls back to the existing cached schedule file to prevent pipeline crashes. `update_stats.py` also supports `--no-schedules` to explicitly skip schedule queries.
+  - **Live Postponement & Time Shift Detection**: To detect game postponements (`PPD`) or tip-off time shifts throughout the day without re-downloading the entire 1,267-game season schedule, `update_todays_schedule_from_scoreboard()` queries NBA's lightweight daily `scoreboardv3` endpoint (~5-10 games). It automatically patches `postponedStatus`, `gameStatusText`, and `GAME_DATE_TIME` in the cached season schedule file both during the morning run and right before lineup submission. `load_schedule(drop_ppd=True)` filters out all games marked with `postponedStatus == 'Y'` or `PPD` / `Postponed`.
 
 ### Browser Profile & DFS Lineup Submission
 - **Dedicated Automated Profile**: To prevent `DevToolsActivePort` / file-lock collisions when the user has desktop Chrome running, Selenium uses a dedicated automated profile at `submitted_teams/browser_profile/` (with fallback to default Chrome user data if missing).
 - **Interactive Login**: Run `python submit_dfs_team.py --login` to open a visible Chrome window, log in to Yahoo once with "keep me signed in", and save cookies directly to `submitted_teams/browser_profile/`.
 - **Permissions & Headless**: Selenium is configured with automation-suppression flags (`--disable-blink-features=AutomationControlled`, notification suppressions) and dedicated download directories to ensure it runs headlessly without permission prompts or popups.
 - **Submitted Teams Storage**: Generated Yahoo CSV templates and submission logs are stored in `submitted_teams/` in the project root. Daily CSV files and `browser_profile/` are ignored by Git.
+- **Private League Contest Filtering**: In `_get_template_df()` in `submit_dfs_team.py`, private league contests (e.g. `'DFS league 2026-27'`, `'dfs league 2025-26'`) are automatically filtered out of the downloaded template CSV by shifting subsequent contest rows up. This preserves the player pool on the right while preventing automated submissions from altering private league lineups.
+
+### Prediction Merging & Salary Robustness (`run_full_pipeline.py`)
+- **Metadata Column Collisions**: Model predictions include metadata columns (`YAHOO_POSITION`, `YAHOO_SALARY`). In `_get_todays_predictions()`, overlapping columns (`GAME_ID`, `TEAM_ID`, `YAHOO_POSITION`, `YAHOO_SALARY`) are stripped from `predictions` before merging with `stats_loaders_players.df` to prevent pandas `_x` / `_y` duplicate column suffixes.
+- **Authoritative DFS Salaries & Positions**: Missing or placeholder (`-999.0` / `<= 0`) salaries and unmapped positions in `predictions` are authoritatively resolved using the downloaded Yahoo `teams_template`. Positions are mapped to integer codes (`POSITION_TO_NUM`) and unmapped fallback positions are handled gracefully.
 
 ## Data Consistency & Validation Guidelines
 

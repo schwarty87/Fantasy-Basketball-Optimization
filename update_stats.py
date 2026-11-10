@@ -3,10 +3,12 @@ import logging
 import pandas as pd
 from utils import (
     define_logger,
+    get_current_date,
     get_current_season,
     load_and_cache_players_list,
     scrape_season_schedules,
     update_dir_name,
+    update_todays_schedule_from_scoreboard,
 )
 from data_collectors.stats_loaders import StatsLoaderTeams, StatsLoaderPlayers
 from calc_features import CalcFeatures
@@ -36,6 +38,7 @@ def update_all_stats(
     if update_schedules and not player_only:
         logging.info(f'Updating season schedules for season {target_season}...')
         scrape_season_schedules(target_season, save_dir=update_dir_name('season_schedules'))
+        update_todays_schedule_from_scoreboard(date=get_current_date(), season=target_season)
 
     if not team_only and players_list is None:
         logging.info(f'Loading active players list for season {target_season}...')
@@ -78,6 +81,8 @@ if __name__ == '__main__':
                         help="Target NBA season year (e.g. 2026 for 2026-27). Defaults to current season.")
     parser.add_argument('--no-features', action='store_true',
                         help="Skip feature calculation after updating boxscores.")
+    parser.add_argument('--no-schedules', action='store_true',
+                        help="Skip updating season schedules.")
     parser.add_argument('--add-upcoming', action='store_true',
                         help="Include today's upcoming games in updates.")
     parser.add_argument('--team-only', action='store_true',
@@ -92,4 +97,5 @@ if __name__ == '__main__':
         add_upcoming_games=args.add_upcoming,
         team_only=args.team_only,
         player_only=args.player_only,
+        update_schedules=not args.no_schedules,
     )

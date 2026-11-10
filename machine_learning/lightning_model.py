@@ -81,6 +81,11 @@ class MachineLearningLightningModule(pl.LightningModule):
         else:
             self.metrics = None
 
+        if self.metrics is not None:
+            self.train_metrics = copy.deepcopy(self.metrics)
+        else:
+            self.train_metrics = None
+
     def setup(self, stage: Optional[str] = None):
         super().setup(stage=stage)
         for fn in (self.loss_function, self.val_loss_function, self.test_loss_function):
@@ -88,6 +93,8 @@ class MachineLearningLightningModule(pl.LightningModule):
                 fn.to(self.device)
         if self.metrics is not None and hasattr(self.metrics, "to"):
             self.metrics.to(self.device)
+        if self.train_metrics is not None and hasattr(self.train_metrics, "to"):
+            self.train_metrics.to(self.device)
 
     def to(self, *args, **kwargs):
         res = super().to(*args, **kwargs)
@@ -96,6 +103,8 @@ class MachineLearningLightningModule(pl.LightningModule):
                 fn.to(*args, **kwargs)
         if self.metrics is not None and hasattr(self.metrics, "to"):
             self.metrics.to(*args, **kwargs)
+        if self.train_metrics is not None and hasattr(self.train_metrics, "to"):
+            self.train_metrics.to(*args, **kwargs)
         return res
 
     @classmethod
@@ -135,6 +144,9 @@ class MachineLearningLightningModule(pl.LightningModule):
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         _, all_tensors = self._prepare_all_tensors(batch)
         total_loss = self.loss_function(all_tensors=all_tensors)
+        if self.train_metrics is not None:
+            with torch.no_grad():
+                self.train_metrics(all_tensors=all_tensors)
         batch_size = self._get_batch_size(batch)
 
         self.log(
@@ -203,6 +215,10 @@ class MachineLearningLightningModule(pl.LightningModule):
             self.loss_function.summarize()
             self._log_nested_dict("train", self.loss_function.get_logs(), on_step=False, on_epoch=True)
             self.loss_function.reset()
+        if self.train_metrics is not None:
+            self.train_metrics.summarize()
+            self._log_nested_dict("train", self.train_metrics.get_logs(), on_step=False, on_epoch=True)
+            self.train_metrics.reset()
 
     def on_validation_epoch_end(self):
         loss_fn = self.val_loss_function if self.val_loss_function is not None else self.loss_function
@@ -214,6 +230,8 @@ class MachineLearningLightningModule(pl.LightningModule):
                 self.val_loss_function.reset()
             if self.metrics is not None:
                 self.metrics.reset()
+            if self.train_metrics is not None:
+                self.train_metrics.reset()
             return
 
         eval_logs = {}

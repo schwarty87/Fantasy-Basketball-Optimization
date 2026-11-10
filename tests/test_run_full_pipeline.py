@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 import pandas as pd
+import numpy as np
 import pytz
 
 from run_full_pipeline import RunFullPipeline
@@ -147,6 +148,7 @@ class TestRunFullPipeline(unittest.TestCase):
         result = RunFullPipeline._browser_profile_path()
         self.assertTrue(result is None or isinstance(result, str))
 
+    @patch("run_full_pipeline.update_todays_schedule_from_scoreboard")
     @patch("run_full_pipeline.scrape_season_schedules")
     @patch("run_full_pipeline.load_and_cache_players_list")
     @patch("run_full_pipeline.RunModelFantasyBasketballPredictions")
@@ -156,7 +158,8 @@ class TestRunFullPipeline(unittest.TestCase):
         mock_load_params,
         mock_run_model_cls,
         mock_load_players,
-        mock_scrape_schedules
+        mock_scrape_schedules,
+        mock_update_scoreboard,
     ):
         """Verify run_once_per_day executes data collection, feature calculation, and model training in order."""
         pipeline = RunFullPipeline(
@@ -195,6 +198,7 @@ class TestRunFullPipeline(unittest.TestCase):
 
         # Assert correct flow
         mock_scrape_schedules.assert_called_once()
+        mock_update_scoreboard.assert_called_once_with(date=today, season=pipeline.season)
         mock_load_players.assert_called_once_with(season=pipeline.season)
         pipeline.stats_loaders_players.call.assert_called_once_with(
             players_list=mock_players, add_upcoming_games=False
@@ -204,6 +208,82 @@ class TestRunFullPipeline(unittest.TestCase):
             players_list=mock_players, add_upcoming_games=False
         )
         mock_runner.train.assert_called_once()
+
+    @patch("run_full_pipeline.RunFullPipeline.run_full_pipeline")
+    @patch("run_full_pipeline.RunFullPipeline.run_once_per_day")
+    def test_run_once_cli_flow(self, mock_ropd, mock_rfp):
+        """Verify RunFullPipeline handles run_once flow by executing pipeline once and exiting."""
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=1,
+            run_immediately=True,
+            initialize_daily_job=False
+        )
+        pipeline.run_full_pipeline()
+        mock_rfp.assert_called_once()
+
+    @patch("run_full_pipeline.get_next_game_time")
+    def test_get_todays_predictions_avoids_salary_column_collision(self, mock_cutoff):
+        """Verify _get_todays_predictions does not crash with KeyError: 'YAHOO_SALARY' when columns overlap."""
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=1,
+            run_immediately=True,
+            initialize_daily_job=False
+        )
+        today = get_current_date()
+        pipeline._run_date = today
+
+        # Mock predict returning metadata containing YAHOO_POSITION and YAHOO_SALARY (e.g. -999)
+        mock_preds = pd.DataFrame({
+            "DATE": [today, today],
+            "PLAYER_ID": [101, 102],
+            "CollectTruePredictedOutputsParamsFantasyBasketballPredictions_YAHOO_POINTS": [30.0, 45.0],
+            "CollectTruePredictedOutputsParamsFantasyBasketballPredictions_YAHOO_POSITION": [1.0, 2.0],
+            "CollectTruePredictedOutputsParamsFantasyBasketballPredictions_YAHOO_SALARY": [-999.0, -999.0],
+            "split_type": ["TRAIN", "TRAIN"],
+        })
+        pipeline.train_nn = MagicMock()
+        pipeline.train_nn._change_metrics_params_tuple_to_per_sample = MagicMock(return_value=())
+        pipeline.train_nn.params.training_params.metrics_params = ()
+        pipeline.train_nn.params.training_params.loss_params = ()
+        pipeline.train_nn.predict = MagicMock(return_value=mock_preds)
+
+        # Mock stats_loaders_players.df also containing YAHOO_POSITION and YAHOO_SALARY
+        pipeline.stats_loaders_players.df = pd.DataFrame({
+            "DATE": [today, today],
+            "PLAYER_ID": [101, 102],
+            "GAME_ID": [10001, 10001],
+            "TEAM_ID": [1610612738, 1610612744],
+            "YAHOO_POSITION": ["PG", "SG"],
+            "YAHOO_SALARY": [np.nan, np.nan],
+        })
+        pipeline.stats_loaders_players.get_player_name_to_id = MagicMock(return_value={
+            "Stephen Curry": 101,
+            "Klay Thompson": 102,
+        })
+
+        # Mock teams_template from Yahoo
+        mock_template = pd.DataFrame({
+            "Name": ["Stephen Curry", "Klay Thompson"],
+            "Position": ["PG", "SG"],
+            "Salary": [45, 25],
+            "Time": [datetime.datetime.now(NY_TZ) + datetime.timedelta(hours=2)] * 2,
+        })
+
+        # Future cutoff time
+        mock_cutoff.return_value = datetime.datetime.now(NY_TZ) - datetime.timedelta(hours=1)
+        pipeline._add_game_times_to_df = MagicMock(side_effect=lambda df, **kwargs: df.assign(
+            GAME_DATE_TIME=datetime.datetime.now(NY_TZ) + datetime.timedelta(hours=2)
+        ))
+
+        result = pipeline._get_todays_predictions(teams_template=mock_template)
+
+        self.assertIn("YAHOO_SALARY", result.columns)
+        self.assertNotIn("YAHOO_SALARY_x", result.columns)
+        self.assertNotIn("YAHOO_SALARY_y", result.columns)
+        self.assertEqual(result.loc[result["PLAYER_ID"] == 101, "YAHOO_SALARY"].values[0], 45.0)
+        self.assertEqual(result.loc[result["PLAYER_ID"] == 102, "YAHOO_SALARY"].values[0], 25.0)
+        self.assertEqual(result.loc[result["PLAYER_ID"] == 101, "YAHOO_POSITION"].values[0], 1)
+        self.assertEqual(result.loc[result["PLAYER_ID"] == 102, "YAHOO_POSITION"].values[0], 2)
 
 
 if __name__ == "__main__":

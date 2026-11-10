@@ -5,7 +5,7 @@ import glob
 import logging
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Union, List, Tuple
+from typing import Optional, Dict, Union, List, Tuple, Any
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
@@ -60,7 +60,7 @@ class SubmitDFSTeamYahooByCSV:
             return
 
         logging.info('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-        has_contest_inds = self.template['Contest ID'].apply(lambda x: isinstance(x, int))
+        has_contest_inds = self.template['Contest ID'].apply(self._is_valid_contest_id)
         template_str = f'template after downloading:\n{self.template.loc[has_contest_inds, ["Contest ID"] + self._positions].to_string()}'
         template_str = remove_accents(template_str)
         logging.info(template_str)
@@ -75,8 +75,18 @@ class SubmitDFSTeamYahooByCSV:
             self.template.loc[has_id, ['ID + Name', 'Name']].set_index('ID + Name').iloc[:, 0].to_dict()
         self.name_to_id = {v: k for k, v in self.id_to_name.items()}
 
-        self.contest_ids = [contest_id for contest_id in self.template['Contest ID'].unique() if
-                            isinstance(contest_id, int)]
+        self.contest_ids = [
+            int(contest_id) for contest_id in self.template['Contest ID'].unique()
+            if self._is_valid_contest_id(contest_id)
+        ]
+
+    @staticmethod
+    def _is_valid_contest_id(val: Any) -> bool:
+        if isinstance(val, (int, np.integer)):
+            return int(val) > 0
+        if isinstance(val, (float, np.floating)):
+            return not np.isnan(val) and int(val) > 0
+        return False
 
     @staticmethod
     def _submitted_teams_dir() -> str:
@@ -271,19 +281,41 @@ class SubmitDFSTeamYahooByCSV:
             if hasattr(self, 'driver') and self.driver:
                 self.driver.quit()
 
-        # remove the row with the dfs league
-        dfs_league_row = template['Contest Title'].str.contains('NBA Free 6-Team 155-Round League Round')
-        if dfs_league_row.any():
-            cols = template.loc[:, :' '].columns
-            i = dfs_league_row[dfs_league_row].index[0]
-            template.loc[i: template.index[-2], cols] = template.loc[i + 1: template.index[-1], cols].values
+        return self._filter_excluded_contests(template, contest_positions=self._positions)
 
-        # # remove the row with the dfs league
-        # dfs_league_row = template['Contest Title'].str.contains('dfs league 2025-26')
-        # if dfs_league_row.any():
-        #     cols = template.loc[:, :' '].columns
-        #     i = dfs_league_row[dfs_league_row].index[0]
-        #     template.loc[i: template.index[-2], cols] = template.loc[i + 1: template.index[-1], cols].values
+    @classmethod
+    def _filter_excluded_contests(cls, template: pd.DataFrame, excluded_patterns: Optional[List[str]] = None,
+                                  contest_positions: Optional[List[str]] = None) -> pd.DataFrame:
+        """Filter out contests from private leagues by shifting subsequent contest rows up."""
+        if excluded_patterns is None:
+            excluded_patterns = [
+                'DFS league 2026-27',
+                'dfs league 2025-26',
+                'NBA Free 6-Team 155-Round League Round',
+            ]
+        if 'Contest Title' not in template.columns:
+            return template
+
+        if ' ' in template.columns:
+            cols = template.loc[:, :' '].columns
+        else:
+            positions = contest_positions or DFS_POSITIONS[Sites.YAHOO]
+            contest_cols = ['Entry ID', 'Contest ID', 'Contest Title', 'Contest Entry Fee'] + positions
+            cols = [c for c in contest_cols if c in template.columns]
+
+        pattern = '|'.join(excluded_patterns)
+        while True:
+            matches = template['Contest Title'].astype(str).str.contains(pattern, case=False, na=False)
+            if not matches.any():
+                break
+            idx = matches[matches].index[0]
+            matched_title = template.loc[idx, 'Contest Title']
+            logging.info(f"Filtering out contest at row {idx} matching excluded league pattern: '{matched_title}'")
+            if len(template) > 1:
+                template.loc[idx: template.index[-2], cols] = template.loc[idx + 1: template.index[-1], cols].values
+                template.loc[template.index[-1], cols] = np.nan
+            else:
+                template.loc[idx, cols] = np.nan
 
         return template
 
@@ -464,7 +496,7 @@ class SubmitDFSTeamYahooByCSV:
             logging.info('<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
 
             logging.info('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-            has_contest_inds = self.template['Contest ID'].apply(lambda x: isinstance(x, int))
+            has_contest_inds = self.template['Contest ID'].apply(self._is_valid_contest_id)
             template_str = f'template after submitting:\n{self.template.loc[has_contest_inds, ["Contest ID"] + self._positions].to_string()}'
             template_str = remove_accents(template_str)
             logging.info(template_str)

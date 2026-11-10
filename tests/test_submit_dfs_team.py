@@ -54,6 +54,43 @@ class TestSubmitDFSTeamYahooByCSV(unittest.TestCase):
         with self.assertRaises(KeyError):
             SubmitDFSTeamYahooByCSV._id_to_value(lookup, "99999")
 
+    def test_is_valid_contest_id(self):
+        """Verify _is_valid_contest_id accepts positive integers and floats, rejecting NaNs and non-positives."""
+        self.assertTrue(SubmitDFSTeamYahooByCSV._is_valid_contest_id(15935109))
+        self.assertTrue(SubmitDFSTeamYahooByCSV._is_valid_contest_id(np.int64(15935109)))
+        self.assertTrue(SubmitDFSTeamYahooByCSV._is_valid_contest_id(15935109.0))
+        self.assertFalse(SubmitDFSTeamYahooByCSV._is_valid_contest_id(np.nan))
+        self.assertFalse(SubmitDFSTeamYahooByCSV._is_valid_contest_id(0))
+        self.assertFalse(SubmitDFSTeamYahooByCSV._is_valid_contest_id(-1))
+        self.assertFalse(SubmitDFSTeamYahooByCSV._is_valid_contest_id("invalid"))
+
+    def test_filter_dfs_league_contests(self):
+        """Verify private DFS league contests (e.g. 'DFS league 2026-27') are filtered out of template."""
+        left_cols = ['Entry ID', 'Contest ID', 'Contest Title', 'Contest Entry Fee', 'PG', 'SG', 'G', 'SF', 'PF', 'F', 'C', 'UTIL', ' ']
+        right_cols = ['ID', 'First Name', 'Last Name', 'Position', 'Salary', 'Time']
+        cols = left_cols + right_cols
+
+        mock_template = pd.DataFrame(index=range(4), columns=cols)
+        mock_template.loc[0, 'Contest ID'] = 15935109
+        mock_template.loc[0, 'Contest Title'] = 'NBA $5K Baller'
+        mock_template.loc[1, 'Contest ID'] = 15935799
+        mock_template.loc[1, 'Contest Title'] = 'DFS league 2026-27 Round 1'
+
+        mock_template.loc[0:3, 'ID'] = ['101', '102', '103', '104']
+        mock_template.loc[0:3, 'First Name'] = ['Player', 'Player', 'Player', 'Player']
+        mock_template.loc[0:3, 'Last Name'] = ['One', 'Two', 'Three', 'Four']
+        mock_template.loc[0:3, 'Position'] = ['PG', 'SG', 'SF', 'PF']
+        mock_template.loc[0:3, 'Salary'] = [20, 25, 30, 35]
+
+        filtered = SubmitDFSTeamYahooByCSV._filter_excluded_contests(mock_template)
+
+        # Contest 0 ('NBA $5K Baller') should remain, contest 1 ('DFS league 2026-27') should be removed
+        self.assertEqual(filtered.loc[0, 'Contest ID'], 15935109)
+        self.assertTrue(pd.isna(filtered.loc[1, 'Contest ID']))
+
+        # Verify player list on right side is completely unharmed
+        self.assertEqual(list(filtered['ID'].dropna()), ['101', '102', '103', '104'])
+
 
 if __name__ == '__main__':
     unittest.main()

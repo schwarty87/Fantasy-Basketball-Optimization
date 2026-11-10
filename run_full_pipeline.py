@@ -3,14 +3,16 @@ import logging
 import os
 import shutil
 import time
+from typing import Any
 import pandas as pd
+import numpy as np
 from datetime import timedelta
 from data_collectors.stats_loaders import StatsLoaderPlayers, StatsLoaderTeams
 from calc_features import CalcFeatures
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
 from utils import add_missing_points_columns_to_predictions, get_current_time, define_logger, load_schedule, \
     get_current_date, load_and_cache_players_list, scrape_season_schedules, get_next_game_time, update_dir_name, DATA_DIR, \
-    get_current_season, add_game_times_to_df
+    get_current_season, add_game_times_to_df, update_todays_schedule_from_scoreboard
 from submit_dfs_team import SubmitDFSTeamYahooByCSV
 from update_stats import update_all_stats
 from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM, get_browser_profile_path
@@ -26,7 +28,7 @@ class RunFullPipeline:
                  run_date: datetime.date | str = get_current_date(),
                  headless: bool = True, minutes_before_game_to_run: int = 10,
                  params_update_dict: dict | None = None, run_immediately: bool = False,
-                 initialize_daily_job: bool = True):
+                 initialize_daily_job: bool = True, force_retrain: bool = False):
         """
         Run everything we need to continuously update stats, train new models, predict/create teams and submit them
         continuously
@@ -38,6 +40,7 @@ class RunFullPipeline:
         :param run_immediately: if True, don't wait for the game times to run. Should only be true when debugging
         :param params_update_dict: data to update params with
         :param initialize_daily_job: if True, initialize today's schedule and daily run via _reset()
+        :param force_retrain: if True, retrain today's model even if already trained
         """
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
                       filename=os.path.join(DATA_DIR, 'logs', f"logs_{get_current_date()}.txt"), print_to_console=True, filemode='a')
@@ -46,6 +49,7 @@ class RunFullPipeline:
         self.headless = headless
         self.minutes_before_game_to_run = minutes_before_game_to_run
         self._run_immediately = run_immediately
+        self.force_retrain = force_retrain
 
         models_base = os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models')
         if not os.path.isdir(os.path.join(models_base, str(load_params_from_model_id))):
@@ -149,6 +153,17 @@ class RunFullPipeline:
     def _add_game_times_to_df(df: pd.DataFrame, schedule: pd.DataFrame | None = None) -> pd.DataFrame:
         return add_game_times_to_df(df, schedule=schedule)
 
+    @staticmethod
+    def _parse_position(val: Any) -> int | float:
+        if pd.isna(val):
+            return np.nan
+        if isinstance(val, str):
+            first_p = val.replace('/', ',').split(',')[0].strip()
+            return POSITION_TO_NUM.get(first_p, POSITION_TO_NUM.get(val, np.nan))
+        if isinstance(val, (int, float, np.integer, np.floating)):
+            return val
+        return np.nan
+
     def _get_todays_predictions(self, teams_template: pd.DataFrame | None = None) -> pd.DataFrame:
         metrics_params = self.train_nn._change_metrics_params_tuple_to_per_sample(self.train_nn.params.training_params.metrics_params)
         loss_params = self.train_nn._change_metrics_params_tuple_to_per_sample(self.train_nn.params.training_params.loss_params)
@@ -156,40 +171,63 @@ class RunFullPipeline:
                                             loss_params=loss_params)
         predictions.rename(columns=lambda x: x.replace('CollectTruePredictedOutputsParamsFantasyBasketballPredictions_', ''),
                            inplace=True)
-        predictions = predictions.loc[predictions['DATE'] == self._run_date]
+        predictions = predictions.loc[predictions['DATE'] == self._run_date].copy()
 
-        # adding game id
-        predictions = predictions.merge(self.stats_loaders_players.df[['PLAYER_ID', 'DATE', 'GAME_ID', 'TEAM_ID',
-                                                                       'YAHOO_POSITION', 'YAHOO_SALARY']],
-                                        on=['DATE', 'PLAYER_ID'], how='left')
+        # Drop overlapping columns in predictions before merging from stats_loaders_players to prevent _x/_y collisions
+        for col in ['GAME_ID', 'TEAM_ID', 'YAHOO_POSITION', 'YAHOO_SALARY']:
+            if col in predictions.columns:
+                predictions.drop(columns=[col], inplace=True)
+
+        # Merge GAME_ID, TEAM_ID (and YAHOO_POSITION, YAHOO_SALARY if available) from stats_loaders_players
+        merge_cols = ['PLAYER_ID', 'DATE']
+        for col in ['GAME_ID', 'TEAM_ID', 'YAHOO_POSITION', 'YAHOO_SALARY']:
+            if col in self.stats_loaders_players.df.columns:
+                merge_cols.append(col)
+
+        players_df_today = self.stats_loaders_players.df[merge_cols].drop_duplicates(subset=['PLAYER_ID', 'DATE'])
+        predictions = predictions.merge(players_df_today, on=['DATE', 'PLAYER_ID'], how='left')
+
+        # Ensure YAHOO_SALARY and YAHOO_POSITION exist in predictions
+        if 'YAHOO_SALARY' not in predictions.columns:
+            predictions['YAHOO_SALARY'] = np.nan
+        if 'YAHOO_POSITION' not in predictions.columns:
+            predictions['YAHOO_POSITION'] = np.nan
+
+        # Treat placeholder/negative values (e.g. IGNORE=-999) as missing
+        predictions.loc[predictions['YAHOO_SALARY'] <= 0, 'YAHOO_SALARY'] = np.nan
 
         logging.info(f'number of players after running predictions: {predictions.shape[0]}')
 
         if teams_template is not None:
             player_name_to_id = self.stats_loaders_players.get_player_name_to_id()
             player_id_to_name = {player_id: player_name for player_name, player_id in player_name_to_id.items()}
-            prediction_names = predictions['PLAYER_ID'].replace(player_id_to_name)
-            # prediction_names2 = prediction_names.replace(FIX_PLAYER_NAMES_NBA_TO_YAHOO)
-            # in_template = prediction_names2.isin(teams_template['Name'].values)
+            prediction_names = predictions['PLAYER_ID'].map(player_id_to_name)
             in_template = prediction_names.isin(teams_template['Name'].values)
             predictions = predictions.loc[in_template].reset_index(drop=True)
 
-            # filling fantasy salaries and positions
-            if predictions['YAHOO_SALARY'].isnull().any():
-                id_to_salary = \
-                    {int(id): teams_template.loc[teams_template['Name'] == player_id_to_name[id], 'Salary'].values[0]
-                     for id in predictions['PLAYER_ID'].values}
-                predictions['YAHOO_SALARY'] = (
-                    predictions['YAHOO_SALARY'].fillna(predictions['PLAYER_ID'].replace(id_to_salary)))
-                predictions['YAHOO_SALARY'] = predictions['YAHOO_SALARY'].astype(float)
-            if predictions['YAHOO_POSITION'].isnull().any():
-                id_to_position = \
-                    {int(id): teams_template.loc[teams_template['Name'] == player_id_to_name[id], 'Position'].values[0]
-                     for id in predictions['PLAYER_ID'].values}
-                predictions['YAHOO_POSITION'] = (
-                    predictions['YAHOO_POSITION'].fillna(predictions['PLAYER_ID'].replace(id_to_position)))
-                predictions['YAHOO_POSITION'] = predictions['YAHOO_POSITION'].map(POSITION_TO_NUM)
-                predictions['YAHOO_POSITION'] = predictions['YAHOO_POSITION'].astype(int)
+            # filling fantasy salaries and positions using template as authoritative source
+            name_to_salary = dict(zip(teams_template['Name'], teams_template['Salary']))
+            id_to_salary = {
+                pid: name_to_salary.get(player_id_to_name.get(pid))
+                for pid in predictions['PLAYER_ID'].values
+                if player_id_to_name.get(pid) in name_to_salary
+            }
+            mapped_salaries = predictions['PLAYER_ID'].map(id_to_salary)
+            predictions['YAHOO_SALARY'] = mapped_salaries.fillna(predictions['YAHOO_SALARY']).astype(float)
+
+            name_to_position = dict(zip(teams_template['Name'], teams_template['Position']))
+            id_to_position = {
+                pid: name_to_position.get(player_id_to_name.get(pid))
+                for pid in predictions['PLAYER_ID'].values
+                if player_id_to_name.get(pid) in name_to_position
+            }
+            mapped_positions = predictions['PLAYER_ID'].map(id_to_position)
+            predictions['YAHOO_POSITION'] = (
+                mapped_positions.fillna(predictions['YAHOO_POSITION'])
+                .apply(self._parse_position)
+                .fillna(1)
+                .astype(int)
+            )
 
             logging.info(f'number of players after filtering with players in template: {predictions.shape[0]}')
 
@@ -197,9 +235,9 @@ class RunFullPipeline:
         predictions = self._add_game_times_to_df(predictions)
 
         # dropping players whose game time already passed
-        # cutoff_time = get_current_time() + timedelta(minutes=1 )
         cutoff_time = get_next_game_time(template=teams_template)
-        predictions = predictions.loc[predictions['GAME_DATE_TIME'] >= cutoff_time]
+        if pd.notna(cutoff_time):
+            predictions = predictions.loc[predictions['GAME_DATE_TIME'] >= cutoff_time]
 
         logging.info(f'number of players after filtering with cutoff time: {predictions.shape[0]}')
 
@@ -207,6 +245,7 @@ class RunFullPipeline:
 
     def run_once_per_day(self):
         scrape_season_schedules(self.season, save_dir=update_dir_name('season_schedules'))
+        update_todays_schedule_from_scoreboard(date=self._run_date, season=self.season)
 
         self.dates_to_game_times = self._get_game_times_by_day_dict()
 
@@ -234,10 +273,13 @@ class RunFullPipeline:
         # TODO: Future investigation: evaluate fine-tuning an existing checkpoint vs. full daily retrain.
         params_path = os.path.join(DATA_DIR, f'machine_learning_fantasy_basketball_predictions/models/{self._load_params_from_model_id}/params.json')
         params = MachineLearningParamsFantasyBasketballPredictions.load_params(params_path)
-        # params.features_params.extra_weight_on_certain_date = self._run_date
+        params.training_params.fast_dev_run = False
         params.features_params.last_month_in_train = True
         todays_model_name = 'model_' + str(self._run_date).replace('-', '_')
-        if not self._todays_model_already_trained() and self._has_games_today():
+        already_trained = self._todays_model_already_trained()
+
+        if (not already_trained or self.force_retrain) and self._has_games_today():
+            logging.info(f"Training fresh model for today ({todays_model_name})...")
             self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
             self.train_nn.train()
 
@@ -247,6 +289,13 @@ class RunFullPipeline:
             if os.path.exists(target_dir):
                 shutil.rmtree(target_dir, ignore_errors=True)
             os.rename(model_dir, target_dir)
+        elif already_trained:
+            logging.info(
+                f"Today's model '{todays_model_name}' has already been trained. "
+                f"Skipping retraining (pass --force-retrain to train from scratch)."
+            )
+        elif not self._has_games_today():
+            logging.info(f"No games scheduled for today ({self._run_date}). Skipping model training.")
 
         params.continue_model_id = todays_model_name
         self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
@@ -266,6 +315,8 @@ class RunFullPipeline:
         contest_ids = submit_teams.contest_ids
         if len(contest_ids) == 0:
             return
+
+        update_todays_schedule_from_scoreboard(date=self._run_date, season=self.season)
 
         update_all_stats(
             season=self.season,
@@ -383,20 +434,30 @@ if __name__ == '__main__':
                         help="Do not wait for 8:00 AM or game times")
     parser.add_argument('--date', type=str, default='today',
                         help="Run date (default: today)")
+    parser.add_argument('--force-retrain', action='store_true',
+                        help="Force retraining of today's model even if it was already trained")
+    parser.add_argument('--run-once', action='store_true',
+                        help="Run the pipeline once immediately to generate predictions, optimize lineups, and submit to Yahoo, then exit")
+    parser.add_argument('--no-headless', action='store_true',
+                        help="Run the browser in visible mode (default: headless)")
     args = parser.parse_args()
 
     params_update_dict = {'continue_model_name': 'extra_weight_on_ast'}
     ropd = RunFullPipeline(
         run_date=args.date,
-        headless=True,
+        headless=not args.no_headless,
         params_update_dict=params_update_dict,
-        run_immediately=args.run_immediately or args.train_only,
+        run_immediately=args.run_immediately or args.train_only or args.run_once,
         minutes_before_game_to_run=7,
         load_params_from_model_id=args.model_id,
-        initialize_daily_job=not args.train_only
+        initialize_daily_job=not args.train_only,
+        force_retrain=args.force_retrain,
     )
     if args.train_only:
         ropd.run_once_per_day()
         logging.info("Morning model training completed successfully!")
+    elif args.run_once:
+        ropd.run_full_pipeline()
+        logging.info("End-to-end pipeline execution and lineup submission completed successfully!")
     else:
         ropd.run_full_pipeline_continuously()

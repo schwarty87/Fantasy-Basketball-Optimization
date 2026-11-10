@@ -398,9 +398,9 @@ class MachineLearningDatasetMetadata(MachineLearningDatasetTabular):
                 self._features_df = self._features_df.assign(time=time_int)
 
         if 'DATE' in self.params.feature_names:
-            # count days from epoch
-            self._features_df = \
-                self._features_df.assign(DATE=pd.to_datetime(self._features_df['DATE']).astype(np.int64) / 1e9 / 86400)
+            # count days from epoch (ensuring datetime64[s] before dividing by seconds per day)
+            dt_s = pd.to_datetime(self._features_df['DATE']).astype('datetime64[s]').astype(np.int64)
+            self._features_df = self._features_df.assign(DATE=dt_s / 86400.0)
 
     @staticmethod
     def tensor_to_df(tensor: torch.Tensor, column_names: List[str]) -> pd.DataFrame:

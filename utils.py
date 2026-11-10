@@ -829,20 +829,22 @@ def sharpe(daily_account_money: pd.Series) -> float:
     return returns.mean() / returns.std() * np.sqrt(252.0)
 
 
-def add_missing_points_columns_to_predictions(predictions_df: pd.DataFrame):
-    """ add PTS and YAHOO_POINTS columns to the predictions df if they're missing. The changes are done inplace"""
+def add_missing_points_columns_to_predictions(predictions_df: pd.DataFrame, overwrite: bool = False):
+    """ add PTS and YAHOO_POINTS columns to the predictions df if they're missing or if overwrite is True. The changes are done inplace"""
     for pp in ['pred', 'true']:
-        if f'PTS_{pp}' not in predictions_df.columns and \
+        if (overwrite or f'PTS_{pp}' not in predictions_df.columns) and \
                 all([c in predictions_df.columns for c in (f'3PM_{pp}', f'2PM_{pp}', f'FTM_{pp}')]):
             predictions_df[f'PTS_{pp}'] = \
                 (predictions_df[[f'3PM_{pp}', f'2PM_{pp}', f'FTM_{pp}']] * [3., 2., 1.]).sum(axis=1)
 
-        if f'YAHOO_POINTS_{pp}' not in predictions_df.columns:
+        if (overwrite or f'YAHOO_POINTS_{pp}' not in predictions_df.columns) and \
+                all([f'{c}_{pp}' in predictions_df.columns for c in SCORING[Sites.YAHOO].keys()]):
             predictions_df[f'YAHOO_POINTS_{pp}'] = pd.concat([predictions_df[f'{c}_{pp}'] * p for c, p in
                                                               SCORING[Sites.YAHOO].items()], axis=1).sum(axis=1)
 
 
 def scrape_season_schedules(season: int | str, save_dir: str | None = None) -> None:
+    save_path = None
     if save_dir:
         if isinstance(season, str):
             season = int(season.split('-')[0])
@@ -852,33 +854,129 @@ def scrape_season_schedules(season: int | str, save_dir: str | None = None) -> N
             file_mtime = os.path.getmtime(save_path)
             current_time = time.time()
             age_seconds = current_time - file_mtime
-            if age_seconds < 30 * 60:
+            if age_seconds < 24 * 3600:
                 logging.info(f'found valid file for schedule for {season}, returning cached data')
                 return
 
     logging.info(f'scraping season schedule {season}')
-    season_schedule = load_nbacom_data(url=URLS().season_schedule(season=season),
-                                       use_header=True,
-                                       use_key='leagueSchedule')
-    season_schedule = season_schedule['gameDates']
-    season_schedule = sum([date_schedule['games'] for date_schedule in season_schedule], [])
-    season_schedule = pd.DataFrame(season_schedule)
-    season_schedule = \
-        season_schedule[['gameId', 'gameDateTimeUTC', 'homeTeam', 'awayTeam', 'postponedStatus', 'gameStatusText']]
-    season_schedule = season_schedule.assign(TEAM_ID_HOME=season_schedule['homeTeam'].apply(lambda x: x['teamId']).astype(int),
-                                             TEAM_ID_AWAY=season_schedule['awayTeam'].apply(lambda x: x['teamId']).astype(int),
-                                             )
-    season_schedule = season_schedule.loc[(season_schedule['TEAM_ID_HOME'] != 0) &
-                                          (season_schedule['TEAM_ID_AWAY'] != 0)].reset_index(drop=True)
-    season_schedule = season_schedule.loc[season_schedule['gameStatusText'] != 'TBD'].reset_index(drop=True)
-    season_schedule['GAME_DATE_TIME'] = (
-        pd.to_datetime(season_schedule['gameDateTimeUTC'], utc=True).dt.tz_convert('US/Eastern')
-    )
-    season_schedule['GAME_ID'] = season_schedule['gameId'].astype(int)
-    season_schedule.drop(columns=['homeTeam', 'awayTeam', 'gameDateTimeUTC', 'gameId'], inplace=True)
-    if save_dir is not None:
-        season_schedule.to_feather(save_path)
-        logging.info(f'saved season schedule to {save_path}')
+    try:
+        season_schedule = load_nbacom_data(url=URLS().season_schedule(season=season),
+                                           use_header=True,
+                                           use_key='leagueSchedule')
+        season_schedule = season_schedule['gameDates']
+        season_schedule = sum([date_schedule['games'] for date_schedule in season_schedule], [])
+        season_schedule = pd.DataFrame(season_schedule)
+        season_schedule = \
+            season_schedule[['gameId', 'gameDateTimeUTC', 'homeTeam', 'awayTeam', 'postponedStatus', 'gameStatusText']]
+        season_schedule = season_schedule.assign(TEAM_ID_HOME=season_schedule['homeTeam'].apply(lambda x: x['teamId']).astype(int),
+                                                 TEAM_ID_AWAY=season_schedule['awayTeam'].apply(lambda x: x['teamId']).astype(int),
+                                                 )
+        season_schedule = season_schedule.loc[(season_schedule['TEAM_ID_HOME'] != 0) &
+                                              (season_schedule['TEAM_ID_AWAY'] != 0)].reset_index(drop=True)
+        season_schedule = season_schedule.loc[season_schedule['gameStatusText'] != 'TBD'].reset_index(drop=True)
+        season_schedule['GAME_DATE_TIME'] = (
+            pd.to_datetime(season_schedule['gameDateTimeUTC'], utc=True).dt.tz_convert('US/Eastern')
+        )
+        season_schedule['GAME_ID'] = season_schedule['gameId'].astype(int)
+        season_schedule.drop(columns=['homeTeam', 'awayTeam', 'gameDateTimeUTC', 'gameId'], inplace=True)
+        if save_dir is not None:
+            season_schedule.to_feather(save_path)
+            logging.info(f'saved season schedule to {save_path}')
+    except Exception as e:
+        if save_path is not None and os.path.isfile(save_path):
+            logging.warning(
+                f"Failed to scrape season schedule for {season} from NBA.com ({e}). "
+                f"Falling back to existing cached schedule at {save_path}."
+            )
+            try:
+                os.utime(save_path, None)
+            except OSError:
+                pass
+            return
+        raise
+
+
+def update_todays_schedule_from_scoreboard(
+    date: datetime.date | str | None = None,
+    season: int | None = None,
+    schedules_dir: str = 'season_schedules',
+) -> bool:
+    """
+    Fetch live game statuses and postponements for a given date from NBA.com daily scoreboardv3
+    and update them in the cached season schedule feather file.
+    Only queries today's games (~5-10 games) instead of the entire 1,267-game season schedule.
+    Returns True if updates were applied, False otherwise.
+    """
+    if date is None:
+        target_date = get_current_date()
+    elif isinstance(date, datetime.date):
+        target_date = date
+    elif isinstance(date, str):
+        if date == 'today':
+            target_date = get_current_date()
+        else:
+            try:
+                target_date = datetime.date.fromisoformat(date)
+            except ValueError:
+                target_date = get_current_date()
+    else:
+        target_date = get_current_date()
+
+    target_season = season or get_current_season()
+    schedules_dir_path = update_dir_name(schedules_dir)
+    save_path = os.path.join(schedules_dir_path, f'{target_season}.feather')
+
+    if not os.path.isfile(save_path):
+        logging.warning(f"No cached schedule file found at {save_path} to patch from scoreboard.")
+        return False
+
+    date_str = str(target_date)
+    url = URLS().games_scoreboard_nbacom(date=date_str)
+    logging.info(f"Checking live game statuses and postponements for {date_str} via scoreboardv3...")
+    try:
+        data = load_nbacom_data(url=url, use_header=True, use_key='scoreboard')
+    except Exception as e:
+        logging.warning(f"Could not load live scoreboard from NBA.com for {date_str} ({e}). Retaining existing schedule.")
+        return False
+
+    games = data.get('games', []) if isinstance(data, dict) else []
+    if not games:
+        logging.info(f"No games found on scoreboard for {date_str}.")
+        return False
+
+    schedule_df = pd.read_feather(save_path)
+    updated = False
+
+    for game in games:
+        try:
+            gid = int(game['gameId'])
+        except (KeyError, ValueError, TypeError):
+            continue
+
+        status_text = str(game.get('gameStatusText', '')).strip()
+        is_ppd = any(kw in status_text.upper() for kw in ('PPD', 'POSTPONED'))
+        ppd_status = 'Y' if is_ppd else 'N'
+        utc_str = game.get('gameTimeUTC')
+
+        mask = schedule_df['GAME_ID'] == gid
+        if mask.any():
+            if 'gameStatusText' in schedule_df.columns:
+                schedule_df.loc[mask, 'gameStatusText'] = status_text
+            if 'postponedStatus' in schedule_df.columns:
+                schedule_df.loc[mask, 'postponedStatus'] = ppd_status
+            if utc_str:
+                try:
+                    game_dt = pd.to_datetime(utc_str, utc=True).dt.tz_convert('US/Eastern') if hasattr(pd.to_datetime(utc_str, utc=True), 'dt') else pd.to_datetime(utc_str, utc=True).tz_convert('US/Eastern')
+                    schedule_df.loc[mask, 'GAME_DATE_TIME'] = game_dt
+                except Exception:
+                    pass
+            updated = True
+
+    if updated:
+        schedule_df.to_feather(save_path)
+        logging.info(f"Successfully updated live statuses for {len(games)} games on {date_str} in {save_path}")
+
+    return updated
 
 
 def get_current_time(tz=NY_TZ, return_date: bool = False) -> datetime.date | datetime.datetime:
@@ -939,7 +1037,10 @@ def load_schedule(schedules_dir: str = 'season_schedules', drop_ppd: bool = True
     schedule.sort_values(['DATE', 'GAME_TIME', 'GAME_ID', 'HOME'], inplace=True)
 
     if drop_ppd:
-        schedule = schedule.loc[schedule['gameStatusText'] != 'PPD']
+        if 'postponedStatus' in schedule.columns:
+            schedule = schedule.loc[schedule['postponedStatus'] != 'Y']
+        if 'gameStatusText' in schedule.columns:
+            schedule = schedule.loc[~schedule['gameStatusText'].str.contains('PPD|Postponed', case=False, na=False)]
 
     return schedule
 
@@ -1184,6 +1285,10 @@ def update_dir_name(dir_name: str) -> str:
     Root-level data categories (e.g. 'stats', 'season_schedules', 'features')
     live directly under DATA_DIR.
     """
+    if os.path.isabs(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
+        return dir_name
+
     clean_name = dir_name.replace('\\', '/').strip('/')
     cached_subdirs = {
         'starters',

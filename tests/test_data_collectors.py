@@ -1,10 +1,13 @@
 import os
 import datetime
 import json
+import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
+import requests
 from constants import DATA_DIR
 
 from bs4 import BeautifulSoup
@@ -18,7 +21,8 @@ from data_collectors.fantasy_data import LoadFantasyData
 from utils import (read_and_cache, fetch_soup, parse_html_table, fetch_html_table,
                    get_current_season, season_int_to_str, date_to_season_str, assert_valid_df_all,
                    add_game_times_to_df, load_and_cache_players_list, date_to_game_ids,
-                   update_dir_name)
+                   update_dir_name, scrape_season_schedules, update_todays_schedule_from_scoreboard,
+                   load_schedule)
 from run_full_pipeline import RunFullPipeline
 
 
@@ -1204,6 +1208,141 @@ class TestDataCollectors(unittest.TestCase):
                 has_2025_autumn = any("2025_10_" in f or "2025_11_" in f for f in files)
                 self.assertTrue(has_2025_spring, f"Missing 2025 spring historical data in {cat}")
                 self.assertTrue(has_2025_autumn, f"Missing 2025 autumn data in {cat}")
+
+    # -------------------------------------------------------------------------
+    # 21. Season Schedules - Resilient Fallback Tests
+    # -------------------------------------------------------------------------
+    @patch("utils.load_nbacom_data")
+    def test_scrape_season_schedules_fresh_cache(self, mock_load):
+        """Verify scrape_season_schedules does not make network calls if cache is younger than 24h."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "2026.feather")
+            pd.DataFrame({"test": [1]}).to_feather(save_path)
+            # mtime is now, which is < 24h
+            scrape_season_schedules(2026, save_dir=tmpdir)
+            mock_load.assert_not_called()
+
+    @patch("utils.load_nbacom_data")
+    def test_scrape_season_schedules_fallback_on_network_error(self, mock_load):
+        """Verify scrape_season_schedules falls back to existing cached file on network exception."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "2026.feather")
+            pd.DataFrame({"test": [1]}).to_feather(save_path)
+            # Backdate mtime by 2 days so it attempts to refresh
+            old_time = time.time() - (48 * 3600)
+            os.utime(save_path, (old_time, old_time))
+
+            mock_load.side_effect = requests.exceptions.ReadTimeout("Timeout")
+            # Should not raise exception because save_path exists
+            scrape_season_schedules(2026, save_dir=tmpdir)
+            mock_load.assert_called_once()
+
+    @patch("utils.load_nbacom_data")
+    def test_scrape_season_schedules_raises_when_no_cache(self, mock_load):
+        """Verify scrape_season_schedules re-raises exception when network fails and no cached file exists."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mock_load.side_effect = requests.exceptions.ReadTimeout("Timeout")
+            with self.assertRaises(requests.exceptions.ReadTimeout):
+                scrape_season_schedules(2026, save_dir=tmpdir)
+
+    # -------------------------------------------------------------------------
+    # 22. Live Daily Scoreboard - Postponement & Time Shift Tests
+    # -------------------------------------------------------------------------
+    @patch("utils.load_nbacom_data")
+    def test_update_todays_schedule_from_scoreboard_postponed_game(self, mock_load):
+        """Verify live scoreboard marks postponed games as PPD and load_schedule drops them."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sched_df = pd.DataFrame({
+                "postponedStatus": ["N"],
+                "gameStatusText": ["7:00 pm ET"],
+                "TEAM_ID_HOME": [1610612741],
+                "TEAM_ID_AWAY": [1610612755],
+                "GAME_DATE_TIME": [pd.to_datetime("2026-11-08 19:00:00-05:00")],
+                "GAME_ID": [22600196],
+            })
+            save_path = os.path.join(tmpdir, "2026.feather")
+            sched_df.to_feather(save_path)
+
+            mock_load.return_value = {
+                "games": [
+                    {
+                        "gameId": "0022600196",
+                        "gameStatusText": "PPD",
+                        "gameStatus": 1,
+                        "gameTimeUTC": "2026-11-09T00:00:00Z",
+                    }
+                ]
+            }
+
+            result = update_todays_schedule_from_scoreboard(date="2026-11-08", season=2026, schedules_dir=tmpdir)
+            self.assertTrue(result)
+
+            updated_df = pd.read_feather(save_path)
+            self.assertEqual(updated_df.loc[0, "postponedStatus"], "Y")
+            self.assertEqual(updated_df.loc[0, "gameStatusText"], "PPD")
+
+            # Verify load_schedule drops the PPD game
+            loaded = load_schedule(schedules_dir=tmpdir, drop_ppd=True)
+            self.assertEqual(len(loaded), 0)
+
+    @patch("utils.load_nbacom_data")
+    def test_update_todays_schedule_from_scoreboard_time_shift(self, mock_load):
+        """Verify live scoreboard updates tip-off time when game start time changes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sched_df = pd.DataFrame({
+                "postponedStatus": ["N"],
+                "gameStatusText": ["7:00 pm ET"],
+                "TEAM_ID_HOME": [1610612741],
+                "TEAM_ID_AWAY": [1610612755],
+                "GAME_DATE_TIME": [pd.to_datetime("2026-11-08 19:00:00-05:00")],
+                "GAME_ID": [22600196],
+            })
+            save_path = os.path.join(tmpdir, "2026.feather")
+            sched_df.to_feather(save_path)
+
+            mock_load.return_value = {
+                "games": [
+                    {
+                        "gameId": "0022600196",
+                        "gameStatusText": "8:30 pm ET",
+                        "gameStatus": 1,
+                        "gameTimeUTC": "2026-11-09T01:30:00Z",
+                    }
+                ]
+            }
+
+            result = update_todays_schedule_from_scoreboard(date="2026-11-08", season=2026, schedules_dir=tmpdir)
+            self.assertTrue(result)
+
+            updated_df = pd.read_feather(save_path)
+            self.assertEqual(updated_df.loc[0, "gameStatusText"], "8:30 pm ET")
+            self.assertEqual(updated_df.loc[0, "postponedStatus"], "N")
+            self.assertEqual(updated_df.loc[0, "GAME_DATE_TIME"].hour, 20)
+            self.assertEqual(updated_df.loc[0, "GAME_DATE_TIME"].minute, 30)
+
+    @patch("utils.load_nbacom_data")
+    def test_update_todays_schedule_from_scoreboard_network_failure(self, mock_load):
+        """Verify network errors on scoreboard query are safely handled without corrupting schedule."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sched_df = pd.DataFrame({
+                "postponedStatus": ["N"],
+                "gameStatusText": ["7:00 pm ET"],
+                "TEAM_ID_HOME": [1610612741],
+                "TEAM_ID_AWAY": [1610612755],
+                "GAME_DATE_TIME": [pd.to_datetime("2026-11-08 19:00:00-05:00")],
+                "GAME_ID": [22600196],
+            })
+            save_path = os.path.join(tmpdir, "2026.feather")
+            sched_df.to_feather(save_path)
+
+            mock_load.side_effect = requests.exceptions.ReadTimeout("Timeout")
+            result = update_todays_schedule_from_scoreboard(date="2026-11-08", season=2026, schedules_dir=tmpdir)
+            self.assertFalse(result)
+
+            # Schedule remains intact
+            intact_df = pd.read_feather(save_path)
+            self.assertEqual(len(intact_df), 1)
+            self.assertEqual(intact_df.loc[0, "postponedStatus"], "N")
 
 
 if __name__ == "__main__":
