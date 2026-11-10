@@ -7,6 +7,17 @@
 - **Purpose**: Incorporate the latest game results and apply extra weights on players who have scheduled games today so the model specializes on active players.
 - **Do NOT "optimize away" daily retraining**: Retraining from scratch each morning when `_todays_model_already_trained()` is false is the expected design behavior, not an issue or oversight.
 - **Future Investigation**: There is an open investigation to explore fine-tuning from the previous day's checkpoint rather than retraining from scratch, but full retraining remains the default until empirical tests are completed.
+- **Model Validation & Fallback Safety**:
+  - `_is_valid_trained_model_dir()` validates that a model directory contains `params.json`, weights (`model.pt` or `*.ckpt`), target scalers (`scalers/true_label.pkl`), and encoders (`categorical_encoder/embedding_features.pkl`).
+  - If training today's model fails or produces an incomplete directory, the failed temporary directory is deleted (never deleting base models like `models/0`), and the pipeline safely falls back to the latest valid `model_YYYY_MM_DD` (or base model `0`) while reloading its schema-matched `params.json` with `last_month_in_train = True`.
+  - Redundant retraining inside `run_full_pipeline()` prior to game tip-off is omitted, preserving `run_once_per_day()` as the single retraining source of truth.
+
+### Embeddings & Unknown Category Zero-Padding
+- `CustomOrdinalEncoder` with `handle_unknown='use_encoded_value'` assigns unseen categories the integer index `len(categories)`.
+- `EmbeddingsLayer` allocates `num_unique_values = len(categories) + 1` embedding rows and configures `padding_idx = len(categories)`. Unseen players or teams automatically map to frozen `0.0` vectors with zero gradients, preventing index errors.
+
+### Feature NaN Filtering & Undrafted Rookies
+- In `CalcFeatures._drop_nans()`, `YEARS_SINCE_DRAFT` is intentionally excluded from the required non-null check columns so that undrafted rookies (with `NaN` draft years) are retained in the feature set.
 
 ### Shared Stats & Feature Pipeline (`update_stats.py` & `run_full_pipeline.py`)
 - **Single Source of Truth**: All stats data fetching (season schedules, team boxscores, player boxscores, and calculated features) is standardized in `update_all_stats()` in `update_stats.py`.
