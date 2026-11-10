@@ -3,6 +3,7 @@ import contextlib
 import copy
 import logging
 import torch
+import torch.nn as nn
 import numpy as np
 import traceback
 import pandas as pd
@@ -207,6 +208,12 @@ class RunModel:
         else:
             if self.params.continue_model_id is not None:
                 self.model = ModelCheckpoint.load_model(os.path.join(self._continue_model_dir, 'model.pt'))
+                if self.model is not None and hasattr(self.model, "modules"):
+                    for m in self.model.modules():
+                        if isinstance(m, nn.Embedding) and m.padding_idx is None and m.num_embeddings > 0:
+                            m.padding_idx = m.num_embeddings - 1
+                            with torch.no_grad():
+                                m.weight[m.padding_idx].zero_()
             else:
                 try:
                     self.model = model_cls(

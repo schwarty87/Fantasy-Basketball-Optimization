@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 
 from calc_features import CalcFeatures, COUNTING_STATS
@@ -25,7 +26,9 @@ from machine_learning.params.machine_learning_dataset_params import (
     MachineLearningDatasetTabularScalingParams,
 )
 from machine_learning.params.params import MachineLearningParams, FeaturesParams
+from machine_learning.run_model import RunModel
 from machine_learning.utils import CustomOrdinalEncoder
+from machine_learning_fantasy_basketball_predictions.lightning_model import FantasyBasketballLightningModule
 from machine_learning_fantasy_basketball_predictions.params.params import (
     MachineLearningParamsFantasyBasketballPredictions,
 )
@@ -34,6 +37,15 @@ from machine_learning_fantasy_basketball_predictions.run_model import (
 )
 from run_full_pipeline import RunFullPipeline
 from utils import get_current_date
+
+
+class DummyLegacyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(5, 4)
+        self.emb.padding_idx = None
+        with torch.no_grad():
+            self.emb.weight.fill_(1.0)  # Row 4 is 1.0 initially
 
 
 class TestPR1ReliabilityAndEmbeddings(unittest.TestCase):
@@ -347,6 +359,86 @@ class TestPR1ReliabilityAndEmbeddings(unittest.TestCase):
         self.assertEqual(len(cf.updates_df), 1)
         self.assertEqual(cf.updates_df.iloc[0]["PLAYER_ID"], 201)
         self.assertTrue(pd.isna(cf.updates_df.iloc[0]["YEARS_SINCE_DRAFT"]))
+
+    def test_collect_outputs_supports_explicit_valid_scaler_dir_when_model_dir_is_none(self):
+        """Verify CollectTruePredictedOutputs accepts existing directory in params.scaler_dir when model_dir is None."""
+        scalers_dir = os.path.join(self.temp_dir, "custom_scalers")
+        os.makedirs(scalers_dir, exist_ok=True)
+        params = CollectTruePredictedOutputsParams(
+            scaler_dir=scalers_dir,
+            tensor_names_true=["true_label"],
+            tensor_names_pred=["true_label_pred"],
+        )
+        cb = CollectTruePredictedOutputs(params=params, model_dir=None)
+        resolved = cb._resolve_scaler_dir()
+        self.assertEqual(resolved, scalers_dir)
+
+    def test_lightning_format_predictions_fails_fast_when_scaler_missing(self):
+        """Verify FantasyBasketballLightningModule.format_predictions raises FileNotFoundError when scaler is missing."""
+        mock_params = MagicMock()
+        mock_params.features_params.feature_name_to_machine_learning_dataset_params = {
+            "true_label": MachineLearningDatasetTabularScalingParams(feature_names=["YAHOO_POINTS"])
+        }
+        empty_scaler_dir = os.path.join(self.temp_dir, "empty_scalers")
+        os.makedirs(empty_scaler_dir, exist_ok=True)
+
+        module = MagicMock(spec=FantasyBasketballLightningModule)
+        module.params = mock_params
+        module.scaler_dir = empty_scaler_dir
+        module._target_scaler = None
+        module._load_target_scaler = MagicMock(return_value=None)
+
+        with self.assertRaises(FileNotFoundError) as cm:
+            FantasyBasketballLightningModule.format_predictions(module, predict_batches=[])
+        self.assertIn("Target scaler true_label.pkl not found", str(cm.exception))
+
+    def test_run_model_create_data_loaders_asserts_transformers_complete(self):
+        """Verify RunModel.create_data_loaders calls assert_transformers_complete and fails on missing scaler."""
+        checkpoint_dir = os.path.join(self.temp_dir, "ckpt_missing_scalers")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(os.path.join(checkpoint_dir, "scalers"), exist_ok=True)
+        os.makedirs(os.path.join(checkpoint_dir, "categorical_encoder"), exist_ok=True)
+
+        class TestRunner(RunModel):
+            def __init__(self):
+                pass
+
+        runner = TestRunner()
+        runner.params = MagicMock()
+        runner.params.continue_model_id = "test_ckpt"
+        runner._continue_model_dir = checkpoint_dir
+        runner.use_lightning = False
+        runner.params.features_params = FeaturesParams(
+            feature_name_to_machine_learning_dataset_params={
+                "tabular": MachineLearningDatasetTabularScalingParams(feature_names=["PTS"]),
+            }
+        )
+
+        with self.assertRaises(FileNotFoundError) as cm:
+            runner.create_data_loaders()
+        self.assertIn("Missing scalers for datasets", str(cm.exception))
+
+    def test_loaded_legacy_model_acquires_padding_idx_and_zeroes_row(self):
+        """Verify that loading a model with legacy EmbeddingsLayer (padding_idx=None) retrofits padding_idx and zeroes row."""
+        model_path = os.path.join(self.temp_dir, "dummy_model.pt")
+        legacy_model = DummyLegacyModel()
+        torch.save(legacy_model, model_path)
+
+        runner = MagicMock(spec=RunModel)
+        runner.params = MagicMock()
+        runner.params.continue_model_id = "dummy"
+        runner.use_lightning = False
+        runner.device = torch.device("cpu")
+        runner._continue_model_dir = self.temp_dir
+
+        with patch("machine_learning.callbacks.ModelCheckpoint.load_model", return_value=torch.load(model_path, weights_only=False)):
+            RunModel._create_model(runner)
+
+        # Verify padding_idx retrofitted to 4, and row 4 zeroed
+        self.assertEqual(runner.model.emb.padding_idx, 4)
+        self.assertTrue(torch.all(runner.model.emb.weight[4] == 0.0))
+        # Non-padding rows still intact
+        self.assertTrue(torch.all(runner.model.emb.weight[0] == 1.0))
 
 
 if __name__ == "__main__":

@@ -329,9 +329,11 @@ class CollectTruePredictedOutputs(AbstractCallback):
         if self.params.scaler_dir is None:
             return None
         active_model_dir = self._model_dir if self._model_dir is not None else self.model_dir
-        if active_model_dir is None:
-            raise ValueError("CollectTruePredictedOutputs requires model_dir when scaler_dir is enabled")
-        return os.path.join(active_model_dir, 'scalers')
+        if active_model_dir is not None:
+            return os.path.join(active_model_dir, 'scalers')
+        if os.path.isdir(self.params.scaler_dir):
+            return self.params.scaler_dir
+        raise ValueError("CollectTruePredictedOutputs requires model_dir when scaler_dir is enabled")
 
     def _unscale_results(self, results_df: pd.DataFrame, scaler_dir: str):
         """Unscale standardized target and prediction columns back to physical units."""
