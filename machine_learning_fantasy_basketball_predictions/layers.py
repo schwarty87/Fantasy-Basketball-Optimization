@@ -48,8 +48,17 @@ class CalculateFantasyPoints(AbstractLayer):
 
         self.register_buffer('weights', self.scoring_vector)
 
+        if getattr(params, 'scaler_mean', None) is not None and getattr(params, 'scaler_scale', None) is not None:
+            self.register_buffer('scaler_mean', torch.tensor(params.scaler_mean, dtype=torch.float32), persistent=False)
+            self.register_buffer('scaler_scale', torch.tensor(params.scaler_scale, dtype=torch.float32), persistent=False)
+        else:
+            self.register_buffer('scaler_mean', None, persistent=False)
+            self.register_buffer('scaler_scale', None, persistent=False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch_size, ..., num_stats]
+        if self.scaler_mean is not None and self.scaler_scale is not None:
+            x = x * self.scaler_scale.to(device=x.device, dtype=x.dtype) + self.scaler_mean.to(device=x.device, dtype=x.dtype)
         fantasy_points = torch.einsum('...s, s -> ...', x, self.weights)  # [batch_size, ...]
         return fantasy_points
 
@@ -78,16 +87,20 @@ class ReshapeToSamplePerDay(AbstractLayer):
             sample_per_game = sample_per_game[..., self._ind_in_sample_per_game_tensor]
         dates = x[self._metadata_name][..., 0, self._date_ind_in_metadata]
 
-        sample_per_day = torch.zeros(self._num_day_per_batch, self._max_num_games_per_day, self._num_players_per_game,
-                                     dtype=sample_per_game.dtype, device=sample_per_game.device)
-
         unique_dates, group_indices = torch.unique(dates, return_inverse=True, sorted=False)
-        one_hot = F.one_hot(group_indices, num_classes=self._num_day_per_batch)
+        num_days = max(self._num_day_per_batch, len(unique_dates), 1)
+        one_hot = F.one_hot(group_indices, num_classes=num_days)
         item_idx = (torch.cumsum(one_hot, dim=0) - 1) * one_hot
         item_idx = item_idx.sum(dim=1)
+
+        max_games = max(self._max_num_games_per_day, int(item_idx.max().item()) + 1 if item_idx.numel() > 0 else 1)
+        sample_per_day = torch.zeros(num_days, max_games, self._num_players_per_game,
+                                     dtype=sample_per_game.dtype, device=sample_per_game.device)
+
         if sample_per_game.ndim == 3 and sample_per_game.shape[-1] == 1:
             sample_per_game = sample_per_game[..., 0]
-        sample_per_day[group_indices, item_idx] = sample_per_game
+        if group_indices.numel() > 0:
+            sample_per_day[group_indices, item_idx] = sample_per_game
         return sample_per_day
 
     def output_shape(self) -> LayersInputOutputShape:
@@ -168,17 +181,11 @@ class OptimizeTeamFn(torch.autograd.Function):
         # Iterate over each day in the batch
         optimize_team_funcs_pred = list()
         optimize_team_funcs_true = list()
-        # for day_num, day_mask in enumerate(mask):
         for day_num, date_day in enumerate(dates):
-            # if not np.any(day_mask):
-            #     continue
-
             # Filter for active players for the current day
-            points_pred = y_pred_np[day_num] #[day_mask]
-            points_true = y_true_np[day_num] #[day_mask]
-            salaries_day = salaries_np[day_num] #[day_mask]
-            positions_day = positions_np[day_num] #[day_mask]
-            # date_day = dates[day_num]
+            points_pred = y_pred_np[day_num]
+            salaries_day = salaries_np[day_num]
+            positions_day = positions_np[day_num]
 
             # Find optimal team based on predicted points
             optimize_team_funcs_pred.append(partial(OptimizeTeamFn._run_single_day, points=points_pred,
@@ -187,36 +194,33 @@ class OptimizeTeamFn(torch.autograd.Function):
                                                     )
                                             )
 
-            # Find optimal team based on true points
-            optimize_team_funcs_true.append(partial(OptimizeTeamFn._run_single_day, points=points_true,
-                                                    salaries=salaries_day, positions=num_to_position(positions_day),
-                                                    optimizer=optimizer, cache_key=date_day
-                                                    )
-                                            )
+            # Find optimal team based on true points ONLY when gradients are needed for backward pass
+            if y_pred.requires_grad:
+                points_true = y_true_np[day_num]
+                optimize_team_funcs_true.append(partial(OptimizeTeamFn._run_single_day, points=points_true,
+                                                        salaries=salaries_day, positions=num_to_position(positions_day),
+                                                        optimizer=optimizer, cache_key=date_day
+                                                        )
+                                                )
 
-        results = list()
-        all_funcs = optimize_team_funcs_pred + optimize_team_funcs_true
-        for i, f in enumerate(all_funcs):
-            results.append(f())
+        results_pred = [f() for f in optimize_team_funcs_pred]
+        results_pred_all = np.vstack(results_pred).astype(float) if results_pred else np.zeros((0, y_pred_np.shape[1]), dtype=float)
 
-        # results = [f() for f in optimize_team_funcs_pred + optimize_team_funcs_true]
-        # # results = Parallel(n_jobs=-1)([delayed(f)() for f in optimize_team_funcs_pred + optimize_team_funcs_true])
-        results_pred = results[:len(optimize_team_funcs_pred)]
-        results_true = results[len(optimize_team_funcs_pred):]
-
-        results_pred_all = np.vstack(results_pred).astype(float)
-        results_true_all = np.vstack(results_true).astype(float)
-
-        has_team_pred = np.any(results_pred_all, axis=1)
-        remove = np.logical_not(has_team_pred)
-        results_true_all[remove] = 0
+        if y_pred.requires_grad and optimize_team_funcs_true:
+            results_true = [f() for f in optimize_team_funcs_true]
+            results_true_all = np.vstack(results_true).astype(float)
+            has_team_pred = np.any(results_pred_all, axis=1)
+            remove = np.logical_not(has_team_pred)
+            results_true_all[remove] = 0
+        else:
+            results_true_all = np.zeros_like(results_pred_all)
 
         # Save tensors for the backward pass
         ctx.save_for_backward(torch.from_numpy(results_pred_all).to(y_pred.device, dtype=y_pred.dtype),
                               torch.from_numpy(results_true_all).to(y_pred.device, dtype=y_pred.dtype),
                               )
 
-        # Return the optimal team based on true points
+        # Return the optimal team based on predicted points
         return torch.from_numpy(results_pred_all).float().to(y_pred.device)
 
     @staticmethod
@@ -276,7 +280,8 @@ class OptimizeTeam(AbstractLayer):
         return return_arr
 
     def forward(self, x: Dict[str, torch.tensor]) -> torch.Tensor:
-        # x_np = {k: v.cpu().detach().numpy() for k, v in x.items()}
+        if self.training and not getattr(self.params, 'run_in_train', False):
+            return torch.zeros_like(x['fantasy_points_pred_sample_per_day'])
 
         points_pred = x['fantasy_points_pred_sample_per_day'].view(x['fantasy_points_pred_sample_per_day'].shape[0], -1)
         points_true = x['fantasy_points_true_sample_per_day'].view(x['fantasy_points_true_sample_per_day'].shape[0], -1)

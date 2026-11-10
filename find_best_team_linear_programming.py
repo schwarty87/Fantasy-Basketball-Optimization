@@ -317,13 +317,12 @@ class FindBestSetOfTeamsLinearProgramming(ABC):
         results = np.zeros((self._num_teams_in_set, len(self._player_id_to_index)), dtype=int)
 
         if len(self._players) > 0:
-            player_variables_are_int = isinstance(list(self._player_variables.values())[0], np.integer)
             for team_num in range(self._num_teams_in_set):
                 for player_num in self._players:
-                    if player_variables_are_int:
-                        if self._player_variables[player_num, team_num]:
-                            results[team_num, self._player_id_to_index[player_num]] = 1
-                    elif self._player_variables[player_num, team_num].varValue:
+                    val = self._player_variables.get((player_num, team_num), 0)
+                    if hasattr(val, 'varValue'):
+                        val = val.varValue
+                    if val and float(val) > 0.5:
                         results[team_num, self._player_id_to_index[player_num]] = 1
         return results
 
@@ -637,6 +636,8 @@ class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgrammi
         solver_options = {'presolve': True}
         if self._gap_rel is not None:
             solver_options['mip_rel_gap'] = self._gap_rel
+        elif num_teams == 1:
+            solver_options['mip_rel_gap'] = 0.0
         else:
             solver_options['mip_rel_gap'] = 0.01
 
@@ -970,6 +971,8 @@ class FindBestSetOfTeamsLinearProgrammingYahooScipy(FindBestSetOfTeamsLinearProg
         solver_options = {'presolve': True}
         if self._gap_rel is not None:
             solver_options['mip_rel_gap'] = self._gap_rel
+        elif num_teams == 1:
+            solver_options['mip_rel_gap'] = 0.0
         else:
             solver_options['mip_rel_gap'] = 0.01
 

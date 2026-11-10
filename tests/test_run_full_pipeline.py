@@ -8,8 +8,12 @@ import pandas as pd
 import numpy as np
 import pytz
 
-from run_full_pipeline import RunFullPipeline
+from run_full_pipeline import RunFullPipeline, _next_8am_et
 from constants import DATA_DIR, NY_TZ
+from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
+from machine_learning_fantasy_basketball_predictions.machine_learning_datasets import (
+    MachineLearningDatasetCombinedFantasyBasketballPredictions,
+)
 from utils import get_current_date, get_current_season
 
 
@@ -479,6 +483,81 @@ class TestRunFullPipeline(unittest.TestCase):
         mock_submit_inst.submit_best_set.assert_called_once()
         submitted_df = mock_submit_inst.submit_best_set.call_args[0][0]
         self.assertEqual(list(submitted_df["entry_id"]), [5001, 6001, 6002])
+
+    def test_next_8am_et(self):
+        """Verify _next_8am_et returns candidate 8am today when earlier, or 8am tomorrow when later."""
+        # 6:30 AM ET today -> 8:00 AM ET today
+        dt_before = NY_TZ.localize(datetime.datetime(2026, 11, 10, 6, 30))
+        res_before = _next_8am_et(dt_before)
+        self.assertEqual(res_before.date(), datetime.date(2026, 11, 10))
+        self.assertEqual(res_before.hour, 8)
+        self.assertEqual(res_before.minute, 0)
+
+        # 10:30 AM ET today -> 8:00 AM ET tomorrow
+        dt_after = NY_TZ.localize(datetime.datetime(2026, 11, 10, 10, 30))
+        res_after = _next_8am_et(dt_after)
+        self.assertEqual(res_after.date(), datetime.date(2026, 11, 11))
+        self.assertEqual(res_after.hour, 8)
+        self.assertEqual(res_after.minute, 0)
+
+    def test_reset_localizes_8am_in_ny_tz(self):
+        """Verify _reset creates today_8am strictly localized to NY_TZ."""
+        pipeline = RunFullPipeline(load_params_from_model_id=1, initialize_daily_job=False)
+        with patch.object(pipeline, "run_once_per_day"), patch.object(pipeline, "_wait_until_certain_time") as mock_wait:
+            test_date = datetime.date(2026, 11, 15)
+            pipeline._reset(test_date)
+            mock_wait.assert_called_once()
+            wait_dt = mock_wait.call_args.kwargs['wait_until']
+            self.assertEqual(wait_dt.hour, 8)
+            self.assertEqual(wait_dt.minute, 0)
+            self.assertEqual(wait_dt.tzinfo.zone, 'America/New_York')
+
+    def test_get_todays_predictions_passes_date_filtered_loader(self):
+        """Verify _get_todays_predictions constructs and passes a date-filtered DataLoader."""
+        pipeline = RunFullPipeline(load_params_from_model_id=1, initialize_daily_job=False)
+        run_date = datetime.date(2026, 11, 10)
+        pipeline._run_date = run_date
+
+        mock_dataset = MagicMock(spec=MachineLearningDatasetCombinedFantasyBasketballPredictions)
+        mock_loader = MagicMock()
+        mock_dataset.create_date_filtered_data_loader.return_value = mock_loader
+
+        mock_train_nn = MagicMock()
+        mock_train_nn.dataset_combined = mock_dataset
+        mock_train_nn.params.training_params.metrics_params = ()
+        mock_train_nn.params.training_params.loss_params = ()
+        mock_train_nn._change_metrics_params_tuple_to_per_sample.side_effect = lambda x: x
+        mock_train_nn.predict.return_value = pd.DataFrame({
+            'DATE': [run_date],
+            'PLAYER_ID': [101],
+            'fantasy_points': [35.0],
+        })
+        pipeline.train_nn = mock_train_nn
+        pipeline._add_game_times_to_df = MagicMock(side_effect=lambda df, **kwargs: df.assign(
+            GAME_DATE_TIME=datetime.datetime.now(NY_TZ) + datetime.timedelta(hours=2)
+        ))
+
+        predictions = pipeline._get_todays_predictions()
+        mock_dataset.create_date_filtered_data_loader.assert_called_once_with([run_date])
+        mock_train_nn.predict.assert_called_once()
+        self.assertEqual(mock_train_nn.predict.call_args.kwargs['data_loader'], mock_loader)
+
+    def test_run_full_pipeline_continuously_terminates_when_run_immediately(self):
+        """Verify run_full_pipeline_continuously terminates cleanly when run_immediately=True without spinning."""
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=1,
+            run_immediately=True,
+            initialize_daily_job=False,
+        )
+        run_date = get_current_date()
+        pipeline._run_date = run_date
+        future_game_time = datetime.datetime.now(NY_TZ) + datetime.timedelta(hours=2)
+        pipeline.dates_to_game_times = {run_date: [future_game_time]}
+        pipeline._todays_game_times = [future_game_time]
+
+        with patch.object(pipeline, "run_full_pipeline") as mock_pipeline_run:
+            pipeline.run_full_pipeline_continuously()
+            mock_pipeline_run.assert_called_once()
 
 
 if __name__ == "__main__":

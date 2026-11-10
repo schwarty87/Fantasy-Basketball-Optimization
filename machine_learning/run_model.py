@@ -138,6 +138,7 @@ class RunModel:
             )
             self.data_module.setup(stage="fit")
             self.data_loaders = self.data_module.data_loaders
+            self.dataset_combined = getattr(self.data_module, 'dataset_combined', None)
         else:
             if self.params.continue_model_id is not None:
                 scalers, label_encoders = data_cls.load_transformers(self._continue_model_dir)
@@ -388,7 +389,8 @@ class RunModel:
 
     def _run_epoch(self, training_mode: ModelMode, data_split_type: DataSplitType,
                    loss_function: LossesCombined, metrics: MetricsCombined, callbacks: CallbacksManager,
-                   optimizer: OPTIMIZER_TYPE = None, profiler: Optional[torch.profiler.profile] = None) -> \
+                   optimizer: OPTIMIZER_TYPE = None, profiler: Optional[torch.profiler.profile] = None,
+                   data_loader: Optional[DataLoader] = None) -> \
         Dict[str, Union[float, Dict, pd.DataFrame]]:
         loss_function.reset(device=self.device)
         metrics.reset(device=self.device)
@@ -396,7 +398,8 @@ class RunModel:
         if self.model.training:
             optimizer.zero_grad(set_to_none=True)
 
-        for batch_num, batch_data in enumerate(self.data_loaders[data_split_type]):
+        loader = data_loader if data_loader is not None else self.data_loaders[data_split_type]
+        for batch_num, batch_data in enumerate(loader):
             if (self.params.training_params.num_batches_per_epoch is not None) and \
                 (batch_num >= self.params.training_params.num_batches_per_epoch):
                 break
@@ -762,7 +765,8 @@ class RunModel:
         return pd.DataFrame()
 
     def predict(self, data_split_type: DataSplitType, loss_params: Optional[Tuple[AbstractLossParams, ...]] = None,
-                metrics_params: Optional[Tuple[AbstractMetricParams, ...]] = None, trainer_cls=None, **kwargs) -> Optional[pd.DataFrame]:
+                metrics_params: Optional[Tuple[AbstractMetricParams, ...]] = None, trainer_cls=None,
+                data_loader: Optional[DataLoader] = None, **kwargs) -> Optional[pd.DataFrame]:
         """
         Perform a prediction run on the data. This means we'll perform a forward pass of all the samples in the
         "data_split_type" dataset and collect all the results for each sample.
@@ -771,6 +775,8 @@ class RunModel:
                             self.params.training_params.loss_params
         :param metrics_params: The params for the metrics. If None, use the data from
                                 self.params.training_params.metrics_params
+        :param data_loader: Optional custom DataLoader to evaluate (e.g. single-date evaluation).
+                            If provided, overrides default data loaders.
         :return: A df with all the results for each sample
         """
         if self.use_lightning:
@@ -780,7 +786,9 @@ class RunModel:
                 precision = "16-mixed" if torch.cuda.is_available() else "32-true"
                 self.trainer = trainer_cls(accelerator="auto", devices=1, precision=precision, logger=False)
 
-            if hasattr(self, "data_module"):
+            if data_loader is not None:
+                batches = self.trainer.predict(model=self.model, dataloaders=data_loader)
+            elif hasattr(self, "data_module"):
                 self.data_module.predict_data_split_type = data_split_type
                 batches = self.trainer.predict(model=self.model, datamodule=self.data_module)
             else:
@@ -806,7 +814,8 @@ class RunModel:
         with torch.no_grad():
             metric_name_to_results_df = self._run_epoch(training_mode=ModelMode.PREDICT, callbacks=callbacks,
                                                         data_split_type=data_split_type,
-                                                        metrics=metrics, loss_function=loss_function)
+                                                        metrics=metrics, loss_function=loss_function,
+                                                        data_loader=data_loader)
             callback_name_to_results = callbacks.on_predict_end(metric_name_to_results_df=metric_name_to_results_df)
             results_dfs = list()
             for callback_name, callback_results_df in callback_name_to_results.items():

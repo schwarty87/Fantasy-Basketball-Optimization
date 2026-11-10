@@ -8,7 +8,8 @@ from machine_learning.registries import params_registry
 @params_registry.register
 @dataclass(kw_only=True)
 class OptimizeTeamsLossParams(AbstractLossParams):
-    name_for_logs = 'optimize_teams'
+    name_for_logs: str = 'optimize_teams'
+    run_in_predict: bool = False
 
 
 @params_registry.register

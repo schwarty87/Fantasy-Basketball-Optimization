@@ -1,3 +1,4 @@
+import datetime
 import os
 import torch
 import numpy as np
@@ -7,7 +8,7 @@ from abc import ABC, abstractmethod
 from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 from torch.utils.data import Dataset, DataLoader, Subset, StackDataset
-from typing import Optional, Dict, List, Tuple, Union, Callable, Any
+from typing import Optional, Dict, List, Tuple, Union, Callable, Any, Sequence
 from calc_features import CalcFeatures
 from machine_learning.constants import IGNORE
 from machine_learning.enums import DataSplitType, FeatureType, ImputationType, SampleWeightType
@@ -20,6 +21,14 @@ from machine_learning.params.machine_learning_dataset_params import MachineLearn
 from machine_learning.params.params import FeaturesParams, TrainingParams
 from machine_learning.registries import datasets_registry
 from machine_learning.utils import tensor_to_df, binary_opening_1d, binary_closing_1d, CustomOrdinalEncoder
+
+
+def dates_to_epoch_days(dates: Union[datetime.date, str, Sequence[Any]]) -> np.ndarray:
+    """Convert a sequence of dates/datetimes/strings into days since Unix epoch (floating point)."""
+    if isinstance(dates, (str, datetime.date, datetime.datetime, pd.Timestamp)):
+        dates = [dates]
+    dt_s = pd.to_datetime(list(dates)).astype('datetime64[s]').astype(np.int64)
+    return dt_s / 86400.0
 
 
 def _reshape_keep_mask(keep_mask: np.ndarray, compare_arr: np.ndarray | pd.DataFrame) -> np.ndarray:

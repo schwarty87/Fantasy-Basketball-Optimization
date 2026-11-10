@@ -7,16 +7,20 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 
+from constants import Sites
 from machine_learning.callbacks import CollectTruePredictedOutputs, CollectTruePredictedOutputsParams
-from machine_learning.enums import Reduction
+from machine_learning.constants import METADATA
+from machine_learning.enums import Reduction, ModelMode, DataSplitType
 from machine_learning.layers.layers import EmbeddingsLayer
 from machine_learning.machine_learning_datasets import (
     MachineLearningDatasetCombined,
     MachineLearningDatasetMetadata,
+    dates_to_epoch_days,
 )
 from machine_learning.metrics.abstract_metrics import AbstractMetric
 from machine_learning.params.abstract_params import AbstractMetricParams
@@ -28,9 +32,22 @@ from machine_learning.params.machine_learning_dataset_params import (
 from machine_learning.params.params import FeaturesParams
 from machine_learning.run_model import RunModel
 from machine_learning.utils import CustomOrdinalEncoder, get_next_model_id
+from machine_learning_fantasy_basketball_predictions.layers import (
+    CalculateFantasyPoints,
+    ReshapeToSamplePerDay,
+    OptimizeTeam,
+    OptimizeTeamFn,
+)
 from machine_learning_fantasy_basketball_predictions.machine_learning_datasets import (
     MachineLearningDatasetCombinedFantasyBasketballPredictions,
 )
+from machine_learning_fantasy_basketball_predictions.params.layers_params import (
+    CalculateFantasyPointsParams,
+    ReshapeToSamplePerDayParams,
+    OptimizeTeamParams,
+    update_calculate_fantasy_points_params,
+)
+from machine_learning_fantasy_basketball_predictions.params.metrics_params import OptimizeTeamsLossParams
 from machine_learning_fantasy_basketball_predictions.params.params import (
     FeaturesParamsFantasyBasketballPredictions,
 )
@@ -443,6 +460,209 @@ class TestEmbeddingsLayerPaddingAndRetrofit(unittest.TestCase):
         self.assertTrue(torch.all(runner.model.emb.weight[4] == 0.0))
         # Non-padding rows still intact
         self.assertTrue(torch.all(runner.model.emb.weight[0] == 1.0))
+
+
+class TestCalculateFantasyPointsUnscaling(unittest.TestCase):
+    def test_unscaling_with_scaler_buffers(self):
+        """Verify CalculateFantasyPoints unscales inputs back to physical units before computing points."""
+        stat_names = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV']
+        params = CalculateFantasyPointsParams(
+            input_tensor_name='outputs_pred',
+            stat_names=stat_names,
+            site=Sites.YAHOO,
+            scaler_mean=[10.0, 5.0, 3.0, 1.0, 0.5, 2.0],
+            scaler_scale=[2.0, 1.0, 0.5, 0.5, 0.5, 1.0],
+        )
+        layer = CalculateFantasyPoints(params=params, input_shape=(1, 6))
+        # Normalized input: PTS=1.0 -> 12.0 raw; REB=2.0 -> 7.0 raw; AST=-1.0 -> 2.5 raw; STL=0->1; BLK=0->0.5; TOV=0->2
+        # Yahoo scoring: 12*1 + 7*1.2 + 2.5*1.5 + 1*3 + 0.5*3 + 2*(-1) = 26.65
+        x = torch.tensor([[1.0, 2.0, -1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+        fp = layer(x)
+        self.assertTrue(torch.isclose(fp, torch.tensor([26.65]), atol=1e-4))
+
+    def test_unscaling_fallback_when_buffers_none(self):
+        """Verify CalculateFantasyPoints preserves backward compatibility when scalers are None."""
+        stat_names = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV']
+        params = CalculateFantasyPointsParams(
+            input_tensor_name='outputs_pred',
+            stat_names=stat_names,
+            site=Sites.YAHOO,
+        )
+        layer = CalculateFantasyPoints(params=params, input_shape=(1, 6))
+        # Without scaler, raw calculation: 1*1 + 2*1.2 + 3*1.5 + 1*3 + 1*3 + 1*(-1) = 12.9
+        x = torch.tensor([[1.0, 2.0, 3.0, 1.0, 1.0, 1.0]], dtype=torch.float32)
+        fp = layer(x)
+        self.assertTrue(torch.isclose(fp, torch.tensor([12.9]), atol=1e-4))
+
+
+class TestReshapeToSamplePerDayDynamic(unittest.TestCase):
+    def test_dynamic_sizing_arbitrary_dates_and_games(self):
+        """Verify ReshapeToSamplePerDay dynamically accommodates slates larger than max_num_games_per_day."""
+        params = ReshapeToSamplePerDayParams(
+            input_tensor_name=['game_pred', METADATA],
+            sample_per_game_tensor_name='game_pred',
+            metadata_name=METADATA,
+            max_num_games_per_day=2,  # Configured small
+            num_players_per_game=2,
+            num_days_per_batch=1,
+            date_ind_in_metadata=0,
+        )
+        layer = ReshapeToSamplePerDay(params=params, input_shape=(5, 2))
+
+        # 5 games: 3 on date 100.0, 2 on date 200.0 (exceeds max_num_games_per_day=2 and num_days_per_batch=1)
+        pred_tensor = torch.arange(10, dtype=torch.float32).view(5, 2)
+        meta_tensor = torch.tensor([
+            [[100.0], [100.0]],
+            [[100.0], [100.0]],
+            [[100.0], [100.0]],
+            [[200.0], [200.0]],
+            [[200.0], [200.0]],
+        ], dtype=torch.float32)
+
+        batch = {'game_pred': pred_tensor, METADATA: meta_tensor}
+        reshaped = layer(batch)
+
+        # Output shape should be (num_days >= 2, max_games >= 3, 2)
+        self.assertGreaterEqual(reshaped.shape[0], 2)
+        self.assertGreaterEqual(reshaped.shape[1], 3)
+        self.assertEqual(reshaped.shape[2], 2)
+        # Verify content intact
+        self.assertTrue(torch.all(reshaped[0, 0] == pred_tensor[0]))
+        self.assertTrue(torch.all(reshaped[0, 2] == pred_tensor[2]))
+        self.assertTrue(torch.all(reshaped[1, 1] == pred_tensor[4]))
+
+
+class TestOptimizeTeamGating(unittest.TestCase):
+    def test_optimize_team_skipped_in_training_when_run_in_train_false(self):
+        """Verify OptimizeTeam returns zeros during training when run_in_train=False without calling solver."""
+        params = OptimizeTeamParams(
+            input_tensor_name=['pred', 'true', 'salary', 'pos', 'date'],
+            run_in_train=False,
+        )
+        layer = OptimizeTeam(params=params, input_shape=(1, 8))
+        layer.train()  # In training mode
+
+        dummy_tensor = torch.ones((1, 8), dtype=torch.float32)
+        batch = {
+            'fantasy_points_pred_sample_per_day': dummy_tensor,
+            'fantasy_points_true_sample_per_day': dummy_tensor,
+            'salary_sample_per_day': dummy_tensor,
+            'position_sample_per_day': dummy_tensor,
+            'date_sample_per_day': dummy_tensor,
+        }
+
+        with patch.object(layer.optimizer, 'run_inner') as mock_solve:
+            out = layer(batch)
+            mock_solve.assert_not_called()
+            self.assertTrue(torch.all(out == 0.0))
+
+    def test_optimize_team_fn_no_grad_skips_true_lp(self):
+        """Verify OptimizeTeamFn does not solve true team when y_pred does not require grad."""
+        points_pred = torch.tensor([[10.0, 20.0, 30.0]], dtype=torch.float32, requires_grad=False)
+        points_true = torch.tensor([[5.0, 15.0, 25.0]], dtype=torch.float32)
+        salaries = torch.tensor([[10.0, 20.0, 30.0]], dtype=torch.float32)
+        positions = torch.tensor([[1, 2, 3]], dtype=torch.float32)
+        dates = torch.tensor([[20000.0, 20000.0, 20000.0]], dtype=torch.float32)
+
+        mock_optimizer = MagicMock()
+        mock_optimizer.get_results_boolean_array.return_value = np.array([[True, False, True]])
+
+        num_to_pos = lambda arr: np.array(['PG', 'SG', 'SF'])
+
+        out = OptimizeTeamFn.apply(points_pred, points_true, salaries, positions, mock_optimizer, num_to_pos, dates)
+        self.assertEqual(out.shape, (1, 3))
+        # run_inner should only be called once (for pred), NOT twice (never for true)
+        self.assertEqual(mock_optimizer.run_inner.call_count, 1)
+
+
+class TestDatesToEpochDays(unittest.TestCase):
+    def test_dates_to_epoch_days_conversions(self):
+        """Verify dates_to_epoch_days converts dates, datetimes, and strings to exact floating epoch days."""
+        d = datetime.date(2026, 11, 10)
+        dt = datetime.datetime(2026, 11, 10, 0, 0, 0)
+        s = "2026-11-10"
+
+        res_d = dates_to_epoch_days(d)
+        res_dt = dates_to_epoch_days(dt)
+        res_s = dates_to_epoch_days(s)
+        res_list = dates_to_epoch_days([d, s])
+
+        self.assertEqual(res_d[0], res_dt[0])
+        self.assertEqual(res_d[0], res_s[0])
+        self.assertEqual(len(res_list), 2)
+        self.assertEqual(res_list[0], res_list[1])
+        # Invert back to date
+        recovered = pd.to_datetime(res_d, unit='D').date[0]
+        self.assertEqual(recovered, d)
+
+
+class TestRunModelPredictDataLoader(unittest.TestCase):
+    def test_predict_passes_custom_data_loader_to_run_epoch(self):
+        """Verify RunModel.predict passes custom data_loader through to _run_epoch."""
+        runner = MagicMock(spec=RunModel)
+        runner.use_lightning = False
+        runner.model = MagicMock()
+        runner._define_callbacks.return_value = MagicMock()
+        runner._loss_function = MagicMock()
+        runner._metrics = MagicMock()
+        runner._define_metrics.return_value = MagicMock()
+        runner._run_epoch.return_value = {}
+
+        custom_loader = [MagicMock()]
+        RunModel.predict(runner, data_split_type=DataSplitType.TRAIN, data_loader=custom_loader)
+        runner._run_epoch.assert_called_once()
+        self.assertEqual(runner._run_epoch.call_args.kwargs['data_loader'], custom_loader)
+
+
+class TestUpdateCalculateFantasyPointsParams(unittest.TestCase):
+    def test_update_populates_scalers(self):
+        """Verify update_calculate_fantasy_points_params copies scaler values to layer params."""
+        stat_names = ['PTS', 'REB', 'AST']
+        cfp = CalculateFantasyPointsParams(input_tensor_name='pred', stat_names=stat_names)
+        arch = type("Arch", (), {"layer_params_list": [cfp]})()
+        params = type("Params", (), {"architecture_params": arch})()
+
+        class DummyScaler:
+            feature_names_in_ = np.array(['PTS', 'REB', 'AST'])
+            mean_ = np.array([15.0, 7.0, 5.0])
+            scale_ = np.array([3.0, 2.0, 1.0])
+
+        combined = type("Combined", (), {
+            "machine_learning_datasets_stacked": type("Stacked", (), {
+                "datasets": {"true_label": type("DS", (), {"scaler": DummyScaler()})()}
+            })()
+        })()
+
+        update_calculate_fantasy_points_params(params=params, dataset_combined=combined)
+        self.assertEqual(cfp.scaler_mean, [15.0, 7.0, 5.0])
+        self.assertEqual(cfp.scaler_scale, [3.0, 2.0, 1.0])
+
+
+class TestDateFilteredDataLoader(unittest.TestCase):
+    def test_create_date_filtered_data_loader(self):
+        """Verify create_date_filtered_data_loader extracts only samples for the specified target date."""
+        class MockStacked:
+            def __init__(self):
+                self.datasets = {'true_label': torch.arange(50)}
+            def __len__(self):
+                return 50
+
+        class MockDS(MachineLearningDatasetCombinedFantasyBasketballPredictions):
+            def __init__(self):
+                self._original_index_to_date = np.array([20000.0] * 20 + [20001.0] * 30)
+                self.machine_learning_datasets_stacked = MockStacked()
+                self.training_params = type("TP", (), {"batch_size": 10, "num_days_per_batch": 1})()
+
+            def _remove_unused_indices_by_keep_mask(self, indices):
+                return indices
+
+            def _get_data_loader_batch_kwargs(self, batch_size, shuffle, machine_learning_datasets_stacked_subset):
+                return {"batch_size": batch_size, "shuffle": False}
+
+        ds = MockDS()
+        target_d = pd.to_datetime(20001.0, unit='D').date()
+        loader = ds.create_date_filtered_data_loader([target_d], batch_size=10)
+        self.assertEqual(len(loader.dataset), 30)
 
 
 if __name__ == "__main__":

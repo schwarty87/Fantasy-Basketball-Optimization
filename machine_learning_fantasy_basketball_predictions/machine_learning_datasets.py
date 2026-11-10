@@ -2,23 +2,24 @@ import datetime
 import logging
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, List
+import torch
+from typing import Optional, Dict, List, Union, Sequence, Any
 
 from sklearn.preprocessing import StandardScaler, OrdinalEncoder
-from torch.utils.data import Sampler, Subset
+from torch.utils.data import Sampler, Subset, DataLoader
 
 from constants import START_POSITIONS, UNKNOWN_PLAYER_ID, IGNORE_VAL, TEAM_NAME_TO_ID, POSITION_TO_NUM
 from utils import get_current_date, get_current_time
 from machine_learning.constants import METADATA
 from machine_learning.enums import DataSplitType
-from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined, \
-    AbstractMachineLearningDataset
-from machine_learning.machine_learning_datasets import MachineLearningDatasetSampleWeightsTabular
-from machine_learning_fantasy_basketball_predictions.params.machine_learning_dataset_params import \
-    MachineLearningDatasetSampleWeightsTabularFantasyBasketballPredictionsParams, \
-    MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams
-from machine_learning.machine_learning_datasets import AbstractCategoricalEncodingMachineLearningDataset,\
-    MachineLearningDatasetTabularCategoricalEncoding
+from machine_learning.machine_learning_datasets import (
+    MachineLearningDatasetCombined,
+    AbstractMachineLearningDataset,
+    MachineLearningDatasetSampleWeightsTabular,
+    AbstractCategoricalEncodingMachineLearningDataset,
+    MachineLearningDatasetTabularCategoricalEncoding,
+    dates_to_epoch_days,
+)
 from machine_learning_fantasy_basketball_predictions.params.params import FeaturesParamsFantasyBasketballPredictions
 from machine_learning.registries import datasets_registry
 from machine_learning_fantasy_basketball_predictions.samplers import ByDateBatchSampler
@@ -320,3 +321,33 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         return super()._get_data_loader_batch_kwargs(batch_size=batch_size, shuffle=shuffle,
                                                      machine_learning_datasets_stacked_subset=machine_learning_datasets_stacked_subset
                                                      )
+
+    def create_date_filtered_data_loader(
+        self,
+        target_dates: Union[datetime.date, str, Sequence[Any]],
+        batch_size: Optional[int] = None,
+        num_workers: int = 0,
+    ) -> DataLoader:
+        """Create a DataLoader containing only samples for the specified target date(s)."""
+        if self._original_index_to_date is None:
+            raise ValueError("Cannot create date-filtered DataLoader because _original_index_to_date is None.")
+
+        target_days = np.round(dates_to_epoch_days(target_dates)).astype(np.int64)
+        dataset_days = np.round(self._original_index_to_date).astype(np.int64)
+        matching_indices = np.where(np.isin(dataset_days, target_days))[0].tolist()
+
+        filtered_indices = self._remove_unused_indices_by_keep_mask(matching_indices)
+        subset = Subset(self.machine_learning_datasets_stacked, indices=filtered_indices)
+
+        effective_batch_size = batch_size or getattr(self.training_params, 'batch_size', 1)
+        data_loader_batch_kwargs = self._get_data_loader_batch_kwargs(
+            batch_size=effective_batch_size,
+            shuffle=False,
+            machine_learning_datasets_stacked_subset=subset,
+        )
+        return DataLoader(
+            subset,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+            **data_loader_batch_kwargs,
+        )

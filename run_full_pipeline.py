@@ -22,6 +22,21 @@ from machine_learning_fantasy_basketball_predictions.params.params import \
     MachineLearningParamsFantasyBasketballPredictions
 from machine_learning_fantasy_basketball_predictions.run_model import RunModelFantasyBasketballPredictions
 from machine_learning.enums import DataSplitType
+from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
+
+
+def _next_8am_et(current_dt: datetime.datetime) -> datetime.datetime:
+    """Return the next 8:00 AM Eastern Time strictly in the future."""
+    if current_dt.tzinfo is None:
+        dt_ny = NY_TZ.localize(current_dt)
+    else:
+        dt_ny = current_dt.astimezone(NY_TZ)
+
+    candidate_today = NY_TZ.localize(datetime.datetime.combine(dt_ny.date(), datetime.time(8, 0, 0)))
+    if dt_ny < candidate_today:
+        return candidate_today
+    tomorrow = dt_ny.date() + timedelta(days=1)
+    return NY_TZ.localize(datetime.datetime.combine(tomorrow, datetime.time(8, 0, 0)))
 
 
 class RunFullPipeline:
@@ -114,9 +129,7 @@ class RunFullPipeline:
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
                       filename=os.path.join(DATA_DIR, 'logs', f"logs_{self._run_date}.txt"), print_to_console=True, filemode='a')
 
-        today_8am = datetime.datetime(year=self._run_date.year, month=self._run_date.month, day=self._run_date.day,
-                                      hour=8, minute=0, second=0)
-        today_8am = today_8am.astimezone(NY_TZ)
+        today_8am = NY_TZ.localize(datetime.datetime.combine(self._run_date, datetime.time(8, 0, 0)))
         self._exclude_contest_ids = set()
 
         if not self._run_immediately:
@@ -186,8 +199,25 @@ class RunFullPipeline:
     def _get_todays_predictions(self, teams_template: pd.DataFrame | None = None) -> pd.DataFrame:
         metrics_params = self.train_nn._change_metrics_params_tuple_to_per_sample(self.train_nn.params.training_params.metrics_params)
         loss_params = self.train_nn._change_metrics_params_tuple_to_per_sample(self.train_nn.params.training_params.loss_params)
-        predictions = self.train_nn.predict(data_split_type=DataSplitType.TRAIN, metrics_params=metrics_params,
-                                            loss_params=loss_params)
+
+        predict_kwargs = dict(
+            data_split_type=DataSplitType.TRAIN,
+            metrics_params=metrics_params,
+            loss_params=loss_params,
+        )
+        dataset_combined = getattr(self.train_nn, 'dataset_combined', None)
+        if isinstance(dataset_combined, MachineLearningDatasetCombined) and hasattr(dataset_combined, 'create_date_filtered_data_loader'):
+            try:
+                date_loader = dataset_combined.create_date_filtered_data_loader([self._run_date])
+                predict_kwargs['data_loader'] = date_loader
+            except Exception as e:
+                logging.warning(f"Could not build single-date DataLoader for {self._run_date}: {e}. Falling back to full dataset prediction.")
+
+        predictions = self.train_nn.predict(**predict_kwargs)
+        if predictions is None or predictions.empty:
+            logging.warning(f"No predictions returned for {self._run_date}")
+            return pd.DataFrame()
+
         predictions.rename(columns=lambda x: x.replace('CollectTruePredictedOutputsParamsFantasyBasketballPredictions_', ''),
                            inplace=True)
         predictions = predictions.loc[predictions['DATE'] == self._run_date].copy()
@@ -478,10 +508,10 @@ class RunFullPipeline:
             # if there are no remaining games today, wait until the next day
             if not self._has_games_today() or self._todays_game_times is None or \
                     get_current_time() > max(self._todays_game_times):
-                tomorrow_8am = (get_current_time() + timedelta(days=1)).replace(hour=8, minute=0, second=0,
-                                                                                microsecond=0)
                 if not self._run_immediately:
-                    self._wait_until_certain_time(tomorrow_8am)
+                    self._wait_until_certain_time(_next_8am_et(get_current_time()))
+                else:
+                    break
                 continue
 
             # run pipeline a few minutes before each game
@@ -500,6 +530,11 @@ class RunFullPipeline:
                 except Exception as e:
                     logging.exception(f'Error executing run_full_pipeline before game at {game_time}: {e}')
                     continue
+
+            if self._run_immediately:
+                break
+            else:
+                self._wait_until_certain_time(_next_8am_et(get_current_time()))
 
     @staticmethod
     def _get_game_times_by_day_dict() -> dict:

@@ -104,6 +104,15 @@ class TestYahooLinearProgrammingSingleTeam(unittest.TestCase):
         # 5. Total points positive and maximized
         self.assertGreater(team['points'].iloc[0], 0)
 
+    def test_get_results_boolean_array_with_integer_variables(self):
+        """Verify get_results_boolean_array correctly extracts selections from integer dictionary."""
+        self.solver._player_id_to_index = {101: 0, 102: 1, 103: 2}
+        self.solver._players = [101, 102, 103]
+        self.solver._num_teams_in_set = 1
+        self.solver._player_variables = {(101, 0): 1, (102, 0): 0, (103, 0): 1}
+        res = self.solver.get_results_boolean_array()
+        np.testing.assert_array_equal(res, [[1, 0, 1]])
+
 
 class TestYahooLinearProgrammingLockedPlayers(unittest.TestCase):
     """Tests for Yahoo lineup optimization with locked players."""
@@ -314,6 +323,24 @@ class TestYahooLinearProgrammingLateSwapAndResidualMilp(unittest.TestCase):
         all_chosen = [set(teams[slots].iloc[t].values) for t in range(3)]
         in_all_three = all_chosen[0] & all_chosen[1] & all_chosen[2]
         self.assertEqual(len(in_all_three), 0, f"Expected no player in all 3 teams, but got {in_all_three}")
+
+    def test_single_team_defaults_to_zero_mip_rel_gap(self):
+        """Verify that single-team optimization defaults to exact 0.0 relative gap."""
+        solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+            position_col='YAHOO_POSITION',
+            salary_col='YAHOO_SALARY',
+            points_col='YAHOO_POINTS',
+            player_col='PLAYER_ID',
+            num_teams_in_set=1,
+            verbose=False,
+        )
+        # Verify default gap_rel is None so that run() sets mip_rel_gap = 0.0
+        self.assertIsNone(solver._gap_rel)
+        df = _generate_synthetic_dfs_pool(n_players=60, seed=42)
+        result = solver.run(df=df)
+        self.assertEqual(len(result), 1)
+        self.assertTrue(solver.last_result.success)
+
 
 
 if __name__ == '__main__':
