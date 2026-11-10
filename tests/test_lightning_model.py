@@ -12,6 +12,9 @@ from sklearn.preprocessing import StandardScaler
 
 from constants import Sites
 from machine_learning.constants import METADATA
+from machine_learning.params.machine_learning_dataset_params import (
+    MachineLearningDatasetTabularScalingParams,
+)
 from run_all import create_params
 from machine_learning_fantasy_basketball_predictions.lightning_model import (
     FantasyBasketballLightningModule,
@@ -210,6 +213,26 @@ class TestFantasyBasketballLightningModule(unittest.TestCase):
             )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_lightning_format_predictions_fails_fast_when_scaler_missing(self):
+        """Verify FantasyBasketballLightningModule.format_predictions raises FileNotFoundError when scaler is missing."""
+        mock_params = MagicMock()
+        mock_params.features_params.feature_name_to_machine_learning_dataset_params = {
+            "true_label": MachineLearningDatasetTabularScalingParams(feature_names=["YAHOO_POINTS"])
+        }
+        empty_scaler_dir = os.path.join(tempfile.mkdtemp(), "empty_scalers")
+        os.makedirs(empty_scaler_dir, exist_ok=True)
+        try:
+            module = MagicMock(spec=FantasyBasketballLightningModule)
+            module.params = mock_params
+            module.scaler_dir = empty_scaler_dir
+            module._target_scaler = None
+            module._load_target_scaler = MagicMock(return_value=None)
+            with self.assertRaises(FileNotFoundError) as cm:
+                FantasyBasketballLightningModule.format_predictions(module, predict_batches=[])
+            self.assertIn("Target scaler true_label.pkl not found", str(cm.exception))
+        finally:
+            shutil.rmtree(empty_scaler_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

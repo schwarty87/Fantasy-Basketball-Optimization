@@ -11,6 +11,7 @@ import requests
 from constants import DATA_DIR
 
 from bs4 import BeautifulSoup
+from calc_features import CalcFeatures, COUNTING_STATS
 from data_collectors.injuries import Injuries, InjuriesSources
 from data_collectors.ejections import Ejections
 from data_collectors.left_midgame import LeftMidgame
@@ -1350,6 +1351,28 @@ class TestDataCollectors(unittest.TestCase):
             intact_df = pd.read_feather(save_path)
             self.assertEqual(len(intact_df), 1)
             self.assertEqual(intact_df.loc[0, "postponedStatus"], "N")
+
+    def test_undrafted_rookie_retained_in_drop_nans(self):
+        """Verify undrafted rookie with YEARS_SINCE_DRAFT=NaN is retained, while missing MIN_mean5 is dropped."""
+        cf = CalcFeatures()
+        sample_data = {
+            "PLAYER_ID": [201, 202],
+            "TEAM_ID": [1610612738, 1610612738],
+            "DATE": [datetime.date(2026, 11, 10), datetime.date(2026, 11, 10)],
+            "DAYS_REST": [2, 2],
+            "MIN_mean5": [28.5, np.nan],
+            "START_POSITION_CALCULATED": [1, 1],
+            "YEARS_SINCE_DRAFT": [np.nan, 2.0],
+        }
+        for stat in COUNTING_STATS:
+            sample_data[stat] = [10.0, 10.0]
+
+        cf.updates_df = pd.DataFrame(sample_data)
+        cf._drop_nans()
+
+        self.assertEqual(len(cf.updates_df), 1)
+        self.assertEqual(cf.updates_df.iloc[0]["PLAYER_ID"], 201)
+        self.assertTrue(pd.isna(cf.updates_df.iloc[0]["YEARS_SINCE_DRAFT"]))
 
 
 if __name__ == "__main__":

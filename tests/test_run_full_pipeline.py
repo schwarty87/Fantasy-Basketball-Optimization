@@ -310,6 +310,94 @@ class TestRunFullPipeline(unittest.TestCase):
         self.assertEqual(result.loc[result["PLAYER_ID"] == 101, "YAHOO_POSITION"].values[0], 1)
         self.assertEqual(result.loc[result["PLAYER_ID"] == 102, "YAHOO_POSITION"].values[0], 2)
 
+    @patch("run_full_pipeline.update_todays_schedule_from_scoreboard")
+    @patch("run_full_pipeline.scrape_season_schedules")
+    @patch("run_full_pipeline.load_and_cache_players_list")
+    @patch("run_full_pipeline.update_all_stats")
+    def test_run_once_per_day_falls_back_to_latest_valid_daily_model_with_matching_params(
+        self,
+        mock_update_stats,
+        mock_load_players,
+        mock_scrape_schedules,
+        mock_update_scoreboard,
+    ):
+        """Verify run_once_per_day safely falls back to latest valid daily model on training failure."""
+        models_base = os.path.join(
+            self.temp_dir, "machine_learning_fantasy_basketball_predictions", "models"
+        )
+        os.makedirs(models_base, exist_ok=True)
+
+        # 1. Create base model 0
+        model_0_dir = os.path.join(models_base, "0")
+        os.makedirs(os.path.join(model_0_dir, "scalers"), exist_ok=True)
+        os.makedirs(os.path.join(model_0_dir, "categorical_encoder"), exist_ok=True)
+        with open(os.path.join(model_0_dir, "params.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(model_0_dir, "model.pt"), "w") as f:
+            f.write("model0")
+        with open(os.path.join(model_0_dir, "scalers", "true_label.pkl"), "w") as f:
+            f.write("scaler")
+        with open(os.path.join(model_0_dir, "categorical_encoder", "embedding_features.pkl"), "w") as f:
+            f.write("encoder")
+
+        # 2. Create previous valid daily model: model_2026_11_07
+        model_yesterday_dir = os.path.join(models_base, "model_2026_11_07")
+        os.makedirs(os.path.join(model_yesterday_dir, "scalers"), exist_ok=True)
+        os.makedirs(os.path.join(model_yesterday_dir, "categorical_encoder"), exist_ok=True)
+        with open(os.path.join(model_yesterday_dir, "params.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(model_yesterday_dir, "model.pt"), "w") as f:
+            f.write("model_yesterday")
+        with open(os.path.join(model_yesterday_dir, "scalers", "true_label.pkl"), "w") as f:
+            f.write("scaler")
+        with open(os.path.join(model_yesterday_dir, "categorical_encoder", "embedding_features.pkl"), "w") as f:
+            f.write("encoder")
+
+        # 3. Setup pipeline for 2026-11-08 with scheduled games
+        run_date = datetime.date(2026, 11, 8)
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=0,
+            run_date=run_date,
+            run_immediately=True,
+            initialize_daily_job=False,
+            force_retrain=True,
+        )
+        pipeline.dates_to_game_times = {run_date: [datetime.datetime.now(NY_TZ)]}
+        pipeline._get_game_times_by_day_dict = MagicMock(return_value={run_date: [datetime.datetime.now(NY_TZ)]})
+
+        # Mock RunModelFantasyBasketballPredictions: first instantiation fails during train()
+        mock_failing_runner = MagicMock()
+        failed_temp_dir = os.path.join(models_base, "failed_tmp_model")
+        os.makedirs(failed_temp_dir, exist_ok=True)
+        mock_failing_runner._model_dir = failed_temp_dir
+        mock_failing_runner.train.side_effect = RuntimeError("Simulated GPU OutOfMemoryError")
+
+        mock_fallback_runner = MagicMock()
+
+        def runner_side_effect(params, description=None):
+            if params.continue_model_id == "model_2026_11_07":
+                return mock_fallback_runner
+            return mock_failing_runner
+
+        with patch("run_full_pipeline.DATA_DIR", self.temp_dir), \
+             patch("run_full_pipeline.MachineLearningParamsFantasyBasketballPredictions.load_params") as mock_load_params, \
+             patch("run_full_pipeline.RunModelFantasyBasketballPredictions", side_effect=runner_side_effect):
+
+            mock_params = MagicMock()
+            mock_params.features_params = MagicMock()
+            mock_params.training_params = MagicMock()
+            mock_load_params.return_value = mock_params
+
+            pipeline.run_once_per_day()
+
+        # Verify failed temporary directory was cleaned up
+        self.assertFalse(os.path.exists(failed_temp_dir))
+        # Verify base model 0 was preserved
+        self.assertTrue(os.path.isdir(model_0_dir))
+        # Verify fallback model was set to model_2026_11_07
+        self.assertEqual(mock_params.continue_model_id, "model_2026_11_07")
+        self.assertIs(pipeline.train_nn, mock_fallback_runner)
+
 
 if __name__ == "__main__":
     unittest.main()
