@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pulp
+from scipy.optimize import OptimizeResult, milp as real_milp
 
 from constants import Sites
 from find_best_team_linear_programming import (
@@ -78,7 +80,6 @@ class TestYahooLinearProgrammingSingleTeam(unittest.TestCase):
         # 1. Output shape & status
         self.assertEqual(len(team), 1)
         self.assertTrue(self.solver.last_result.success)
-        self.assertEqual(self.solver.prob.status, pulp.LpStatusOptimal)
 
         # 2. Salary Cap ($200)
         total_salary = team['salary'].iloc[0]
@@ -256,9 +257,8 @@ class TestYahooLinearProgrammingLateSwapAndResidualMilp(unittest.TestCase):
         chosen = team[slots].iloc[0].values
         self.assertEqual(len(set(chosen)), 8)
         self.assertIn('entry_id', team.columns)
-        self.assertIn('contest_id', team.columns)
+        self.assertNotIn('contest_id', team.columns)
         self.assertEqual(team['entry_id'].iloc[0], 777)
-        self.assertEqual(team['contest_id'].iloc[0], 777)
 
     def test_fully_locked_entry_returns_gracefully(self):
         """Verify an entry with all 8 slots locked returns immediately without MILP failure."""
@@ -341,6 +341,74 @@ class TestYahooLinearProgrammingLateSwapAndResidualMilp(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertTrue(solver.last_result.success)
 
+    def test_canonical_late_swap_locked_flex_slots_forces_cheap_sg(self):
+        """Verify locking PG in G and SG in UTIL leaves SG open and forces picking a cheap SG even when absent from pool."""
+        # Locked early-game players (omitted from remaining candidate pool_df)
+        locked_df = pd.DataFrame([
+            {'PLAYER_ID': 1, 'Pos': 'G', 'YAHOO_POSITION': 'PG', 'YAHOO_SALARY': 20.0},
+            {'PLAYER_ID': 2, 'Pos': 'UTIL', 'YAHOO_POSITION': 'SG', 'YAHOO_SALARY': 20.0},
+        ])
+        # Remaining pool: 1 PG, 2 SF, 2 PF, 1 C at $25 / 50 pts each + 1 cheap $10 / 10-pt SG
+        pool_df = pd.DataFrame([
+            {'PLAYER_ID': 10, 'YAHOO_POSITION': 'PG', 'YAHOO_SALARY': 25.0, 'YAHOO_POINTS': 50.0},
+            {'PLAYER_ID': 11, 'YAHOO_POSITION': 'SF', 'YAHOO_SALARY': 25.0, 'YAHOO_POINTS': 50.0},
+            {'PLAYER_ID': 12, 'YAHOO_POSITION': 'SF', 'YAHOO_SALARY': 25.0, 'YAHOO_POINTS': 50.0},
+            {'PLAYER_ID': 13, 'YAHOO_POSITION': 'PF', 'YAHOO_SALARY': 25.0, 'YAHOO_POINTS': 50.0},
+            {'PLAYER_ID': 14, 'YAHOO_POSITION': 'PF', 'YAHOO_SALARY': 25.0, 'YAHOO_POINTS': 50.0},
+            {'PLAYER_ID': 15, 'YAHOO_POSITION': 'C', 'YAHOO_SALARY': 25.0, 'YAHOO_POINTS': 50.0},
+            {'PLAYER_ID': 16, 'YAHOO_POSITION': 'SG', 'YAHOO_SALARY': 10.0, 'YAHOO_POINTS': 10.0},
+        ])
+
+        solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+            position_col='YAHOO_POSITION',
+            salary_col='YAHOO_SALARY',
+            points_col='YAHOO_POINTS',
+            player_col='PLAYER_ID',
+            num_teams_in_set=1,
+            verbose=False,
+        )
+        team = solver.run(df=pool_df, locked_dfs={501: locked_df})
+
+        self.assertEqual(len(team), 1)
+        self.assertEqual(team['G'].iloc[0], 1)
+        self.assertEqual(team['UTIL'].iloc[0], 2)
+        self.assertEqual(team['SG'].iloc[0], 16)
+        self.assertEqual(team['PG'].iloc[0], 10)
+        self.assertEqual(team['C'].iloc[0], 15)
+        self.assertEqual(set(team[['SF', 'PF', 'F']].iloc[0].values), {11, 12, 13, 14} & set(team[['SF', 'PF', 'F']].iloc[0].values))
+        self.assertEqual(len(set(team[['SF', 'PF', 'F']].iloc[0].values)), 3)
+        self.assertEqual(team['points'].iloc[0], 260.0)
+        self.assertEqual(team['salary'].iloc[0], 175.0)
+
+    def test_milp_time_limit_accepts_status_1_incumbent_and_rejects_none_x(self):
+        """Verify status=1 (time limit) with feasible x succeeds, while status=1 with x=None raises ValueError."""
+        df = _generate_synthetic_dfs_pool(n_players=40, seed=42)
+        solver = FindBestSetOfTeamsLinearProgrammingYahoo(
+            position_col='YAHOO_POSITION',
+            salary_col='YAHOO_SALARY',
+            points_col='YAHOO_POINTS',
+            player_col='PLAYER_ID',
+            num_teams_in_set=1,
+            verbose=False,
+        )
+
+        def fake_milp_incumbent(*args, **kwargs):
+            res = real_milp(*args, **kwargs)
+            self.assertEqual(kwargs.get('options', {}).get('time_limit'), 60.0)
+            return OptimizeResult(status=1, success=False, x=res.x, message="Time limit reached with incumbent")
+
+        with patch("find_best_team_linear_programming.milp", side_effect=fake_milp_incumbent):
+            team = solver.run(df=df)
+
+        slots = ['PG', 'SG', 'G', 'SF', 'PF', 'F', 'C', 'UTIL']
+        self.assertEqual(len(set(team[slots].iloc[0].values)), 8)
+
+        with patch(
+            "find_best_team_linear_programming.milp",
+            return_value=OptimizeResult(status=1, success=False, x=None, message="Time limit without incumbent"),
+        ):
+            with self.assertRaises(ValueError):
+                solver.run(df=df)
 
 
 if __name__ == '__main__':

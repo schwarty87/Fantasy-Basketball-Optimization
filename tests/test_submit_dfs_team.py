@@ -144,9 +144,9 @@ class TestSubmitDFSTeamYahooByCSV(unittest.TestCase):
 
         # _fill_template_with_predicted_teams matches on Entry ID
         mock_best_set = pd.DataFrame([
-            {'entry_id': 88001, 'contest_id': 15935109, 'PG': '101 - Player One', 'SG': '102 - Player Two',
+            {'entry_id': 88001, 'PG': '101 - Player One', 'SG': '102 - Player Two',
              'G': '', 'SF': '', 'PF': '', 'F': '', 'C': '', 'UTIL': ''},
-            {'entry_id': 88002, 'contest_id': 15935109, 'PG': '102 - Player Two', 'SG': '101 - Player One',
+            {'entry_id': 88002, 'PG': '102 - Player Two', 'SG': '101 - Player One',
              'G': '', 'SF': '', 'PF': '', 'F': '', 'C': '', 'UTIL': ''},
         ])
         SubmitDFSTeamYahooByCSV._fill_template_with_predicted_teams(inst, mock_best_set)
@@ -167,6 +167,92 @@ class TestSubmitDFSTeamYahooByCSV(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             SubmitDFSTeamYahooByCSV._get_template_df(inst)
         self.assertIn("we weren't able to load the template", str(cm.exception))
+
+    def test_get_locked_dfs_skips_nan_empty_slots_and_fill_template_rejects_missing_entry(self):
+        """Verify get_locked_dfs handles NaN empty slots and _fill_template_with_predicted_teams rejects unknown Entry IDs."""
+        cols = ['Entry ID', 'Contest ID'] + DFS_POSITIONS[Sites.YAHOO] + ['ID', 'ID + Name', 'Name', 'Position', 'Salary', 'Time']
+        template_df = pd.DataFrame(index=[0], columns=cols)
+        template_df.loc[0, 'Entry ID'] = 88001
+        template_df.loc[0, 'Contest ID'] = 15935109
+        for s in DFS_POSITIONS[Sites.YAHOO]:
+            template_df.loc[0, s] = np.nan
+
+        inst = MagicMock(spec=SubmitDFSTeamYahooByCSV)
+        inst._positions = DFS_POSITIONS[Sites.YAHOO]
+        inst._is_valid_contest_id = SubmitDFSTeamYahooByCSV._is_valid_contest_id
+        inst.template = template_df
+
+        with patch("submit_dfs_team.get_next_game_time", return_value="7:00PM"):
+            locked_dfs = SubmitDFSTeamYahooByCSV.get_locked_dfs(inst)
+
+        self.assertIn(88001, locked_dfs)
+        self.assertTrue(locked_dfs[88001].empty)
+
+        unknown_best_set = pd.DataFrame([
+            {'entry_id': 99999, **{s: '' for s in DFS_POSITIONS[Sites.YAHOO]}}
+        ])
+        with self.assertRaises(ValueError) as cm:
+            SubmitDFSTeamYahooByCSV._fill_template_with_predicted_teams(inst, unknown_best_set)
+        self.assertIn("Expected exactly 1 template row for Entry ID 99999", str(cm.exception))
+
+    def test_submit_best_set_waits_for_entry_ids_count_on_shared_contest(self):
+        """Verify submit_best_set checks 'We have detected 2 lineups' when 2 entries share 1 Contest ID."""
+        positions = DFS_POSITIONS[Sites.YAHOO]
+        cols = ['Entry ID', 'Contest ID'] + positions + ['ID', 'ID + Name', 'Name', 'Position', 'Salary', 'Time']
+        template_df = pd.DataFrame(index=range(8), columns=cols)
+        template_df.loc[0, 'Entry ID'] = 88001
+        template_df.loc[0, 'Contest ID'] = 15935109
+        template_df.loc[1, 'Entry ID'] = 88002
+        template_df.loc[1, 'Contest ID'] = 15935109
+
+        player_names = [f"Player {i}" for i in range(1, 9)]
+        player_id_names = [f"10{i} - Player {i}" for i in range(1, 9)]
+        template_df['ID'] = [f"10{i}" for i in range(1, 9)]
+        template_df['ID + Name'] = player_id_names
+        template_df['Name'] = player_names
+        template_df['Position'] = ['PG', 'SG', 'PG', 'SF', 'PF', 'SF', 'C', 'C']
+        template_df['Salary'] = [25] * 8
+        template_df['Time'] = ['7:00PM'] * 8
+
+        inst = MagicMock(spec=SubmitDFSTeamYahooByCSV)
+        inst._positions = positions
+        inst._is_valid_contest_id = SubmitDFSTeamYahooByCSV._is_valid_contest_id
+        inst.template = template_df
+        inst.contest_ids = [15935109]
+        inst.entry_ids = [88001, 88002]
+        inst.name_to_id = dict(zip(player_names, player_id_names))
+        inst._sort_players_by_time = lambda teams_df: teams_df
+        inst._fill_template_with_predicted_teams = lambda df: SubmitDFSTeamYahooByCSV._fill_template_with_predicted_teams(inst, df)
+        inst._template_path = MagicMock(return_value=os.path.join(self.temp_dir, "upload.csv"))
+        inst._assert_template_csv_finished_saving = MagicMock()
+        inst._start_driver = MagicMock()
+        inst._navigate_to_submit_csv_page = MagicMock(return_value=True)
+
+        mock_driver = MagicMock()
+        mock_file_input = MagicMock()
+        mock_driver.find_elements.return_value = [mock_file_input]
+        inst.driver = mock_driver
+
+        upload_btn = MagicMock()
+        marker_calls = []
+
+        def fake_find_by_two_markers(by1, value1, attribute_name, attribute_value):
+            marker_calls.append((value1, attribute_name, attribute_value))
+            if value1 == 'button' and attribute_value == 'Upload and edit entries':
+                return upload_btn
+            return MagicMock()
+
+        inst._find_element_by_two_markers = MagicMock(side_effect=fake_find_by_two_markers)
+
+        best_set = pd.DataFrame([
+            {'entry_id': 88001, **dict(zip(positions, player_names))},
+            {'entry_id': 88002, **dict(zip(positions, player_names))},
+        ])
+
+        SubmitDFSTeamYahooByCSV.submit_best_set(inst, best_set)
+
+        self.assertIn(('span', 'text', 'We have detected 2 lineups'), marker_calls)
+        upload_btn.click.assert_called_once()
 
 
 if __name__ == '__main__':

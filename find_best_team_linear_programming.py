@@ -441,13 +441,9 @@ class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgrammi
                 row['salary'] = sum(pool_salary_map.get(row[s], 0.0) for s in YAHOO_SLOTS)
                 row['points'] = sum(pool_points_map.get(row[s], 0.0) for s in YAHOO_SLOTS)
                 row['entry_id'] = entry_keys[t]
-                row['contest_id'] = entry_keys[t]
                 rows.append(row)
             self.last_result = OptimizeResult(success=True, status=0, message="all slots locked")
-            class DummyProb:
-                status = pulp.LpStatusOptimal
-            self.prob = DummyProb()
-            return pd.DataFrame(rows)[YAHOO_SLOTS + ['salary', 'points', 'entry_id', 'contest_id']]
+            return pd.DataFrame(rows)[YAHOO_SLOTS + ['salary', 'points', 'entry_id']]
 
         # 4. Define candidate player pools per team P_t and variable index map
         def _get_eligible_slots(pos_str: str) -> Set[str]:
@@ -633,7 +629,7 @@ class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgrammi
         constraints = LinearConstraint(A_csc, np.array(b_l), np.array(b_u))
         bounds = Bounds(np.array(lb_list), np.array(ub_list))
 
-        solver_options = {'presolve': True}
+        solver_options = {'presolve': True, 'time_limit': 60.0}
         if self._gap_rel is not None:
             solver_options['mip_rel_gap'] = self._gap_rel
         elif num_teams == 1:
@@ -649,13 +645,12 @@ class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgrammi
             options=solver_options
         )
 
-        if not res.success or res.x is None:
+        if not (res.success or res.status == 1) or res.x is None:
             raise ValueError(f"MILP solver failed: status={res.status}, message='{res.message}'")
+        if res.status == 1 and not res.success:
+            logging.warning(f"MILP solver hit time limit (status=1), using feasible incumbent: '{res.message}'")
 
         self.last_result = res
-        class DummyProb:
-            status = pulp.LpStatusOptimal
-        self.prob = DummyProb()
 
         # 8. Reconstruct solution DataFrame
         self._player_variables = {}
@@ -682,10 +677,9 @@ class FindBestSetOfTeamsLinearProgrammingYahoo(FindBestSetOfTeamsLinearProgrammi
             team_lineup['salary'] = sum(pool_salary_map[team_lineup[s]] for s in YAHOO_SLOTS)
             team_lineup['points'] = sum(pool_points_map[team_lineup[s]] for s in YAHOO_SLOTS)
             team_lineup['entry_id'] = entry_keys[t]
-            team_lineup['contest_id'] = entry_keys[t]
             rows.append(team_lineup)
 
-        results_df = pd.DataFrame(rows)[YAHOO_SLOTS + ['salary', 'points', 'entry_id', 'contest_id']]
+        results_df = pd.DataFrame(rows)[YAHOO_SLOTS + ['salary', 'points', 'entry_id']]
         if self._verbose:
             logging.info(f'\n{results_df.to_string()}')
         return results_df

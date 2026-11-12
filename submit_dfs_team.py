@@ -62,7 +62,7 @@ class SubmitDFSTeamYahooByCSV:
 
         logging.info('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         has_contest_inds = self.template['Contest ID'].apply(self._is_valid_contest_id)
-        template_str = f'template after downloading:\n{self.template.loc[has_contest_inds, ["Contest ID"] + self._positions].to_string()}'
+        template_str = f'template after downloading:\n{self.template.loc[has_contest_inds, ["Contest ID", "Entry ID"] + self._positions].to_string()}'
         template_str = remove_accents(template_str)
         logging.info(template_str)
         logging.info('<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
@@ -354,7 +354,7 @@ class SubmitDFSTeamYahooByCSV:
                 continue
             entry_id = int(entry_id)
             for p in self._positions:
-                if len(curr_row[p]) <= 1:
+                if pd.isna(curr_row[p]) or len(str(curr_row[p]).strip()) <= 1:
                     continue
                 curr_id = curr_row[p]
                 player_game_time = self._id_to_value(dict=self.id_to_game_time, id=curr_id)
@@ -381,8 +381,6 @@ class SubmitDFSTeamYahooByCSV:
         """Sorting each team so the players who play in the earlier games will be in the more restrictive positions"""
         if 'entry_id' in teams_df.columns:
             teams_df = teams_df.set_index('entry_id')
-        elif 'contest_id' in teams_df.columns:
-            teams_df = teams_df.set_index('contest_id')
 
         teams_df_sorted = teams_df.copy()
         eligibility = {p: self.template.loc[self.template['Position'].isin(ELIGIBILITY[p]), 'ID + Name'].values
@@ -424,21 +422,17 @@ class SubmitDFSTeamYahooByCSV:
 
     def _fill_template_with_predicted_teams(self, best_set_with_ids: pd.DataFrame):
         for _, curr_row in best_set_with_ids.iterrows():
-            if 'entry_id' in curr_row and pd.notna(curr_row['entry_id']):
-                key_col = 'Entry ID'
-                key_val = int(curr_row['entry_id'])
-            else:
-                key_col = 'Contest ID'
-                key_val = int(curr_row['contest_id'])
-            matches = self.template.loc[self.template[key_col] == key_val].index
-            if len(matches) > 0:
-                ind_in_template = matches[0]
-                self.template.loc[ind_in_template, self._positions] = curr_row[self._positions].values
+            key_val = int(curr_row['entry_id'])
+            matches = self.template.loc[self.template['Entry ID'] == key_val].index
+            if len(matches) != 1:
+                raise ValueError(f"Expected exactly 1 template row for Entry ID {key_val}, found {len(matches)}")
+            ind_in_template = matches[0]
+            self.template.loc[ind_in_template, self._positions] = curr_row[self._positions].values
 
     def submit_best_set(self, best_set: pd.DataFrame):
         """
         Submit the given set of teams to yahoo by updating the template and uploading a csv
-        :param best_set: a dataframe with the best set. The columns should be (all positions), salary, contest_id
+        :param best_set: a dataframe with the best set. The columns should be (all positions), salary, entry_id
                          The value in each position should be the player name (not player id))
         """
         best_set_with_ids = best_set.copy()
@@ -488,8 +482,8 @@ class SubmitDFSTeamYahooByCSV:
                                                                        attribute_name='accessible_name',
                                                                        attribute_value=attribute_value)
             choose_file_button.send_keys(self._template_path())
-            detected_txt = f"We have detected {len(self.contest_ids)} lineup"
-            if len(self.contest_ids) > 1:
+            detected_txt = f"We have detected {len(self.entry_ids)} lineup"
+            if len(self.entry_ids) > 1:
                 detected_txt += "s"
             WebDriverWait(self.driver, 10).until(
                 lambda driver: self._find_element_by_two_markers(By.TAG_NAME, 'span', 'text', detected_txt))
@@ -498,7 +492,7 @@ class SubmitDFSTeamYahooByCSV:
                                                                        attribute_value='Upload and edit entries')
 
             upload_and_edit_button.click()
-            entry_str = 'entries' if len(self.contest_ids) > 1 else 'entry'
+            entry_str = 'entries' if len(self.entry_ids) > 1 else 'entry'
             success_text = f"Contest {entry_str} edited successfully!"
             try:
                 WebDriverWait(self.driver, 15).until(
@@ -522,7 +516,7 @@ class SubmitDFSTeamYahooByCSV:
 
             logging.info('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
             has_contest_inds = self.template['Contest ID'].apply(self._is_valid_contest_id)
-            template_str = f'template after submitting:\n{self.template.loc[has_contest_inds, ["Contest ID"] + self._positions].to_string()}'
+            template_str = f'template after submitting:\n{self.template.loc[has_contest_inds, ["Contest ID", "Entry ID"] + self._positions].to_string()}'
             template_str = remove_accents(template_str)
             logging.info(template_str)
             logging.info('<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
