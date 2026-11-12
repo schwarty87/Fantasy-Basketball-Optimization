@@ -105,6 +105,7 @@ class FeaturesParams(AbstractParams):
 class TrainingParams(AbstractParams):
     """This class holds all parameters needed for training a neural network model."""
     learning_rate: float = 0.01
+    weight_decay: float = 1e-4
     batch_size: int | None = 256
     training_dtype: torch.dtype = torch.float32
     save_to_db: bool = True
@@ -153,6 +154,8 @@ class TrainingParams(AbstractParams):
                 raise ValueError('batch_size must be an integer!')
         if self.learning_rate <= 0:
             raise ValueError('learning_rate must be a positive value!')
+        if self.weight_decay is not None and self.weight_decay < 0:
+            raise ValueError('weight_decay must be non-negative!')
         if self.num_epochs is not None and self.num_epochs <= 0:
             raise ValueError('num_epochs must be a positive value!')
 

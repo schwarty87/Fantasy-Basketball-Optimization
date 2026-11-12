@@ -53,6 +53,15 @@
 - **Multi-Entry `Entry ID` Keying**: `SubmitDFSTeamYahooByCSV` keys lineup sets by `Entry ID` rather than `Contest ID`. Multiple lineups submitted into the same contest (e.g. multi-entry GPPs) preserve independent row identity without colliding or overwriting each other in the Yahoo upload template.
 - **Cash vs. GPP Strategy Routing**: In `run_full_pipeline()`, cash contests (50/50, Double Up, Head-to-Head) are solved independently to maximize expected median/floor without forced diversity, whereas tournament (GPP) entries are solved jointly with pairwise overlap constraints (`max_shared_players_in_teams_pairs = 4`) and single-player set avoidance (`avoid_single_player_in_all_sets = True` when $\ge 3$).
 
+### Masked Input Scalers & Transformer Attention Masking (`machine_learning/` & `run_all.py`)
+- **Real-Player Indicator (`IS_REAL_PLAYER`)**: Identifies actual participating NBA players (`PLAYER_ID != UNKNOWN_PLAYER_ID`) to isolate them from synthetic bench-padding slots (6 per team, 12 per game). `NOT_IGNORE` strictly combines `IS_REAL_PLAYER & ~(EJECTED | LEFT_MIDGAME)`.
+- **Masked Scaler Fitting & Zero Fill (`masked_fill_value`)**: `tabular` and `lagged` feature datasets configure `relevant_keep_mask_dataset_name='real_player_mask'` and `masked_fill_value=0.0`. `StandardScaler` calculates means and standard deviations strictly on active players, and fills dummy padding slots with `0.0` (normalized mean) rather than arbitrary unscaled `-999.0` sentinels.
+- **Contextual Key-Padding Masking (`_build_safe_key_padding_mask`)**: Plumbs `real_player_mask` through `SplitAttentionCombineWrapper`, `SplitAttentionCombine`, and `TransformerEncoderPytorch`. Within-team attention masks dummy teammates, between-team attention masks dummy opponents (`between1` uses `m2`, `between2` uses `m1`), and global attention ignores dummy slots, with automatic row unmasking to prevent softmax `NaN`s on fully-padded batches.
+- **Principled Regularization & Decoupled Weight Decay**: To prevent post-convergence overfitting once clean inputs and attention are unmasked:
+  - `TrainingParams.weight_decay` (`1e-4` default) partitions model parameters into decay (2D weight tensors in linear & attention projections) and no-decay (1D biases, LayerNorm parameters, and categorical embedding tables) in `AdamW`.
+  - Tighter early stopping (`patience=4`) and proactive plateau scheduling (`ReduceLearningRateOnPlateau(patience=2)`) terminate training before idiosyncratic training-set memorization occurs.
+  - Increased dropout on the final dense prediction head (`0.25`) and transformer attention layers (`0.30`).
+
 ## Data Consistency & Validation Guidelines
 
 ### Feather & PyArrow Type Strictness (Pandas 2.2+ / PyArrow 19+)

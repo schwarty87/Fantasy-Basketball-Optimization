@@ -62,6 +62,9 @@ class TestFantasyBasketballLightningModule(unittest.TestCase):
         batch["keep_mask"] = torch.ones(
             (num_games, n_players_per_game, 1), dtype=torch.float32
         )
+        batch["real_player_mask"] = torch.ones(
+            (num_games, n_players_per_game, 1), dtype=torch.float32
+        )
 
         # METADATA: ['DATE', 'split_type', 'PLAYER_ID', 'YAHOO_SALARY', 'YAHOO_POSITION', 'YAHOO_POINTS']
         meta = np.zeros((num_games, n_players_per_game, len(meta_features)), dtype=np.float32)

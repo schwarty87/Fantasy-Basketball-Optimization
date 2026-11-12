@@ -239,8 +239,11 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                                 (features_df['SEASON_YEAR'].astype(int) - 2000).astype(str)
             features_df['PLAYER_SEASON'] = player_season_str.astype(np.int32)
 
-        features_df['NOT_IGNORE'] = ~(features_df['EJECTED'] | features_df['LEFT_MIDGAME'])
-        features_df['NOT_IGNORE'] = features_df['NOT_IGNORE'].astype(int).replace({0: IGNORE_VAL})
+        is_real_player = features_df['PLAYER_ID'].fillna(UNKNOWN_PLAYER_ID) != UNKNOWN_PLAYER_ID
+        not_ignore = is_real_player & ~(features_df['EJECTED'].fillna(False).astype(bool) | features_df['LEFT_MIDGAME'].fillna(False).astype(bool))
+        features_df['NOT_IGNORE'] = np.where(not_ignore, 1, IGNORE_VAL)
+        if 'IS_REAL_PLAYER' in missing_columns or 'IS_REAL_PLAYER' not in features_df.columns:
+            features_df['IS_REAL_PLAYER'] = np.where(is_real_player, 1, IGNORE_VAL)
 
         # adding mean ratios
         for c in missing_columns:

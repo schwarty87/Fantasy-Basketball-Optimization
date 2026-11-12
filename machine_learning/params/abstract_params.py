@@ -253,6 +253,7 @@ class AbstractMachineLearningDatasetParams(AbstractParams, ABC):
     # Some datasets do preprocessing, we want to exclude ignored values for the preprocessing only on the
     # `relevant_keep_mask_dataset_name` dataset
     relevant_keep_mask_dataset_name: Optional[str] = None
+    masked_fill_value: Optional[float] = None
 
     def __post_init__(self):
         super().__post_init__()

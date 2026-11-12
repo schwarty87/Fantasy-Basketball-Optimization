@@ -337,7 +337,25 @@ class RunModel:
         return callbacks
 
     def _define_optimizer(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(self.model.parameters(), lr=self.params.training_params.learning_rate)
+        lr = self.params.training_params.learning_rate
+        weight_decay = getattr(self.params.training_params, "weight_decay", 1e-4)
+        if weight_decay and weight_decay > 0 and self.model is not None:
+            decay_params = []
+            no_decay_params = []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if param.ndim <= 1 or "bias" in name or "norm" in name.lower() or "embedding" in name.lower():
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+            param_groups = []
+            if decay_params:
+                param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+            if no_decay_params:
+                param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+            return torch.optim.AdamW(param_groups if param_groups else self.model.parameters(), lr=lr)
+        return torch.optim.AdamW(self.model.parameters(), lr=lr)
 
     def _should_update_optimizer(self, batch_num: int) -> bool:
         if not self.model.training:
@@ -707,7 +725,16 @@ class RunModel:
             if loader is None:
                 return {}
 
-            self.trainer.validate(model=self.model, dataloaders=loader, verbose=False)
+            # Suppress TensorBoard logging during standalone offline evaluation (e.g. eval_all_data)
+            orig_loggers = getattr(self.trainer, "_loggers", None)
+            if summary_writer is None and hasattr(self.trainer, "_loggers"):
+                self.trainer._loggers = []
+            try:
+                self.trainer.validate(model=self.model, dataloaders=loader, verbose=False)
+            finally:
+                if orig_loggers is not None and hasattr(self.trainer, "_loggers"):
+                    self.trainer._loggers = orig_loggers
+
             metric_name_to_result_eval = copy.deepcopy(getattr(self.model, "_last_epoch_eval_results", {}))
         else:
             if callbacks is None:

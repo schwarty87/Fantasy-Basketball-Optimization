@@ -221,49 +221,89 @@ class CombineTensors(AbstractLayer):
         raise ValueError('combine_func_str has to be one of "concat/"sum"!')
 
 
+def _build_safe_key_padding_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """
+    Build a safe key_padding_mask for PyTorch MultiheadAttention / TransformerEncoder.
+    Input mask: Tensor of 1s (real player) and 0s (dummy slot), with shape (B, S) or (B, S, 1).
+    Returns: Boolean tensor where True = masked (dummy) and False = unmasked (real).
+    Guarantees no all-masked rows to prevent softmax(-inf) NaNs.
+    """
+    if mask is None:
+        return None
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
+    # PyTorch key_padding_mask: True means IGNORE/MASK OUT
+    pad_mask = (mask <= 0)
+    # Prevent all-masked sequence NaNs in softmax
+    all_masked = pad_mask.all(dim=-1, keepdim=True)
+    if all_masked.any():
+        pad_mask = pad_mask & (~all_masked)
+    return pad_mask.to(dtype=torch.bool)
+
+
 @layers_registry.register
 class TransformerEncoderPytorch(AbstractLayer):
-    def __init__(self, params: TransformerEncoderPytorchParams, input_shape: Tuple[int, ...]):
+    def __init__(self, params: TransformerEncoderPytorchParams, input_shape: LayersInputOutputShape):
         super().__init__(params=params, input_shape=input_shape)
 
         encoder_layer = nn.TransformerEncoderLayer(**params.transformer_encoder_layer_kwargs)
         self.layer = nn.TransformerEncoder(encoder_layer=encoder_layer, **params.transformer_encoder_kwargs)
 
-    def forward(self, x):
-        return self.layer(x)
+    def forward(self, x: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
+        if isinstance(x, dict):
+            tensor_x = x['x']
+            mask = x.get('mask')
+        else:
+            tensor_x = x
+            mask = None
+        key_padding_mask = _build_safe_key_padding_mask(mask)
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.to(device=tensor_x.device)
+        return self.layer(tensor_x, src_key_padding_mask=key_padding_mask)
 
     def output_shape(self) -> LayersInputOutputShape:
+        if isinstance(self.input_shape, dict):
+            return self.input_shape['x']
         return self.input_shape
 
 
 @layers_registry.register
 class SplitAttentionCombineWrapper(AbstractLayer):
-    def __init__(self, params: SplitAttentionCombineWrapperParams, input_shape: Tuple[int, ...]):
+    def __init__(self, params: SplitAttentionCombineWrapperParams, input_shape: LayersInputOutputShape):
         super(SplitAttentionCombineWrapper, self).__init__(params=params, input_shape=input_shape)
         single_layer_params = SplitAttentionCombineParams(**params.single_layer_kwargs)
         self.layers = nn.ModuleList([SplitAttentionCombine(params=single_layer_params, input_shape=input_shape)
                                      for _ in range(params.num_layers)]
                                     )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Union[torch.Tensor, Dict[str, torch.Tensor]], mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if isinstance(x, dict):
+            if mask is None:
+                mask = x.get('mask')
+            tensor_x = x['x']
+        else:
+            tensor_x = x
         for layer in self.layers:
-            x = layer(x)
-        return x
+            tensor_x = layer(tensor_x, mask=mask)
+        return tensor_x
 
     def output_shape(self) -> LayersInputOutputShape:
+        if isinstance(self.input_shape, dict):
+            return self.input_shape['x']
         return self.input_shape
 
 
 @layers_registry.register
 class SplitAttentionCombine(AbstractLayer):
-    def __init__(self, params: SplitAttentionCombineParams, input_shape: Tuple[int, ...]):
+    def __init__(self, params: SplitAttentionCombineParams, input_shape: LayersInputOutputShape):
         super(SplitAttentionCombine, self).__init__(params=params, input_shape=input_shape)
         transformer_encoder_params = TransformerEncoderCustomParams(input_tensor_name='', output_tensor_name=None,
                                                                     d_model=params.d_model, n_heads=params.n_heads,
                                                                     ffdim=params.ffdim, dropout_rate=params.dropout_rate,
                                                                     norm_at_beginning=params.norm_at_beginning,
                                                                     activation=params.activation)
-        transformer_encoder_input_shape = (input_shape[0] // 2, input_shape[-1])
+        x_shape = input_shape['x'] if isinstance(input_shape, dict) else input_shape
+        transformer_encoder_input_shape = (x_shape[0] // 2, x_shape[-1])
         self.transformer_encoder_within = TransformerEncoderCustom(params=transformer_encoder_params,
                                                                    input_shape=transformer_encoder_input_shape)
         self.transformer_encoder_between = TransformerEncoderCustom(params=transformer_encoder_params,
@@ -276,12 +316,25 @@ class SplitAttentionCombine(AbstractLayer):
         # self.linear2 = nn.Conv1d(input_shape[0], input_shape[0] // 2, kernel_size=1)
         # # self.linear3 = nn.Conv1d(input_shape[0] * 2, input_shape[0], kernel_size=1)
 
-    def forward(self, x: torch.Tensor):
-        x1, x2 = torch.split(x, 5 + self.params.n_bench_players, dim=1)
-        within1 = self.transformer_encoder_within(x1)
-        within2 = self.transformer_encoder_within(x2)
-        between1 = self.transformer_encoder_between(x1, x2)
-        between2 = self.transformer_encoder_between(x2, x1)
+    def forward(self, x: Union[torch.Tensor, Dict[str, torch.Tensor]], mask: Optional[torch.Tensor] = None):
+        if isinstance(x, dict):
+            if mask is None:
+                mask = x.get('mask')
+            x = x['x']
+
+        n_team = 5 + self.params.n_bench_players
+        x1, x2 = torch.split(x, n_team, dim=1)
+        if mask is not None:
+            if mask.ndim == 3 and mask.shape[-1] == 1:
+                mask = mask.squeeze(-1)
+            m1, m2 = torch.split(mask, n_team, dim=1)
+        else:
+            m1, m2 = None, None
+
+        within1 = self.transformer_encoder_within(x1, mask=m1)
+        within2 = self.transformer_encoder_within(x2, mask=m2)
+        between1 = self.transformer_encoder_between(x1, x2, mask=m2)
+        between2 = self.transformer_encoder_between(x2, x1, mask=m1)
 
         fused1 = torch.cat([within1, between1], dim=-1)
         fused2 = torch.cat([within2, between2], dim=-1)
@@ -294,6 +347,8 @@ class SplitAttentionCombine(AbstractLayer):
         return out_combined
 
     def output_shape(self) -> LayersInputOutputShape:
+        if isinstance(self.input_shape, dict):
+            return self.input_shape['x']
         return self.input_shape
 
 
@@ -330,7 +385,11 @@ class TransformerEncoderCustom(AbstractLayer):
                                          nn.Linear(in_features=params.ffdim, out_features=params.d_model)
                                          )
 
-    def forward(self, query, key=None, value=None):
+    def forward(self, query, key=None, value=None, mask=None):
+        if isinstance(query, dict):
+            if mask is None:
+                mask = query.get('mask')
+            query = query['x']
         x = query
         if key is None:
             key = query
@@ -342,8 +401,14 @@ class TransformerEncoderCustom(AbstractLayer):
         elif self.params.norm_at_beginning:
             value = self.norm1(value)
 
+        key_padding_mask = _build_safe_key_padding_mask(mask)
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask.to(device=query.device)
+
         # attention
-        attn_output, attn_output_weights = self.attn(query, key, value)
+        attn_output, attn_output_weights = self.attn(
+            query, key, value, key_padding_mask=key_padding_mask
+        )
         attn_output = self.dropout(attn_output)
         attn_output = attn_output + x
         if not self.params.norm_at_beginning:
@@ -361,6 +426,8 @@ class TransformerEncoderCustom(AbstractLayer):
         return ff_output
 
     def output_shape(self) -> LayersInputOutputShape:
+        if isinstance(self.input_shape, dict):
+            return self.input_shape['x']
         return self.input_shape
 
 

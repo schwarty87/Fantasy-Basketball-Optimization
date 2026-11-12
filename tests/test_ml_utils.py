@@ -16,20 +16,35 @@ from constants import Sites
 from machine_learning.callbacks import CollectTruePredictedOutputs, CollectTruePredictedOutputsParams
 from machine_learning.constants import METADATA
 from machine_learning.enums import Reduction, ModelMode, DataSplitType
-from machine_learning.layers.layers import EmbeddingsLayer
+from machine_learning.layers.layers import (
+    EmbeddingsLayer,
+    _build_safe_key_padding_mask,
+    TransformerEncoderPytorch,
+    SplitAttentionCombineWrapper,
+    SplitAttentionCombine,
+    TransformerEncoderCustom,
+)
 from machine_learning.machine_learning_datasets import (
     MachineLearningDatasetCombined,
     MachineLearningDatasetMetadata,
+    AbstractScalingMachineLearningDataset,
     dates_to_epoch_days,
 )
 from machine_learning.metrics.abstract_metrics import AbstractMetric
 from machine_learning.params.abstract_params import AbstractMetricParams
-from machine_learning.params.layers_params import EmbeddingsLayerParams
+from machine_learning.params.layers_params import (
+    EmbeddingsLayerParams,
+    TransformerEncoderPytorchParams,
+    SplitAttentionCombineParams,
+    SplitAttentionCombineWrapperParams,
+    TransformerEncoderCustomParams,
+)
 from machine_learning.params.machine_learning_dataset_params import (
     MachineLearningDatasetTabularCategoricalEncodingParams,
     MachineLearningDatasetTabularScalingParams,
 )
-from machine_learning.params.params import FeaturesParams
+from machine_learning.lightning_model import MachineLearningLightningModule
+from machine_learning.params.params import FeaturesParams, TrainingParams
 from machine_learning.run_model import RunModel
 from machine_learning.utils import CustomOrdinalEncoder, get_next_model_id
 from machine_learning_fantasy_basketball_predictions.layers import (
@@ -663,6 +678,202 @@ class TestDateFilteredDataLoader(unittest.TestCase):
         target_d = pd.to_datetime(20001.0, unit='D').date()
         loader = ds.create_date_filtered_data_loader([target_d], batch_size=10)
         self.assertEqual(len(loader.dataset), 30)
+
+
+class TestKeyPaddingMaskAndAttention(unittest.TestCase):
+    def test_build_safe_key_padding_mask(self):
+        """Verify _build_safe_key_padding_mask produces correct booleans and avoids all-masked NaNs."""
+        # Standard mask: 1 is real (False), 0 is dummy (True)
+        mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        pad_mask = _build_safe_key_padding_mask(mask)
+        self.assertTrue(torch.equal(pad_mask, torch.tensor([[False, False, True, True]])))
+
+        # 3D mask with trailing 1 dimension: (B, S, 1) -> (B, S)
+        mask_3d = torch.tensor([[[1.0], [0.0], [1.0]]])
+        pad_mask_3d = _build_safe_key_padding_mask(mask_3d)
+        self.assertEqual(pad_mask_3d.shape, (1, 3))
+        self.assertTrue(torch.equal(pad_mask_3d, torch.tensor([[False, True, False]])))
+
+        # All-masked row protection: should NOT be all-True (prevents softmax -inf NaN)
+        all_zeros = torch.tensor([[0.0, 0.0, 0.0]])
+        safe_mask = _build_safe_key_padding_mask(all_zeros)
+        self.assertFalse(safe_mask.all().item(), "All-masked sequence must be unmasked to prevent softmax NaN")
+
+    def test_transformer_encoder_custom_with_mask(self):
+        """Verify TransformerEncoderCustom accepts mask and outputs finite values."""
+        params = TransformerEncoderCustomParams(
+            input_tensor_name='x',
+            d_model=32,
+            n_heads=4,
+            ffdim=64,
+        )
+        layer = TransformerEncoderCustom(params=params, input_shape=(10, 32))
+        x = torch.randn(2, 10, 32)
+        mask = torch.tensor([[1.0] * 8 + [0.0] * 2, [1.0] * 5 + [0.0] * 5])
+
+        out = layer(x, mask=mask)
+        self.assertEqual(out.shape, (2, 10, 32))
+        self.assertFalse(torch.isnan(out).any())
+
+        # Test dictionary input
+        out_dict = layer({'x': x, 'mask': mask})
+        self.assertEqual(out_dict.shape, (2, 10, 32))
+        self.assertFalse(torch.isnan(out_dict).any())
+
+    def test_split_attention_combine_with_dict_and_mask(self):
+        """Verify SplitAttentionCombine splits mask correctly into m1 and m2 for within and between attention."""
+        params = SplitAttentionCombineParams(
+            input_tensor_name={'x': 'inputs', 'mask': 'real_player_mask'},
+            d_model=32,
+            n_heads=4,
+            ffdim=64,
+            n_bench_players=6,  # 5 + 6 = 11 players per team, 22 total
+        )
+        layer = SplitAttentionCombine(params=params, input_shape={'x': (22, 32), 'mask': (22, 1)})
+        self.assertEqual(layer.output_shape(), (22, 32))
+
+        x = torch.randn(2, 22, 32)
+        # Team 1 has 9 real players, Team 2 has 10 real players
+        mask = torch.tensor([
+            [1.0] * 9 + [0.0] * 2 + [1.0] * 10 + [0.0] * 1,
+            [1.0] * 11 + [1.0] * 8 + [0.0] * 3,
+        ])
+        out = layer({'x': x, 'mask': mask})
+        self.assertEqual(out.shape, (2, 22, 32))
+        self.assertFalse(torch.isnan(out).any())
+
+    def test_split_attention_combine_wrapper_with_dict(self):
+        """Verify SplitAttentionCombineWrapper passes mask through all inner layers."""
+        params = SplitAttentionCombineWrapperParams(
+            input_tensor_name={'x': 'inputs', 'mask': 'real_player_mask'},
+            d_model=32,
+            n_heads=4,
+            ffdim=64,
+            n_bench_players=6,
+            num_layers=2,
+        )
+        wrapper = SplitAttentionCombineWrapper(params=params, input_shape={'x': (22, 32), 'mask': (22, 1)})
+        self.assertEqual(wrapper.output_shape(), (22, 32))
+
+        x = torch.randn(2, 22, 32)
+        mask = torch.ones(2, 22)
+        mask[:, -3:] = 0.0  # 3 dummy players
+        out = wrapper({'x': x, 'mask': mask})
+        self.assertEqual(out.shape, (2, 22, 32))
+        self.assertFalse(torch.isnan(out).any())
+
+    def test_transformer_encoder_pytorch_with_dict(self):
+        """Verify TransformerEncoderPytorch extracts mask from dict and runs attention."""
+        params = TransformerEncoderPytorchParams(
+            input_tensor_name={'x': 'inputs', 'mask': 'real_player_mask'},
+            d_model=32,
+            nhead=4,
+            dim_feedforward=64,
+            num_layers=1,
+            norm_first=True,
+        )
+        layer = TransformerEncoderPytorch(params=params, input_shape={'x': (22, 32), 'mask': (22, 1)})
+        self.assertEqual(layer.output_shape(), (22, 32))
+
+        x = torch.randn(2, 22, 32)
+        mask = torch.ones(2, 22)
+        mask[:, -2:] = 0.0
+        out = layer({'x': x, 'mask': mask})
+        self.assertEqual(out.shape, (2, 22, 32))
+        self.assertFalse(torch.isnan(out).any())
+
+
+class TestMaskedFeatureScaling(unittest.TestCase):
+    def test_scale_features_with_masked_fill_value(self):
+        """Verify _scale_features replaces masked entries with masked_fill_value instead of unscaled numbers."""
+        scaler = StandardScaler()
+        df = pd.DataFrame({
+            'stat1': [10.0, 20.0, 30.0, -999.0],
+            'stat2': [1.0, 2.0, 3.0, -999.0],
+        })
+        keep_mask = np.array([1, 1, 1, 0])
+        # Fit scaler on non-masked rows
+        scaler.fit(df.iloc[:3])
+
+        # Without masked_fill_value: row 3 keeps raw -999.0
+        res_raw = AbstractScalingMachineLearningDataset._scale_features(
+            scaler=scaler, features_to_scale=df, keep_mask=keep_mask, masked_fill_value=None
+        )
+        self.assertEqual(res_raw.loc[3, 'stat1'], -999.0)
+
+        # With masked_fill_value=0.0: row 3 gets 0.0
+        res_filled = AbstractScalingMachineLearningDataset._scale_features(
+            scaler=scaler, features_to_scale=df, keep_mask=keep_mask, masked_fill_value=0.0
+        )
+        self.assertEqual(res_filled.loc[3, 'stat1'], 0.0)
+        self.assertEqual(res_filled.loc[3, 'stat2'], 0.0)
+        # Scaled values on real rows are preserved
+        self.assertAlmostEqual(res_filled.loc[0, 'stat1'], (10.0 - 20.0) / scaler.scale_[0])
+
+
+class TestRegularizationAndWeightDecay(unittest.TestCase):
+    class SimpleModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(10, 8)
+            self.linear = nn.Linear(8, 16)
+            self.norm = nn.LayerNorm(16)
+            self.head = nn.Linear(16, 2)
+
+    def test_training_params_weight_decay(self):
+        """Verify TrainingParams default weight_decay and validation."""
+        tp = TrainingParams(learning_rate=0.001)
+        self.assertEqual(tp.weight_decay, 1e-4)
+
+        tp_custom = TrainingParams(learning_rate=0.001, weight_decay=1e-3)
+        self.assertEqual(tp_custom.weight_decay, 1e-3)
+
+        with self.assertRaises(ValueError):
+            TrainingParams(learning_rate=0.001, weight_decay=-0.01)
+
+    def test_decoupled_weight_decay_parameter_groups(self):
+        """Verify 2D weights get weight_decay while embeddings, biases, and norms get 0.0."""
+        model = self.SimpleModule()
+        mock_params = MagicMock()
+        mock_params.training_params.learning_rate = 0.001
+        mock_params.training_params.weight_decay = 1e-4
+        mock_params.training_params.callbacks_params = ()
+
+        module = MachineLearningLightningModule(params=mock_params, model=model)
+
+        optimizer = module.configure_optimizers()
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
+        self.assertEqual(len(optimizer.param_groups), 2)
+
+        decay_group = optimizer.param_groups[0]
+        no_decay_group = optimizer.param_groups[1]
+
+        self.assertEqual(decay_group["weight_decay"], 1e-4)
+        self.assertEqual(no_decay_group["weight_decay"], 0.0)
+
+        # Decay group should contain linear.weight and head.weight (2D)
+        decay_shapes = [p.shape for p in decay_group["params"]]
+        self.assertIn(torch.Size([16, 8]), decay_shapes)
+        self.assertIn(torch.Size([2, 16]), decay_shapes)
+
+        # No decay group should contain embedding.weight, linear.bias, norm.weight, norm.bias, head.bias
+        no_decay_shapes = [p.shape for p in no_decay_group["params"]]
+        self.assertIn(torch.Size([10, 8]), no_decay_shapes)
+        self.assertIn(torch.Size([16]), no_decay_shapes)
+        self.assertIn(torch.Size([2]), no_decay_shapes)
+
+    def test_zero_weight_decay_falls_back_to_single_group(self):
+        """Verify weight_decay=0.0 does not create split decay groups."""
+        model = self.SimpleModule()
+        mock_params = MagicMock()
+        mock_params.training_params.learning_rate = 0.001
+        mock_params.training_params.weight_decay = 0.0
+        mock_params.training_params.callbacks_params = ()
+
+        module = MachineLearningLightningModule(params=mock_params, model=model)
+
+        optimizer = module.configure_optimizers()
+        self.assertEqual(len(optimizer.param_groups), 1)
 
 
 if __name__ == "__main__":

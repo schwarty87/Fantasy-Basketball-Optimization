@@ -219,7 +219,11 @@ class AbstractScalingMachineLearningDataset(AbstractMachineLearningDataset, ABC)
             if keep_mask is not None:
                 keep_mask_train = keep_mask[self._features_df['split_type'] == DataSplitType.TRAIN]
             self.scaler = _calculate_scaler(scale_data=train_data, keep_mask=keep_mask_train)
-        self._features_df = self._scale_features(self.scaler, features_to_scale=self._features_df, keep_mask=keep_mask)
+        masked_fill_val = getattr(self.params, 'masked_fill_value', None)
+        self._features_df = self._scale_features(
+            self.scaler, features_to_scale=self._features_df, keep_mask=keep_mask,
+            masked_fill_value=masked_fill_val
+        )
 
     @classmethod
     def load_scaler(cls, load_dir, dataset_name: str) -> Optional[StandardScaler]:
@@ -232,8 +236,8 @@ class AbstractScalingMachineLearningDataset(AbstractMachineLearningDataset, ABC)
                 pkl.dump(self.scaler, f)
 
     @staticmethod
-    def _scale_features(scaler: StandardScaler, features_to_scale: pd.DataFrame, keep_mask: Optional[np.ndarray] = None
-                        ) -> pd.DataFrame:
+    def _scale_features(scaler: StandardScaler, features_to_scale: pd.DataFrame, keep_mask: Optional[np.ndarray] = None,
+                        masked_fill_value: Optional[float] = None) -> pd.DataFrame:
         scaler_columns = scaler.feature_names_in_
         features_to_scale = features_to_scale.copy()
         scaled_features = pd.DataFrame(scaler.transform(features_to_scale[scaler_columns]),
@@ -242,8 +246,9 @@ class AbstractScalingMachineLearningDataset(AbstractMachineLearningDataset, ABC)
             features_to_scale[scaler_columns] = scaled_features
         else:
             keep_mask = _reshape_keep_mask(keep_mask, scaled_features)
+            rhs = features_to_scale[scaler_columns] if masked_fill_value is None else masked_fill_value
             features_to_scale[scaler_columns] = \
-                np.where(keep_mask.astype(bool), scaled_features, features_to_scale[scaler_columns])
+                np.where(keep_mask.astype(bool), scaled_features, rhs)
         return features_to_scale
 
 

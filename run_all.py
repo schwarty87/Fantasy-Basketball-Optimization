@@ -97,10 +97,14 @@ def create_features_params() -> FeaturesParamsFantasyBasketballPredictions:
     feature_name_to_machine_learning_dataset_params = {
         'tabular': MachineLearningDatasetTabularScalingParams(
             feature_names=['DAYS_REST', 'SEASON_PROGRESS'],
+            relevant_keep_mask_dataset_name='real_player_mask',
+            masked_fill_value=0.0,
             dtype=features_dtype,
         ),
         'lagged': MachineLearningDatasetTabularScalingParams(
             feature_names=[f'{stat}_t-{lag}' for stat in output_features for lag in range(1, 10)],
+            relevant_keep_mask_dataset_name='real_player_mask',
+            masked_fill_value=0.0,
             dtype=features_dtype,
         ),
         'positional_encoding_features': MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams(
@@ -130,6 +134,10 @@ def create_features_params() -> FeaturesParamsFantasyBasketballPredictions:
         ),
         'keep_mask': MachineLearningDatasetKeepMaskTabularParams(
             feature_names=['NOT_IGNORE'],
+            dtype=features_dtype,
+        ),
+        'real_player_mask': MachineLearningDatasetKeepMaskTabularParams(
+            feature_names=['IS_REAL_PLAYER'],
             dtype=features_dtype,
         ),
     }
@@ -212,12 +220,13 @@ def create_architecture_params(
 
     # 5. Team-level contextual attention (within vs between teams)
     transformer_encoder_params_1 = SplitAttentionCombineWrapperParams(
-        input_tensor_name=inputs_encoder_params.output_tensor_name,
+        input_tensor_name={'x': inputs_encoder_params.output_tensor_name,
+                           'mask': 'real_player_mask'},
         output_tensor_name='transformer_output_1',
         d_model=d_model,
         n_heads=n_heads,
         ffdim=d_model * 4,
-        dropout_rate=0.25,
+        dropout_rate=0.30,
         norm_at_beginning=True,
         n_bench_players=features_params.num_bench_players,
         num_layers=1,
@@ -226,12 +235,13 @@ def create_architecture_params(
 
     # 6. Global multi-head self-attention across all 22 active players
     transformer_encoder_params = TransformerEncoderPytorchParams(
-        input_tensor_name=transformer_encoder_params_1.output_tensor_name,
+        input_tensor_name={'x': transformer_encoder_params_1.output_tensor_name,
+                           'mask': 'real_player_mask'},
         output_tensor_name='transformer_output',
         d_model=d_model,
         nhead=n_heads,
         dim_feedforward=d_model * 4,
-        dropout=0.25,
+        dropout=0.30,
         norm_first=True,
         num_layers=2,
         activation=ActivationFunction.GELU,
@@ -258,7 +268,7 @@ def create_architecture_params(
         num_nodes_per_layer=[64, num_outputs],
         use_batchnorm=True,
         activation=ActivationFunction.GELU,
-        dropout_rate=0.15,
+        dropout_rate=0.25,
     )
 
     # 9. Compute Yahoo Fantasy Points from predicted stats
@@ -364,8 +374,8 @@ def create_training_params(
 
     callbacks_params = (
         ModelCheckpointParams(),
-        EarlyStoppingParams(),
-        ReduceLearningRateOnPlateauParams(patience=5),
+        EarlyStoppingParams(patience=4),
+        ReduceLearningRateOnPlateauParams(patience=2),
         LogModelResultsParams(),
         CollectTruePredictedOutputsParamsFantasyBasketballPredictions(
             column_names={
@@ -394,6 +404,7 @@ def create_training_params(
         batch_size=None,
         num_days_per_batch=num_days_per_batch,
         learning_rate=0.001,
+        weight_decay=1e-4,
         num_epochs=None,
         training_dtype=torch.float32,
         dataloader_num_workers=0,
