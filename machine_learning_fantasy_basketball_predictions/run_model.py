@@ -1,8 +1,5 @@
 import os
-import time
 import logging
-import datetime
-import pickle as pkl
 import numpy as np
 import pandas as pd
 import torch
@@ -11,12 +8,6 @@ import lightning.pytorch as pl
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from typing import Optional, Type, Tuple
-from lightning.pytorch.callbacks import (
-    ModelCheckpoint,
-    EarlyStopping,
-    LearningRateMonitor,
-)
-from lightning.pytorch.loggers import TensorBoardLogger
 
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
@@ -26,9 +17,6 @@ from machine_learning.enums import DataSplitType
 from machine_learning.run_model import RunModel
 from machine_learning.architecture import ModelArchitecture
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
-from machine_learning.lightning_data_module import MachineLearningDataModule
-from machine_learning.lightning_model import MachineLearningLightningModule
-from machine_learning.utils import models_dir, get_next_model_id
 from machine_learning_fantasy_basketball_predictions.constants import PROJECT_NAME
 from machine_learning_fantasy_basketball_predictions.params.params import \
     MachineLearningParamsFantasyBasketballPredictions
@@ -96,9 +84,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
         return contests_df[['contestId', 'score', 'DATE', 'entry_fee']]
 
     @classmethod
-    def _process_predictions_df(cls, predictions_df: pd.DataFrame, contests_df: pd.DataFrame,
-                                model_dir: Optional[str] = None) -> pd.DataFrame:
-        del model_dir
+    def _process_predictions_df(cls, predictions_df: pd.DataFrame, contests_df: pd.DataFrame) -> pd.DataFrame:
         collect_cols = [c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]
         if collect_cols:
             predictions_df = predictions_df[collect_cols].copy()
@@ -160,9 +146,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
         return super().predict(data_split_type=data_split_type, trainer_cls=pl.Trainer, **kwargs)
 
     @classmethod
-    def _calculate_prediction_correlations(cls, eval_results: pd.DataFrame, predict_results: pd.DataFrame,
-                                           model_dir: Optional[str] = None) -> pd.DataFrame:
-        del model_dir
+    def _calculate_prediction_correlations(cls, eval_results: pd.DataFrame, predict_results: pd.DataFrame) -> pd.DataFrame:
         if predict_results is None or predict_results.empty:
             return eval_results
 
@@ -229,7 +213,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
     def _add_extra_metrics_to_eval_results(self, eval_results: pd.DataFrame, predict_results: pd.DataFrame
                                            ) -> pd.DataFrame:
         eval_results = self._calculate_prediction_correlations(
-            eval_results=eval_results, predict_results=predict_results, model_dir=self._model_dir)
+            eval_results=eval_results, predict_results=predict_results)
 
         try:
             contests_df = self._load_contests_df()
@@ -238,7 +222,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
             return eval_results
 
         predict_results = self._process_predictions_df(
-            predictions_df=predict_results, contests_df=contests_df, model_dir=self._model_dir)
+            predictions_df=predict_results, contests_df=contests_df)
 
         find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(points_col='YAHOO_POINTS_pred',
                                                                   num_teams_in_set=1,
@@ -321,7 +305,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
                 for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050', 'sharpe_top10']:
                     for c in [cc for cc in eval_results.columns if cc.startswith(m)]:
-                        val = eval_results.loc[split_type.name, c]
+                        val = eval_results.loc[split_key, c]
                         if pd.notna(val):
                             writer.add_scalar(tag=f'DFS_Contests/{c}',
                                               scalar_value=float(val),

@@ -5,10 +5,9 @@ import pandas as pd
 import torch
 from typing import Optional, Dict, List, Union, Sequence, Any
 
-from sklearn.preprocessing import StandardScaler, OrdinalEncoder
 from torch.utils.data import Sampler, Subset, DataLoader
 
-from constants import START_POSITIONS, UNKNOWN_PLAYER_ID, IGNORE_VAL, TEAM_NAME_TO_ID, POSITION_TO_NUM
+from constants import START_POSITIONS, UNKNOWN_PLAYER_ID, IGNORE_VAL, POSITION_TO_NUM
 from utils import get_current_date, get_current_time
 from machine_learning.constants import METADATA
 from machine_learning.enums import DataSplitType
@@ -51,15 +50,6 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         super().__init__(*args, **kwargs)
         self._original_index_to_date: np.ndarray = None
         self._build_date_map()
-
-    def _init_machine_learning_datasets(
-        self, features_df: pd.DataFrame,
-        dataset_name_to_scalers: Optional[Dict[str, StandardScaler]] = None,
-        dataset_name_to_categorical_encoder: Optional[Dict[str, OrdinalEncoder]] = None):
-        super()._init_machine_learning_datasets(features_df=features_df,
-                                                dataset_name_to_scalers=dataset_name_to_scalers,
-                                                dataset_name_to_categorical_encoder=dataset_name_to_categorical_encoder
-                                                )
 
     def _build_date_map(self):
         """
@@ -104,71 +94,6 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
             df['YAHOO_POSITION'] = df['YAHOO_POSITION'].map(POSITION_TO_NUM).fillna(IGNORE_VAL)
 
         df = self._add_player_history_columns(df, self.params)
-
-        return df
-
-        # if self.params.all_games_every_day:
-        #     team_ids = set(TEAM_NAME_TO_ID.values())
-        #     num_players_per_team = 5 + self.params.num_bench_players
-        #     dummy_df_all = list()
-        #     for year, year_df in df.groupby('SEASON_YEAR'):
-        #         max_game_id = year_df['GAME_ID'].max()
-        #         dummy_df_year = list()
-        #         for date, date_df in year_df.groupby('DATE'):
-        #             missing_team_ids = team_ids - set(date_df['TEAM_ID'])
-        #             if not missing_team_ids:
-        #                 continue
-        #             game_ids = range(max_game_id + 1, max_game_id + 1 + len(missing_team_ids) // 2)
-        #             dummy_df = pd.DataFrame({'DATE': date,
-        #                                      'TEAM_ID': np.repeat(list(missing_team_ids), num_players_per_team),
-        #                                      'GAME_ID': np.repeat(game_ids, num_players_per_team * 2),
-        #                                      'SEASON_PROGRESS': date_df['SEASON_PROGRESS'].iloc[0]
-        #                                      })
-        #             max_game_id = dummy_df['GAME_ID'].max()
-        #             dummy_df_year.append(dummy_df)
-        #         dummy_df_year = pd.concat(dummy_df_year, axis=0).reset_index(drop=True)
-        #         dummy_df_year['SEASON_YEAR'] = year
-        #
-        #         # adding SEASON_YEAR column
-        #         if 'SEASON_YEAR' in df.columns:
-        #             team_to_season_team = year_df.set_index('TEAM_ID')['SEASON_TEAM'].drop_duplicates().to_dict()
-        #             dummy_df_year['SEASON_TEAM'] = dummy_df_year['TEAM_ID'].map(team_to_season_team)
-        #
-        #         dummy_df_all.append(dummy_df_year)
-        #     dummy_df_all = pd.concat(dummy_df_all, axis=0).reset_index(drop=True)
-        #     num_games_in_dummy_df = dummy_df_all['GAME_ID'].nunique()
-        #     start_positions = self._get_start_positions_list()
-        #     team_id_to_team_name = df.set_index('TEAM_ID')['TEAM'].drop_duplicates().to_dict()
-        #     dummy_df_all = (
-        #         dummy_df_all.assign(PLAYER_ID=UNKNOWN_PLAYER_ID,
-        #                             NAME='UNKOWN',
-        #                             TEAM=dummy_df_all['TEAM_ID'].map(team_id_to_team_name),
-        #                             START_POSITION_CALCULATED = np.tile(start_positions, num_games_in_dummy_df * 2),
-        #                             STARTER=np.tile([True] * 5 + [False] * self.params.num_bench_players,
-        #                                             num_games_in_dummy_df * 2),
-        #                             HOME=np.tile([True] * num_players_per_team + [False] * num_players_per_team,
-        #                                          num_games_in_dummy_df),
-        #                             EJECTED=False,
-        #                             LEFT_MIDGAME=False,
-        #                             IS_DUMMY=True,
-        #                             )
-        #     )
-        #
-        #     if 'YAHOO_SALARY' in df.columns:
-        #         dummy_df_all = dummy_df_all.assign(YAHOO_SALARY=100)
-        #     if 'YAHOO_POSITION' in df.columns:
-        #         dummy_df_all = dummy_df_all.assign(YAHOO_POSITION='PG')
-        #
-        #     # adding stats columns
-        #     fill_stats_cols = [c for c in df if c not in dummy_df_all and pd.api.types.is_numeric_dtype(df[c])]
-        #     dummy_df_all = pd.concat([dummy_df_all,
-        #                               pd.DataFrame(IGNORE_VAL, columns=fill_stats_cols, index=dummy_df_all.index)
-        #                               ], axis=1)
-        #     dummy_df_all = dummy_df_all.astype(df.dtypes.to_dict())
-        #
-        #     df['IS_DUMMY'] = False
-        #     df = pd.concat([df, dummy_df_all], axis=0)
-        #     df.sort_values(['DATE', 'GAME_ID', 'TEAM_ID', 'PLAYER_ID'], inplace=True)
 
         return df
 
