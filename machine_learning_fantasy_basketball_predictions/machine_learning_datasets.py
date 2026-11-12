@@ -241,9 +241,6 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         if 'IS_REAL_PLAYER' in missing_columns or 'IS_REAL_PLAYER' not in features_df.columns:
             features_df['IS_REAL_PLAYER'] = np.where(is_real_player, 1, IGNORE_VAL)
 
-        # Idempotent fallback in case features were not loaded via _load_features (e.g. mocked tests)
-        features_df = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(features_df, params)
-
         return features_df
 
     @classmethod
@@ -251,24 +248,27 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         if df.empty:
             return df
 
+        missing_ratios = [c for c in params.all_feature_names_list if c.endswith('_mean_ratio') and c not in df.columns]
+        lag_cols = [c for c in params.all_feature_names_list if '_t-' in c and c not in df.columns]
+        if not missing_ratios and not lag_cols:
+            return df
+
         sort_cols = [c for c in ['DATE', 'GAME_ID', 'TEAM_ID', 'PLAYER_ID'] if c in df.columns]
         if len(sort_cols) >= 2:
             df = df.sort_values(sort_cols).reset_index(drop=True)
 
         # 1. Mean ratios (e.g. PTS_mean_ratio = PTS / PTS_mean5)
-        for c in params.all_feature_names_list:
-            if c.endswith('_mean_ratio') and c not in df.columns:
-                base_name = c.replace('_mean_ratio', '')
-                mean_name = base_name + '_mean5'
-                if base_name in df.columns and mean_name in df.columns:
-                    ratio = df[base_name] / df[mean_name]
-                    ratio = ratio.clip(upper=10.0)
-                    ratio.loc[(df[mean_name] == 0) & (df[base_name] == 0)] = 1.0
-                    ratio.loc[(df[mean_name] == 0) & (df[base_name] != 0)] = 10.0
-                    df[c] = ratio.fillna(1.0).astype(np.float32)
+        for c in missing_ratios:
+            base_name = c.replace('_mean_ratio', '')
+            mean_name = base_name + '_mean5'
+            if base_name in df.columns and mean_name in df.columns:
+                ratio = df[base_name] / df[mean_name]
+                ratio = ratio.clip(upper=10.0)
+                ratio.loc[(df[mean_name] == 0) & (df[base_name] == 0)] = 1.0
+                ratio.loc[(df[mean_name] == 0) & (df[base_name] != 0)] = 10.0
+                df[c] = ratio.fillna(1.0).astype(np.float32)
 
-        # 3. Lagged features (e.g. *_t-{lag})
-        lag_cols = [c for c in params.all_feature_names_list if '_t-' in c and c not in df.columns]
+        # 2. Lagged features (e.g. *_t-{lag})
         if lag_cols and 'PLAYER_ID' in df.columns:
             lags = [int(c.split('_t-')[-1]) for c in lag_cols]
             lag_stats = [c.split('_t-')[0] for c in lag_cols]
@@ -285,9 +285,6 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                         stats_df[s] = stats_df[s].astype(np.float32)
 
                 lagged = stats_df.groupby(df['PLAYER_ID']).shift(lag)
-                if lag == 1 and 'STARTER' in df.columns:
-                    lagged_starter = stats_df.groupby([df['PLAYER_ID'], df['STARTER']]).shift(1)
-                    lagged = lagged_starter.fillna(lagged)
 
                 if prev_lag_df is not None:
                     avail = [s for s in stats if s in prev_lag_df.columns]
@@ -355,6 +352,8 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         matching_indices = np.where(np.isin(dataset_days, target_days))[0].tolist()
 
         filtered_indices = self._remove_unused_indices_by_keep_mask(matching_indices)
+        if not filtered_indices:
+            raise ValueError(f"No valid games found for target_dates={target_dates}")
         subset = Subset(self.machine_learning_datasets_stacked, indices=filtered_indices)
 
         effective_batch_size = batch_size or getattr(self.training_params, 'batch_size', 1)

@@ -215,7 +215,7 @@ class TestLaggedFeaturesFallback(unittest.TestCase):
         })
         params = FeaturesParamsFantasyBasketballPredictions()
         params.all_feature_names_list = ["PTS_t-1", "PTS_t-2", "PTS_t-3"]
-        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_additional_columns(df.copy(), params)
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df.copy(), params)
 
         # Game 2 (index 1) has game 1 prior (PTS=20.0). Lags 2 and 3 should fall back to 20.0
         self.assertEqual(res.loc[1, "PTS_t-1"], 20.0)
@@ -239,7 +239,7 @@ class TestLaggedFeaturesFallback(unittest.TestCase):
         })
         params = FeaturesParamsFantasyBasketballPredictions()
         params.all_feature_names_list = ["PTS_t-1", "PTS_t-2", "PTS_t-3"]
-        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_additional_columns(df.copy(), params)
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df.copy(), params)
 
         # Debut game (index 0) has no prior history -> role mean for Starting PG is (20+30)/2 = 25.0
         self.assertEqual(res.loc[0, "PTS_t-1"], 25.0)
@@ -678,6 +678,10 @@ class TestDateFilteredDataLoader(unittest.TestCase):
         target_d = pd.to_datetime(20001.0, unit='D').date()
         loader = ds.create_date_filtered_data_loader([target_d], batch_size=10)
         self.assertEqual(len(loader.dataset), 30)
+
+        missing_d = pd.to_datetime(29999.0, unit='D').date()
+        with self.assertRaises(ValueError):
+            ds.create_date_filtered_data_loader([missing_d], batch_size=10)
 
 
 class TestKeyPaddingMaskAndAttention(unittest.TestCase):

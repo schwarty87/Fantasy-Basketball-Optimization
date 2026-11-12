@@ -83,6 +83,47 @@ class TestPreGridFeaturesAndLags(unittest.TestCase):
         self.assertEqual(res.loc[res['PLAYER_ID'] == 3, 'PTS_mean_ratio'].iloc[0], 1.0)   # 0 / 0 -> 1.0
         self.assertEqual(res.loc[res['PLAYER_ID'] == 4, 'PTS_mean_ratio'].iloc[0], 10.0)  # x / 0 -> 10.0
 
+    def test_role_promotion_uses_strict_chronological_lag_and_preserves_role_change(self):
+        """Verify spot-start promotion after bench game pulls t-1 from the bench game and preserves STARTER_t-1 == 0.0."""
+        df = pd.DataFrame({
+            'DATE': [datetime.date(2023, 1, 1), datetime.date(2023, 1, 3), datetime.date(2023, 1, 5)],
+            'GAME_ID': [1, 2, 3],
+            'TEAM_ID': [10, 10, 10],
+            'PLAYER_ID': [101, 101, 101],
+            'PTS': [10.0, 28.0, 15.0],
+            'STARTER': [True, False, True],
+            'START_POSITION_CALCULATED': ['PG', 'BN1', 'PG'],
+        })
+        params = FeaturesParamsFantasyBasketballPredictions(
+            feature_name_to_machine_learning_dataset_params={
+                'lagged': unittest.mock.MagicMock(feature_names=['PTS_t-1', 'PTS_t-2', 'STARTER_t-1']),
+            }
+        )
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df, params)
+
+        game3 = res.loc[res['GAME_ID'] == 3].iloc[0]
+        self.assertEqual(game3['PTS_t-1'], 28.0)
+        self.assertEqual(game3['PTS_t-2'], 10.0)
+        self.assertEqual(game3['STARTER_t-1'], 0.0)
+
+    def test_add_player_history_columns_preserves_grid_order_when_columns_exist(self):
+        """Verify _add_player_history_columns is a no-op that never re-sorts an already-computed grid DataFrame."""
+        df = pd.DataFrame({
+            'DATE': [datetime.date(2023, 1, 1), datetime.date(2023, 1, 1)],
+            'GAME_ID': [1, 1],
+            'TEAM_ID': [20, 10],
+            'PLAYER_ID': [500, 0],  # Starter (500) before dummy bench slot (0)
+            'PTS': [20.0, 0.0],
+            'PTS_t-1': [18.0, 0.0],
+        })
+        params = FeaturesParamsFantasyBasketballPredictions(
+            feature_name_to_machine_learning_dataset_params={
+                'lagged': unittest.mock.MagicMock(feature_names=['PTS_t-1']),
+            }
+        )
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df, params)
+        self.assertEqual(list(res['PLAYER_ID']), [500, 0])
+
 
 if __name__ == '__main__':
     unittest.main()
