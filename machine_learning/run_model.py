@@ -189,7 +189,8 @@ class RunModel:
                 else:
                     self.model.model = loaded_model
         except Exception as e:
-            logging.warning(f"Could not load checkpoint weights from {ckpt_path}: {e}")
+            logging.exception(f"Could not load checkpoint weights from {ckpt_path}: {e}")
+            raise
 
     def _create_model(self):
         model_cls = self._model_class()
@@ -201,20 +202,25 @@ class RunModel:
                     else self._model_dir
                 )
                 self.model = model_cls(params=self.params, scaler_dir=scaler_dir)
-                if self.params.continue_model_id is not None and self._continue_model_dir:
-                    self._load_lightning_checkpoint_weights()
             except Exception as e:
                 logging.warning(f"Could not create lightning model: {e}")
                 self.model = None
+            if self.model is not None and self.params.continue_model_id is not None and self._continue_model_dir:
+                self._load_lightning_checkpoint_weights()
         else:
             if self.params.continue_model_id is not None:
                 self.model = ModelCheckpoint.load_model(os.path.join(self._continue_model_dir, 'model.pt'))
                 if self.model is not None and hasattr(self.model, "modules"):
                     for m in self.model.modules():
                         if isinstance(m, nn.Embedding) and m.padding_idx is None and m.num_embeddings > 0:
-                            m.padding_idx = m.num_embeddings - 1
                             with torch.no_grad():
-                                m.weight[m.padding_idx].zero_()
+                                pad_row = m.weight.new_zeros((1, m.embedding_dim))
+                                m.weight = nn.Parameter(
+                                    torch.cat([m.weight.detach(), pad_row], dim=0),
+                                    requires_grad=m.weight.requires_grad,
+                                )
+                            m.num_embeddings = m.weight.shape[0]
+                            m.padding_idx = m.num_embeddings - 1
             else:
                 try:
                     self.model = model_cls(
@@ -466,18 +472,8 @@ class RunModel:
             metrics_params = self.params.training_params.metrics_params
         return self._metrics_combined_class()(all_params=metrics_params, name=name, device=self.device)
 
-    def _update_callbacks_params(self, callbacks_params: Tuple[AbstractMetricsAndCallbacksParams]):
-        for callback_params in callbacks_params:
-            if isinstance(callback_params, ModelCheckpointParams):
-                callback_params.save_dir = self._model_dir
-            if hasattr(callback_params, 'scaler_dir'):
-                model_scalers_dir = os.path.join(self._model_dir, 'scalers')
-                if callback_params.scaler_dir is not None or os.path.isdir(model_scalers_dir):
-                    callback_params.scaler_dir = model_scalers_dir
-
     def _define_callbacks_manager(self, is_training: bool, optimizer: OPTIMIZER_TYPE = None) -> CallbacksManager:
         callbacks_params = copy.deepcopy(self.params.training_params.callbacks_params)
-        self._update_callbacks_params(callbacks_params)
         callbacks_combined_class = self._callbacks_combined_class()
         if not is_training:
             callbacks_params = tuple([p for p in callbacks_params if callbacks_registry.get(p.key_to_class_for_registry)

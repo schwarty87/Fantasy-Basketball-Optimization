@@ -1,10 +1,4 @@
-import sys
 import os
-# Ensure project root is in sys.path when script is invoked directly
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
 import time
 import logging
 import datetime
@@ -102,59 +96,9 @@ class RunModelFantasyBasketballPredictions(RunModel):
         return contests_df[['contestId', 'score', 'DATE', 'entry_fee']]
 
     @classmethod
-    def _unscale_if_needed(cls, df: pd.DataFrame, model_dir: Optional[str] = None) -> pd.DataFrame:
-        """Defensively unscale prediction and true target stats if they appear standard-scaled."""
-        stat_cols = [c for c in df.columns if c.endswith('_pred') and 'YAHOO_POINTS' not in c and 'PTS' not in c]
-        if not stat_cols:
-            return df
-        # Real NBA stats: MIN has mean ~21, 2PM has mean ~2.6, REB has mean ~4.0.
-        # Standardized z-scores have mean ~0.0 and standard deviation ~1.0, with ~40% negative values.
-        # If MIN_pred has mean > 5.0 or 2PM_pred has mean > 1.0, the data is already in real NBA units and must NOT be unscaled again.
-        if 'MIN_pred' in df.columns:
-            is_standardized = df['MIN_pred'].mean() < 5.0
-        elif '2PM_pred' in df.columns:
-            is_standardized = df['2PM_pred'].mean() < 0.8 and (df['2PM_pred'] < -0.2).mean() > 0.15
-        else:
-            is_standardized = df[stat_cols[0]].mean() < 0.8 and (df[stat_cols[0]] < -0.2).mean() > 0.15
-
-        if not is_standardized:
-            return df
-
-        scaler = None
-        candidate_paths = []
-        if model_dir:
-            candidate_paths.append(os.path.join(model_dir, 'scalers', 'true_label.pkl'))
-        proj_models = models_dir(PROJECT_NAME)
-        if os.path.isdir(proj_models):
-            for m_id in sorted(os.listdir(proj_models), reverse=True):
-                candidate_paths.append(os.path.join(proj_models, m_id, 'scalers', 'true_label.pkl'))
-
-        for p in candidate_paths:
-            if os.path.isfile(p):
-                try:
-                    with open(p, 'rb') as f:
-                        scaler = pkl.load(f)
-                    logging.info(f"Loaded target scaler for defensive unscaling from: {p}")
-                    break
-                except Exception as e:
-                    logging.warning(f"Failed loading scaler from {p}: {e}")
-
-        if scaler is not None and hasattr(scaler, 'feature_names_in_'):
-            for tt in ('true', 'pred'):
-                cols = [f'{c}_{tt}' for c in scaler.feature_names_in_]
-                if all(c in df.columns for c in cols):
-                    valid_mask = (df[cols] != IGNORE).all(axis=1)
-                    if valid_mask.any():
-                        unscaled_vals = scaler.inverse_transform(df.loc[valid_mask, cols].values)
-                        df.loc[valid_mask, cols] = unscaled_vals
-            # Recalculate fantasy points with unscaled stats
-            add_missing_points_columns_to_predictions(df, overwrite=True)
-
-        return df
-
-    @classmethod
     def _process_predictions_df(cls, predictions_df: pd.DataFrame, contests_df: pd.DataFrame,
                                 model_dir: Optional[str] = None) -> pd.DataFrame:
+        del model_dir
         collect_cols = [c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]
         if collect_cols:
             predictions_df = predictions_df[collect_cols].copy()
@@ -169,9 +113,6 @@ class RunModelFantasyBasketballPredictions(RunModel):
         if true_cols:
             predictions_df = predictions_df.loc[(predictions_df[true_cols] != IGNORE).all(axis=1)]
 
-        # Defensive unscaling before filtering/calculating points
-        predictions_df = cls._unscale_if_needed(predictions_df, model_dir=model_dir)
-
         predictions_df['DATE'] = convert_date_col_to_date(predictions_df['DATE'])
         predictions_df = predictions_df.loc[predictions_df['DATE'].isin(contests_df['DATE'].unique())]
 
@@ -181,32 +122,31 @@ class RunModelFantasyBasketballPredictions(RunModel):
         needs_raw = 'YAHOO_POINTS_raw' not in predictions_df.columns
         missing_cols = [c for c in ('YAHOO_SALARY', 'YAHOO_POSITION') if c not in predictions_df.columns]
         if needs_raw or len(missing_cols) > 0:
-            try:
-                player_stats = StatsLoaderPlayers().load_saved_data()
-                cols_to_pull = ['PLAYER_ID', 'DATE']
-                if needs_raw and 'YAHOO_POINTS' in player_stats.columns:
-                    cols_to_pull.append('YAHOO_POINTS')
-                cols_to_pull += missing_cols
+            player_stats = StatsLoaderPlayers().load_saved_data()
+            cols_to_pull = ['PLAYER_ID', 'DATE']
+            if needs_raw and 'YAHOO_POINTS' in player_stats.columns:
+                cols_to_pull.append('YAHOO_POINTS')
+            cols_to_pull += missing_cols
 
-                raw_df = player_stats[cols_to_pull].copy()
-                if 'YAHOO_POINTS' in raw_df.columns:
-                    raw_df.rename(columns={'YAHOO_POINTS': 'YAHOO_POINTS_raw'}, inplace=True)
-                raw_df['DATE'] = convert_date_col_to_date(raw_df['DATE'])
-                raw_df['PLAYER_ID'] = raw_df['PLAYER_ID'].astype(int)
-                raw_df.drop_duplicates(['PLAYER_ID', 'DATE'], inplace=True)
+            raw_df = player_stats[cols_to_pull].copy()
+            if 'YAHOO_POINTS' in raw_df.columns:
+                raw_df.rename(columns={'YAHOO_POINTS': 'YAHOO_POINTS_raw'}, inplace=True)
+            raw_df['DATE'] = convert_date_col_to_date(raw_df['DATE'])
+            raw_df['PLAYER_ID'] = raw_df['PLAYER_ID'].astype(int)
+            raw_df.drop_duplicates(['PLAYER_ID', 'DATE'], inplace=True)
 
-                predictions_df['PLAYER_ID'] = predictions_df['PLAYER_ID'].astype(int)
-                predictions_df = predictions_df.merge(raw_df, how='inner', on=['PLAYER_ID', 'DATE'])
-            except Exception as e:
-                logging.warning(f"Could not load or merge raw player stats: {e}")
+            predictions_df['PLAYER_ID'] = predictions_df['PLAYER_ID'].astype(int)
+            predictions_df = predictions_df.merge(raw_df, how='inner', on=['PLAYER_ID', 'DATE'])
+
+        if 'YAHOO_POINTS_raw' not in predictions_df.columns:
+            raise ValueError("YAHOO_POINTS_raw is missing from predictions_df")
 
         predictions_df = predictions_df.loc[(predictions_df['YAHOO_SALARY'] > 0) &
                                             (predictions_df['YAHOO_SALARY'].notnull())]
 
         predictions_df['PLAYER_ID'] = predictions_df['PLAYER_ID'].astype(int)
-        
-        return predictions_df
 
+        return predictions_df
 
     def train(self) -> None:
         precision = "16-mixed" if torch.cuda.is_available() else "32-true"
@@ -222,6 +162,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
     @classmethod
     def _calculate_prediction_correlations(cls, eval_results: pd.DataFrame, predict_results: pd.DataFrame,
                                            model_dir: Optional[str] = None) -> pd.DataFrame:
+        del model_dir
         if predict_results is None or predict_results.empty:
             return eval_results
 
@@ -230,7 +171,6 @@ class RunModelFantasyBasketballPredictions(RunModel):
         if collect_cols:
             preds = preds[collect_cols].copy()
             preds.rename(columns={c: '_'.join(c.split('_')[1:]) for c in preds.columns}, inplace=True)
-        preds = cls._unscale_if_needed(preds, model_dir=model_dir)
         try:
             add_missing_points_columns_to_predictions(preds)
         except Exception:
@@ -304,7 +244,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
                                                                   num_teams_in_set=1,
                                                                   verbose=False)
 
-        true_points_col = 'YAHOO_POINTS_raw' if 'YAHOO_POINTS_raw' in predict_results.columns else 'YAHOO_POINTS_true'
+        true_points_col = 'YAHOO_POINTS_raw'
         score_per_day = dict()
         for curr_date, day_df in tqdm(predict_results.groupby('DATE'), desc='finding best predicted team per day'):
             if day_df.shape[0] < 50:
@@ -392,9 +332,3 @@ class RunModelFantasyBasketballPredictions(RunModel):
             logging.warning(f"Could not save DFS results to tensorboard: {e}")
 
         return eval_results, predict_results
-
-
-if __name__ == '__main__':
-    from run_all import main, create_params
-    params = create_params()
-    main(use_lightning=True, params=params)

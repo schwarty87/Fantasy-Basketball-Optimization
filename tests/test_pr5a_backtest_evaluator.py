@@ -100,6 +100,40 @@ class TestBacktestEvaluatorRawPoints(unittest.TestCase):
 
         self.assertEqual(processed['YAHOO_POINTS_raw'].iloc[0], 34.0)
 
+    def test_process_predictions_df_fails_fast_when_stats_loader_fails_or_missing_column(self):
+        """Verify _process_predictions_df propagates errors and raises ValueError if YAHOO_POINTS_raw cannot be populated."""
+        predictions_df = pd.DataFrame({
+            'DATE': [datetime.date(2023, 1, 1)],
+            'PLAYER_ID': [101],
+            'YAHOO_POINTS_pred': [35.0],
+            'YAHOO_POINTS_true': [30.0],
+            'YAHOO_SALARY': [25.0],
+            'YAHOO_POSITION': [1],
+        })
+        contests_df = pd.DataFrame({
+            'DATE': [datetime.date(2023, 1, 1)],
+            'contestId': [999],
+            'entry_fee': [10.0],
+            'score': [250.0],
+        })
+
+        with patch('machine_learning_fantasy_basketball_predictions.run_model.StatsLoaderPlayers') as mock_loader:
+            mock_loader.return_value.load_saved_data.side_effect = RuntimeError("disk error")
+            with self.assertRaises(RuntimeError):
+                RunModelFantasyBasketballPredictions._process_predictions_df(
+                    predictions_df=predictions_df,
+                    contests_df=contests_df,
+                )
+
+        with patch('machine_learning_fantasy_basketball_predictions.run_model.StatsLoaderPlayers') as mock_loader:
+            # Missing 'YAHOO_POINTS' column in player_boxscores
+            mock_loader.return_value.load_saved_data.return_value = pd.DataFrame({'DATE': ['2023-01-01'], 'PLAYER_ID': [101]})
+            with self.assertRaises(ValueError):
+                RunModelFantasyBasketballPredictions._process_predictions_df(
+                    predictions_df=predictions_df,
+                    contests_df=contests_df,
+                )
+
     def test_add_extra_metrics_scores_lineup_with_raw_points(self):
         # Build slate with 60 players so day_df.shape[0] >= 50
         dates = [datetime.date(2023, 1, 1)] * 60

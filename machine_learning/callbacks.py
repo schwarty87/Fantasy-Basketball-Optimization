@@ -289,7 +289,6 @@ class CollectTruePredictedOutputs(AbstractCallback):
     """Collect the model outputs"""
     def __init__(self, params: CollectTruePredictedOutputsParams, model_dir: Optional[str] = None, **kwargs):
         super().__init__(params=params, model_dir=model_dir, **kwargs)
-        self.model_dir = model_dir
         self.reset()
 
     @staticmethod
@@ -328,9 +327,8 @@ class CollectTruePredictedOutputs(AbstractCallback):
         """Resolve scaler directory from callback params or model_dir/scalers."""
         if self.params.scaler_dir is None:
             return None
-        active_model_dir = self._model_dir if self._model_dir is not None else self.model_dir
-        if active_model_dir is not None:
-            return os.path.join(active_model_dir, 'scalers')
+        if self._model_dir is not None:
+            return os.path.join(self._model_dir, 'scalers')
         if os.path.isdir(self.params.scaler_dir):
             return self.params.scaler_dir
         raise ValueError("CollectTruePredictedOutputs requires model_dir when scaler_dir is enabled")

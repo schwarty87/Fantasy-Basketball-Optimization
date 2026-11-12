@@ -57,8 +57,10 @@ class CalculateFantasyPoints(AbstractLayer):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch_size, ..., num_stats]
-        if self.scaler_mean is not None and self.scaler_scale is not None:
-            x = x * self.scaler_scale.to(device=x.device, dtype=x.dtype) + self.scaler_mean.to(device=x.device, dtype=x.dtype)
+        # Note: pre-unscaling model.pt pickles have no scaler_mean / scaler_scale buffers.
+        scale, mean = getattr(self, 'scaler_scale', None), getattr(self, 'scaler_mean', None)
+        if mean is not None and scale is not None:
+            x = x * scale.to(device=x.device, dtype=x.dtype) + mean.to(device=x.device, dtype=x.dtype)
         fantasy_points = torch.einsum('...s, s -> ...', x, self.weights)  # [batch_size, ...]
         return fantasy_points
 
@@ -88,7 +90,7 @@ class ReshapeToSamplePerDay(AbstractLayer):
         dates = x[self._metadata_name][..., 0, self._date_ind_in_metadata]
 
         unique_dates, group_indices = torch.unique(dates, return_inverse=True, sorted=False)
-        num_days = max(self._num_day_per_batch, len(unique_dates), 1)
+        num_days = max(1, len(unique_dates))
         one_hot = F.one_hot(group_indices, num_classes=num_days)
         item_idx = (torch.cumsum(one_hot, dim=0) - 1) * one_hot
         item_idx = item_idx.sum(dim=1)

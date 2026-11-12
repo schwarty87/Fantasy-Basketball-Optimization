@@ -455,7 +455,7 @@ class TestEmbeddingsLayerPaddingAndRetrofit(unittest.TestCase):
         self.assertTrue(torch.all(padding_grad == 0.0))
 
     def test_loaded_legacy_model_acquires_padding_idx_and_zeroes_row(self):
-        """Verify that loading a model with legacy EmbeddingsLayer (padding_idx=None) retrofits padding_idx and zeroes row."""
+        """Verify that loading a model with legacy EmbeddingsLayer (padding_idx=None) appends row K, sets padding_idx=K, and preserves rows 0..K-1."""
         model_path = os.path.join(self.temp_dir, "dummy_model.pt")
         legacy_model = DummyLegacyModel()
         torch.save(legacy_model, model_path)
@@ -470,11 +470,25 @@ class TestEmbeddingsLayerPaddingAndRetrofit(unittest.TestCase):
         with patch("machine_learning.callbacks.ModelCheckpoint.load_model", return_value=torch.load(model_path, weights_only=False)):
             RunModel._create_model(runner)
 
-        # Verify padding_idx retrofitted to 4, and row 4 zeroed
-        self.assertEqual(runner.model.emb.padding_idx, 4)
-        self.assertTrue(torch.all(runner.model.emb.weight[4] == 0.0))
-        # Non-padding rows still intact
-        self.assertTrue(torch.all(runner.model.emb.weight[0] == 1.0))
+        # Verify num_embeddings expanded from 5 to 6, padding_idx retrofitted to 5, row 5 zeroed, and all 5 original rows preserved
+        self.assertEqual(runner.model.emb.num_embeddings, 6)
+        self.assertEqual(runner.model.emb.padding_idx, 5)
+        self.assertTrue(torch.all(runner.model.emb(torch.tensor([5])) == 0.0))
+        self.assertTrue(torch.all(runner.model.emb.weight[:5] == 1.0))
+
+    def test_load_lightning_checkpoint_weights_raises_on_shape_mismatch(self):
+        """Verify _load_lightning_checkpoint_weights re-raises RuntimeError instead of falling back to random weights."""
+        ckpt_path = os.path.join(self.temp_dir, "epoch=0.ckpt")
+        torch.save({"state_dict": {"emb.weight": torch.ones((10, 4))}}, ckpt_path)
+
+        runner = MagicMock(spec=RunModel)
+        runner._continue_model_dir = self.temp_dir
+        runner._find_checkpoint_path.return_value = ckpt_path
+        runner.device = torch.device("cpu")
+        runner.model = DummyLegacyModel()  # emb has shape (5, 4) -> mismatch with (10, 4)
+
+        with self.assertRaises(RuntimeError):
+            RunModel._load_lightning_checkpoint_weights(runner)
 
 
 class TestCalculateFantasyPointsUnscaling(unittest.TestCase):
@@ -508,6 +522,36 @@ class TestCalculateFantasyPointsUnscaling(unittest.TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 1.0, 1.0, 1.0]], dtype=torch.float32)
         fp = layer(x)
         self.assertTrue(torch.isclose(fp, torch.tensor([12.9]), atol=1e-4))
+
+    def test_legacy_unpickled_layer_without_scaler_attributes(self):
+        """Verify legacy unpickled CalculateFantasyPoints without scaler_mean/scaler_scale attributes does not raise AttributeError."""
+        stat_names = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV']
+        params = CalculateFantasyPointsParams(
+            input_tensor_name='outputs_pred',
+            stat_names=stat_names,
+            site=Sites.YAHOO,
+        )
+        layer = CalculateFantasyPoints(params=params, input_shape=(1, 6))
+        delattr(layer, 'scaler_mean')
+        delattr(layer, 'scaler_scale')
+        x = torch.tensor([[1.0, 2.0, 3.0, 1.0, 1.0, 1.0]], dtype=torch.float32)
+        fp = layer(x)
+        self.assertTrue(torch.isclose(fp, torch.tensor([12.9]), atol=1e-4))
+
+    def test_collect_true_predicted_outputs_resolve_scaler_dir_respects_none(self):
+        """Verify CollectTruePredictedOutputs._resolve_scaler_dir returns None when params.scaler_dir is None even if model_dir/scalers exists."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(temp_dir, "scalers"), exist_ok=True)
+            cb_params = CollectTruePredictedOutputsParams(
+                tensor_names_true=['true_label'],
+                tensor_names_pred=['outputs_pred'],
+                scaler_dir=None,
+            )
+            cb = CollectTruePredictedOutputs(params=cb_params, model_dir=temp_dir)
+            self.assertIsNone(cb._resolve_scaler_dir())
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 class TestReshapeToSamplePerDayDynamic(unittest.TestCase):
@@ -725,7 +769,7 @@ class TestKeyPaddingMaskAndAttention(unittest.TestCase):
         self.assertFalse(torch.isnan(out_dict).any())
 
     def test_split_attention_combine_with_dict_and_mask(self):
-        """Verify SplitAttentionCombine splits mask correctly into m1 and m2 for within and between attention."""
+        """Verify SplitAttentionCombine splits mask into m1/m2, is invariant to dummy perturbation, and handles all-masked teams."""
         params = SplitAttentionCombineParams(
             input_tensor_name={'x': 'inputs', 'mask': 'real_player_mask'},
             d_model=32,
@@ -734,6 +778,7 @@ class TestKeyPaddingMaskAndAttention(unittest.TestCase):
             n_bench_players=6,  # 5 + 6 = 11 players per team, 22 total
         )
         layer = SplitAttentionCombine(params=params, input_shape={'x': (22, 32), 'mask': (22, 1)})
+        layer.eval()
         self.assertEqual(layer.output_shape(), (22, 32))
 
         x = torch.randn(2, 22, 32)
@@ -745,6 +790,21 @@ class TestKeyPaddingMaskAndAttention(unittest.TestCase):
         out = layer({'x': x, 'mask': mask})
         self.assertEqual(out.shape, (2, 22, 32))
         self.assertFalse(torch.isnan(out).any())
+
+        # Perturb masked dummy slots by +1000.0; real player outputs must be strictly invariant
+        x_perturbed = x.clone()
+        x_perturbed[mask == 0] += 1000.0
+        out_perturbed = layer({'x': x_perturbed, 'mask': mask})
+        real_positions = mask == 1
+        self.assertTrue(torch.allclose(out[real_positions], out_perturbed[real_positions], atol=1e-5))
+
+        # All-masked team (Team 1 all 0.0): must produce finite outputs without softmax NaNs
+        mask_all_zero_team = torch.tensor([
+            [0.0] * 11 + [1.0] * 10 + [0.0] * 1,
+            [0.0] * 22,
+        ])
+        out_all_zero = layer({'x': x, 'mask': mask_all_zero_team})
+        self.assertFalse(torch.isnan(out_all_zero).any())
 
     def test_split_attention_combine_wrapper_with_dict(self):
         """Verify SplitAttentionCombineWrapper passes mask through all inner layers."""
@@ -767,7 +827,7 @@ class TestKeyPaddingMaskAndAttention(unittest.TestCase):
         self.assertFalse(torch.isnan(out).any())
 
     def test_transformer_encoder_pytorch_with_dict(self):
-        """Verify TransformerEncoderPytorch extracts mask from dict and runs attention."""
+        """Verify TransformerEncoderPytorch extracts mask from dict, is invariant to dummy perturbation, and runs attention."""
         params = TransformerEncoderPytorchParams(
             input_tensor_name={'x': 'inputs', 'mask': 'real_player_mask'},
             d_model=32,
@@ -777,6 +837,7 @@ class TestKeyPaddingMaskAndAttention(unittest.TestCase):
             norm_first=True,
         )
         layer = TransformerEncoderPytorch(params=params, input_shape={'x': (22, 32), 'mask': (22, 1)})
+        layer.eval()
         self.assertEqual(layer.output_shape(), (22, 32))
 
         x = torch.randn(2, 22, 32)
@@ -785,6 +846,12 @@ class TestKeyPaddingMaskAndAttention(unittest.TestCase):
         out = layer({'x': x, 'mask': mask})
         self.assertEqual(out.shape, (2, 22, 32))
         self.assertFalse(torch.isnan(out).any())
+
+        x_perturbed = x.clone()
+        x_perturbed[mask == 0] += 1000.0
+        out_perturbed = layer({'x': x_perturbed, 'mask': mask})
+        real_positions = mask == 1
+        self.assertTrue(torch.allclose(out[real_positions], out_perturbed[real_positions], atol=1e-5))
 
 
 class TestMaskedFeatureScaling(unittest.TestCase):
