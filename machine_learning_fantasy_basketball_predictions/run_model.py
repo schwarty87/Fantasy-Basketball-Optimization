@@ -178,11 +178,27 @@ class RunModelFantasyBasketballPredictions(RunModel):
         # adding yahoo points if needed
         add_missing_points_columns_to_predictions(predictions_df=predictions_df)
 
+        needs_raw = 'YAHOO_POINTS_raw' not in predictions_df.columns
         missing_cols = [c for c in ('YAHOO_SALARY', 'YAHOO_POSITION') if c not in predictions_df.columns]
-        if len(missing_cols) > 0:
-            player_stats = StatsLoaderPlayers().load_saved_data()
-            predictions_df = predictions_df.merge(player_stats[['PLAYER_ID', 'DATE'] + missing_cols], how='inner',
-                                                  on=['PLAYER_ID', 'DATE'])
+        if needs_raw or len(missing_cols) > 0:
+            try:
+                player_stats = StatsLoaderPlayers().load_saved_data()
+                cols_to_pull = ['PLAYER_ID', 'DATE']
+                if needs_raw and 'YAHOO_POINTS' in player_stats.columns:
+                    cols_to_pull.append('YAHOO_POINTS')
+                cols_to_pull += missing_cols
+
+                raw_df = player_stats[cols_to_pull].copy()
+                if 'YAHOO_POINTS' in raw_df.columns:
+                    raw_df.rename(columns={'YAHOO_POINTS': 'YAHOO_POINTS_raw'}, inplace=True)
+                raw_df['DATE'] = convert_date_col_to_date(raw_df['DATE'])
+                raw_df['PLAYER_ID'] = raw_df['PLAYER_ID'].astype(int)
+                raw_df.drop_duplicates(['PLAYER_ID', 'DATE'], inplace=True)
+
+                predictions_df['PLAYER_ID'] = predictions_df['PLAYER_ID'].astype(int)
+                predictions_df = predictions_df.merge(raw_df, how='inner', on=['PLAYER_ID', 'DATE'])
+            except Exception as e:
+                logging.warning(f"Could not load or merge raw player stats: {e}")
 
         predictions_df = predictions_df.loc[(predictions_df['YAHOO_SALARY'] > 0) &
                                             (predictions_df['YAHOO_SALARY'].notnull())]
@@ -288,11 +304,12 @@ class RunModelFantasyBasketballPredictions(RunModel):
                                                                   num_teams_in_set=1,
                                                                   verbose=False)
 
+        true_points_col = 'YAHOO_POINTS_raw' if 'YAHOO_POINTS_raw' in predict_results.columns else 'YAHOO_POINTS_true'
         score_per_day = dict()
         for curr_date, day_df in tqdm(predict_results.groupby('DATE'), desc='finding best predicted team per day'):
             if day_df.shape[0] < 50:
                 continue
-            player_to_true_points = day_df.set_index('PLAYER_ID')['YAHOO_POINTS_true'].to_dict()
+            player_to_true_points = day_df.set_index('PLAYER_ID')[true_points_col].to_dict()
             predicted_best_team = find_best_team.run(df=day_df).iloc[0]
             chosen_players = predicted_best_team[find_best_team.positions()]
 
@@ -333,7 +350,8 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 eval_results.loc[split_key, f'mean_percentile_{df_name}'] = one_per_date['percentile'].mean()
                 eval_results.loc[split_key, f'mean_score_{df_name}'] = one_per_date['predicted_score'].mean()
                 eval_results.loc[split_key, f'top10_pct_{df_name}'] = (one_per_date['percentile'] >= 0.9).mean()
-                eval_results.loc[split_key, f'sharpe_5050_{df_name}'] = sharpe(one_per_date['portfolio_value_5050'])
+                eval_results.loc[split_key, f'sharpe_5050_{df_name}'] = sharpe(one_per_date['profit_5050'])
+                eval_results.loc[split_key, f'sharpe_top10_{df_name}'] = sharpe(one_per_date['profit_top10'])
 
         return eval_results
 
@@ -361,7 +379,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
                                 writer.add_scalar(tag=f'DFS_Profit/portfolio_top10_{suffix}',
                                                   scalar_value=float(curr_top10), global_step=step)
 
-                for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050']:
+                for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050', 'sharpe_top10']:
                     for c in [cc for cc in eval_results.columns if cc.startswith(m)]:
                         val = eval_results.loc[split_type.name, c]
                         if pd.notna(val):

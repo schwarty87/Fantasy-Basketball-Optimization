@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from functools import wraps
-from typing import Callable, Any
+from typing import Callable, Any, Union, Sequence, Optional
 from bs4 import BeautifulSoup, Tag
 from pandas.api.types import is_datetime64_any_dtype, is_string_dtype
 from constants import FIX_PLAYER_NAMES, URLS, START_POSITIONS, SCORING, NY_TZ, DATA_DIR
@@ -810,23 +810,37 @@ def get_column_names_from_feather_file(path: str, return_dtypes: bool = False):
     return reader.schema.names
 
 
-def sharpe(daily_account_money: pd.Series) -> float:
+def sharpe(pnl: Union[pd.Series, np.ndarray, Sequence[float]], periods_per_year: float = 252.0) -> float:
     """
-    Calculates the sharpe ratio of an account from a daily series of the account balance
+    Calculates the annualized Sharpe ratio from a series of periodic PnL (profit and loss) values.
 
     Parameters
     ----------
-    daily_account_money
-        A series describing the account balance each day (must be continuous, i.e resampled by day)
+    pnl : Union[pd.Series, np.ndarray, Sequence[float]]
+        A series or array describing periodic PnL (e.g. daily contest profit).
+    periods_per_year : float, default 252.0
+        Annualization factor (e.g. 252 for daily trading/betting days).
 
     Returns
     -------
     float
-        The Sharpe ratio of the account
-
+        The annualized Sharpe ratio, or 0.0 if variance is zero or length < 2.
     """
-    returns = np.diff(daily_account_money) / daily_account_money.values[:-1]
-    return returns.mean() / returns.std() * np.sqrt(252.0)
+    if isinstance(pnl, pd.Series):
+        arr = pnl.dropna().to_numpy(dtype=float)
+    else:
+        arr = np.asarray(pnl, dtype=float)
+        arr = arr[~np.isnan(arr)]
+
+    if len(arr) < 2:
+        return 0.0
+
+    std = float(np.std(arr, ddof=1))
+    if std == 0.0 or np.isnan(std):
+        return 0.0
+
+    mean = float(np.mean(arr))
+    return float(mean / std * np.sqrt(periods_per_year))
 
 
 def add_missing_points_columns_to_predictions(predictions_df: pd.DataFrame, overwrite: bool = False):

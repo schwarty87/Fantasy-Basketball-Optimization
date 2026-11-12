@@ -62,6 +62,10 @@
   - Tighter early stopping (`patience=4`) and proactive plateau scheduling (`ReduceLearningRateOnPlateau(patience=2)`) terminate training before idiosyncratic training-set memorization occurs.
   - Increased dropout on the final dense prediction head (`0.25`) and transformer attention layers (`0.30`).
 
+### Contest Backtest Evaluator & Sharpe Ratio (`machine_learning_fantasy_basketball_predictions/run_model.py` & `utils.py`)
+- **Raw Overtime Points for Contest Backtesting**: Neural network training targets remain strictly per-48 normalized to prevent gradient descent from overfitting stochastic overtime noise. However, historical Yahoo contest leaderboards score human contestants on raw regulation + overtime boxscores. `_process_predictions_df` inner-merges raw `YAHOO_POINTS` as `YAHOO_POINTS_raw` from `player_boxscores.feather`, and `_add_extra_metrics_to_eval_results` scores LP-selected lineups on `YAHOO_POINTS_raw` to eliminate artificial 10-25% overtime penalties during contest backtesting.
+- **Daily PnL Sharpe Calculation**: `utils.sharpe` computes annualized Sharpe directly on daily PnL vectors (`profit_5050`, `profit_top10`) using sample standard deviation (`ddof=1`), safely returning `0.0` on zero variance or $N < 2$, eliminating division-by-zero artifacts on cumulative account balance series. Both `sharpe_5050` and `sharpe_top10` are recorded in `eval_results` and logged to TensorBoard under `DFS_Contests/`.
+
 ## Data Consistency & Validation Guidelines
 
 ### Feather & PyArrow Type Strictness (Pandas 2.2+ / PyArrow 19+)
