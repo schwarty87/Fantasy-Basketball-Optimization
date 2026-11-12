@@ -266,6 +266,7 @@ class StatsLoaderPlayers(StatsLoader):
         self._schedule = load_schedule(drop_ppd=True)
 
     def call(self, players_list: pd.DataFrame | None = None, add_upcoming_games: bool = True):
+        self._schedule = load_schedule(drop_ppd=True)
         if players_list is not None:
             self._players_list = players_list
         else:

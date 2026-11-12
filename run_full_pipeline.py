@@ -16,7 +16,7 @@ from utils import add_missing_points_columns_to_predictions, get_current_time, d
     get_current_season, add_game_times_to_df, update_todays_schedule_from_scoreboard
 from submit_dfs_team import SubmitDFSTeamYahooByCSV
 from update_stats import update_all_stats
-from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM, get_browser_profile_path
+from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM, IGNORE_VAL, get_browser_profile_path
 from enums import Browsers
 from machine_learning_fantasy_basketball_predictions.params.params import \
     MachineLearningParamsFantasyBasketballPredictions
@@ -43,7 +43,7 @@ class RunFullPipeline:
     def __init__(self, load_params_from_model_id: int = 0, season: int | None = None,
                  run_date: datetime.date | str = get_current_date(),
                  headless: bool = True, minutes_before_game_to_run: int = 10,
-                 params_update_dict: dict | None = None, run_immediately: bool = False,
+                 run_immediately: bool = False,
                  initialize_daily_job: bool = True, force_retrain: bool = False):
         """
         Run everything we need to continuously update stats, train new models, predict/create teams and submit them
@@ -54,7 +54,6 @@ class RunFullPipeline:
         :param headless: whether to run selenium in headless mode or not
         :param minutes_before_game_to_run: the amount of time we want to run the pipeline before each game
         :param run_immediately: if True, don't wait for the game times to run. Should only be true when debugging
-        :param params_update_dict: data to update params with
         :param initialize_daily_job: if True, initialize today's schedule and daily run via _reset()
         :param force_retrain: if True, retrain today's model even if already trained
         """
@@ -74,11 +73,6 @@ class RunFullPipeline:
         self._load_params_from_model_id = load_params_from_model_id
 
         self.dates_to_game_times = dict()   #self._get_game_times_by_day_dict()
-
-        self._model_params_update_dict = params_update_dict.copy() if params_update_dict is not None else dict()
-        if 'training' not in self._model_params_update_dict:
-            self._model_params_update_dict['training'] = dict()
-        self._model_params_update_dict['training']['run_extra_callbacks'] = False
 
         self.stats_loaders_players = StatsLoaderPlayers(season=self.season)
         self.stats_loaders_teams = StatsLoaderTeams(season=self.season)
@@ -207,11 +201,8 @@ class RunFullPipeline:
         )
         dataset_combined = getattr(self.train_nn, 'dataset_combined', None)
         if isinstance(dataset_combined, MachineLearningDatasetCombined) and hasattr(dataset_combined, 'create_date_filtered_data_loader'):
-            try:
-                date_loader = dataset_combined.create_date_filtered_data_loader([self._run_date])
-                predict_kwargs['data_loader'] = date_loader
-            except Exception as e:
-                logging.warning(f"Could not build single-date DataLoader for {self._run_date}: {e}. Falling back to full dataset prediction.")
+            date_loader = dataset_combined.create_date_filtered_data_loader([self._run_date])
+            predict_kwargs['data_loader'] = date_loader
 
         predictions = self.train_nn.predict(**predict_kwargs)
         if predictions is None or predictions.empty:
@@ -274,7 +265,7 @@ class RunFullPipeline:
             predictions['YAHOO_POSITION'] = (
                 mapped_positions.fillna(predictions['YAHOO_POSITION'])
                 .apply(self._parse_position)
-                .fillna(1)
+                .fillna(IGNORE_VAL)
                 .astype(int)
             )
 
@@ -291,6 +282,20 @@ class RunFullPipeline:
         logging.info(f'number of players after filtering with cutoff time: {predictions.shape[0]}')
 
         return predictions
+
+    def _latest_valid_model_name(self, models_base: str, exclude_name: str | None = None) -> str | None:
+        candidate_models = []
+        if os.path.isdir(models_base):
+            for entry in os.listdir(models_base):
+                if entry.startswith('model_') and entry != exclude_name:
+                    full_path = os.path.join(models_base, entry)
+                    if self._is_valid_trained_model_dir(full_path):
+                        candidate_models.append(entry)
+        if candidate_models:
+            return sorted(candidate_models)[-1]
+        if self._is_valid_trained_model_dir(os.path.join(models_base, str(self._load_params_from_model_id))):
+            return str(self._load_params_from_model_id)
+        return None
 
     def run_once_per_day(self):
         scrape_season_schedules(self.season, save_dir=update_dir_name('season_schedules'))
@@ -320,14 +325,14 @@ class RunFullPipeline:
         # Every morning the pipeline runs once to collect the previous day's results and
         # train a brand new model incorporating the latest data (and extra weights on today's active players).
         # TODO: Future investigation: evaluate fine-tuning an existing checkpoint vs. full daily retrain.
-        params_path = os.path.join(DATA_DIR, f'machine_learning_fantasy_basketball_predictions/models/{self._load_params_from_model_id}/params.json')
+        models_base = os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models')
+        params_path = os.path.join(models_base, str(self._load_params_from_model_id), 'params.json')
         params = MachineLearningParamsFantasyBasketballPredictions.load_params(params_path)
         params.training_params.fast_dev_run = False
         params.features_params.last_month_in_train = True
         todays_model_name = 'model_' + str(self._run_date).replace('-', '_')
         already_trained = self._todays_model_already_trained()
 
-        models_base = os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models')
         target_dir = os.path.join(models_base, todays_model_name)
         active_model_name = todays_model_name
 
@@ -346,32 +351,12 @@ class RunFullPipeline:
             except Exception as e:
                 logging.exception(f"Daily model retraining for {todays_model_name} failed: {e}")
                 if temp_model_dir and os.path.exists(temp_model_dir):
-                    base_models = {'0', '1', '2', '3'}
-                    if os.path.basename(temp_model_dir) not in base_models:
-                        shutil.rmtree(temp_model_dir, ignore_errors=True)
+                    shutil.rmtree(temp_model_dir, ignore_errors=True)
 
-                candidate_models = []
-                if os.path.isdir(models_base):
-                    for entry in os.listdir(models_base):
-                        if entry.startswith('model_') and entry != todays_model_name:
-                            full_path = os.path.join(models_base, entry)
-                            if self._is_valid_trained_model_dir(full_path):
-                                candidate_models.append(entry)
-
-                if candidate_models:
-                    fallback_name = sorted(candidate_models)[-1]
-                elif self._is_valid_trained_model_dir(os.path.join(models_base, str(self._load_params_from_model_id))):
-                    fallback_name = str(self._load_params_from_model_id)
-                else:
-                    fallback_name = None
-
+                fallback_name = self._latest_valid_model_name(models_base, exclude_name=todays_model_name)
                 if fallback_name is not None:
                     logging.warning(f"Falling back to latest valid model: {fallback_name}")
                     active_model_name = fallback_name
-                    fallback_params_path = os.path.join(models_base, fallback_name, 'params.json')
-                    params = MachineLearningParamsFantasyBasketballPredictions.load_params(fallback_params_path)
-                    params.training_params.fast_dev_run = False
-                    params.features_params.last_month_in_train = True
                 else:
                     raise RuntimeError(
                         f"Retraining {todays_model_name} failed and no valid fallback model was found."
@@ -384,18 +369,15 @@ class RunFullPipeline:
         elif not self._has_games_today():
             logging.info(f"No games scheduled for today ({self._run_date}). Skipping model training.")
             if not self._is_valid_trained_model_dir(target_dir):
-                candidate_models = []
-                if os.path.isdir(models_base):
-                    for entry in os.listdir(models_base):
-                        if entry.startswith('model_') and entry != todays_model_name:
-                            full_path = os.path.join(models_base, entry)
-                            if self._is_valid_trained_model_dir(full_path):
-                                candidate_models.append(entry)
-                if candidate_models:
-                    active_model_name = sorted(candidate_models)[-1]
-                elif self._is_valid_trained_model_dir(os.path.join(models_base, str(self._load_params_from_model_id))):
-                    active_model_name = str(self._load_params_from_model_id)
+                fallback_name = self._latest_valid_model_name(models_base, exclude_name=todays_model_name)
+                if fallback_name is not None:
+                    active_model_name = fallback_name
 
+        active_params_path = os.path.join(models_base, str(active_model_name), 'params.json')
+        if os.path.isfile(active_params_path):
+            params = MachineLearningParamsFantasyBasketballPredictions.load_params(active_params_path)
+            params.training_params.fast_dev_run = False
+            params.features_params.last_month_in_train = True
         params.continue_model_id = active_model_name
         self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
 
@@ -489,7 +471,7 @@ class RunFullPipeline:
             best_set = best_set.sort_values('_sort_order').drop(columns=['_sort_order']).reset_index(drop=True)
 
         position_cols = DFS_POSITIONS[Sites.YAHOO]
-        best_set[position_cols] = best_set[position_cols].apply(lambda col: col.map(player_id_to_name))
+        best_set[position_cols] = best_set[position_cols].apply(lambda col: col.map(lambda x: player_id_to_name.get(x, x)))
 
         # submitting the best set to yahoo
         submit_teams.submit_best_set(best_set)
@@ -562,11 +544,9 @@ if __name__ == '__main__':
                         help="Run the browser in visible mode (default: headless)")
     args = parser.parse_args()
 
-    params_update_dict = {'continue_model_name': 'extra_weight_on_ast'}
     ropd = RunFullPipeline(
         run_date=args.date,
         headless=not args.no_headless,
-        params_update_dict=params_update_dict,
         run_immediately=args.run_immediately or args.train_only or args.run_once,
         minutes_before_game_to_run=7,
         load_params_from_model_id=args.model_id,

@@ -388,6 +388,7 @@ class Starters:
         save_path = os.path.join(self.save_dir, f"{str(date).replace('-', '_')}.feather")
         if os.path.isfile(save_path) and date != get_current_date():
             df = pd.read_feather(save_path)
+            df = df.loc[df['TEAM'].isin(todays_teams)].reset_index(drop=True)
             if self._is_finished(df, todays_teams) and df['CONFIRMED'].all():
                 return df
         else:
@@ -398,6 +399,8 @@ class Starters:
             load_instance = load_class(fix_player_names_instance=self.fix_player_names)
             load_instance.run(date=date, schedule=self.schedule, out_players=out_players)
             curr_df = load_instance.df
+            if not curr_df.empty:
+                curr_df = curr_df.loc[curr_df['TEAM'].isin(todays_teams)]
 
             if curr_df.empty:
                 logging.info(f"finished running {load_class.__name__}, returned empty dataframe")

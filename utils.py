@@ -902,10 +902,6 @@ def scrape_season_schedules(season: int | str, save_dir: str | None = None) -> N
                 f"Failed to scrape season schedule for {season} from NBA.com ({e}). "
                 f"Falling back to existing cached schedule at {save_path}."
             )
-            try:
-                os.utime(save_path, None)
-            except OSError:
-                pass
             return
         raise
 
@@ -987,7 +983,12 @@ def update_todays_schedule_from_scoreboard(
             updated = True
 
     if updated:
+        orig_stat = os.stat(save_path)
         schedule_df.to_feather(save_path)
+        try:
+            os.utime(save_path, (orig_stat.st_atime, orig_stat.st_mtime))
+        except OSError:
+            pass
         logging.info(f"Successfully updated live statuses for {len(games)} games on {date_str} in {save_path}")
 
     return updated

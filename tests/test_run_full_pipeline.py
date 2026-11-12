@@ -33,31 +33,11 @@ class TestRunFullPipeline(unittest.TestCase):
         )
 
         self.assertGreaterEqual(pipeline.season, 2026)
-        self.assertIsInstance(pipeline._model_params_update_dict, dict)
-        self.assertIn("training", pipeline._model_params_update_dict)
-        self.assertFalse(pipeline._model_params_update_dict["training"]["run_extra_callbacks"])
+        self.assertFalse(hasattr(pipeline, "_model_params_update_dict"))
         self.assertIsNotNone(pipeline.stats_loaders_players)
         self.assertIsNotNone(pipeline.stats_loaders_teams)
         self.assertIsNotNone(pipeline.calc_features)
         self.assertEqual(pipeline.dates_to_game_times, {})
-
-    def test_init_custom_params_update_dict(self):
-        """Verify custom params_update_dict is preserved while enforcing run_extra_callbacks=False."""
-        custom_dict = {
-            "training": {"num_epochs": 20, "learning_rate": 0.001},
-            "features": {"scale": True}
-        }
-        pipeline = RunFullPipeline(
-            load_params_from_model_id=42,
-            params_update_dict=custom_dict,
-            run_immediately=True,
-            initialize_daily_job=False
-        )
-
-        self.assertEqual(pipeline._model_params_update_dict["training"]["num_epochs"], 20)
-        self.assertEqual(pipeline._model_params_update_dict["training"]["learning_rate"], 0.001)
-        self.assertFalse(pipeline._model_params_update_dict["training"]["run_extra_callbacks"])
-        self.assertEqual(pipeline._model_params_update_dict["features"]["scale"], True)
 
     def test_reset_run_date_resolution(self):
         """Verify _reset correctly sets _run_date from date object or 'today' string."""
@@ -558,6 +538,125 @@ class TestRunFullPipeline(unittest.TestCase):
         with patch.object(pipeline, "run_full_pipeline") as mock_pipeline_run:
             pipeline.run_full_pipeline_continuously()
             mock_pipeline_run.assert_called_once()
+
+    @patch("run_full_pipeline.update_todays_schedule_from_scoreboard")
+    @patch("run_full_pipeline.scrape_season_schedules")
+    @patch("run_full_pipeline.load_and_cache_players_list")
+    @patch("run_full_pipeline.update_all_stats")
+    def test_run_once_per_day_loads_active_model_params_when_already_trained_or_no_games(
+        self,
+        mock_update_stats,
+        mock_load_players,
+        mock_scrape_schedules,
+        mock_update_scoreboard,
+    ):
+        """Verify run_once_per_day reloads params.json from the active model directory in already_trained and no-games branches."""
+        models_base = os.path.join(
+            self.temp_dir, "machine_learning_fantasy_basketball_predictions", "models"
+        )
+        os.makedirs(models_base, exist_ok=True)
+
+        for name in ["0", "model_2026_11_07", "model_2026_11_08"]:
+            mdir = os.path.join(models_base, name)
+            os.makedirs(os.path.join(mdir, "scalers"), exist_ok=True)
+            os.makedirs(os.path.join(mdir, "categorical_encoder"), exist_ok=True)
+            with open(os.path.join(mdir, "params.json"), "w") as f:
+                f.write("{}")
+            with open(os.path.join(mdir, "model.pt"), "w") as f:
+                f.write("w")
+            with open(os.path.join(mdir, "scalers", "true_label.pkl"), "w") as f:
+                f.write("s")
+            with open(os.path.join(mdir, "categorical_encoder", "embedding_features.pkl"), "w") as f:
+                f.write("e")
+
+        run_date = datetime.date(2026, 11, 8)
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=0,
+            run_date=run_date,
+            run_immediately=True,
+            initialize_daily_job=False,
+        )
+
+        # 1. already_trained=True branch (model_2026_11_08 exists): must load model_2026_11_08/params.json
+        pipeline._get_game_times_by_day_dict = MagicMock(return_value={run_date: [datetime.datetime.now(NY_TZ)]})
+        loaded_paths = []
+
+        def fake_load_params(path):
+            loaded_paths.append(os.path.normpath(path))
+            m = MagicMock()
+            m.features_params = MagicMock()
+            m.training_params = MagicMock()
+            return m
+
+        with patch("run_full_pipeline.DATA_DIR", self.temp_dir), \
+             patch("run_full_pipeline.MachineLearningParamsFantasyBasketballPredictions.load_params", side_effect=fake_load_params), \
+             patch("run_full_pipeline.RunModelFantasyBasketballPredictions"):
+            pipeline.run_once_per_day()
+
+        expected_active_path = os.path.normpath(os.path.join(models_base, "model_2026_11_08", "params.json"))
+        self.assertEqual(loaded_paths[-1], expected_active_path)
+
+        # 2. No games today branch (remove model_2026_11_08): must fall back to model_2026_11_07 and load its params.json
+        shutil.rmtree(os.path.join(models_base, "model_2026_11_08"))
+        pipeline._get_game_times_by_day_dict = MagicMock(return_value={})
+        loaded_paths.clear()
+
+        with patch("run_full_pipeline.DATA_DIR", self.temp_dir), \
+             patch("run_full_pipeline.MachineLearningParamsFantasyBasketballPredictions.load_params", side_effect=fake_load_params), \
+             patch("run_full_pipeline.RunModelFantasyBasketballPredictions"):
+            pipeline.run_once_per_day()
+
+        expected_fallback_path = os.path.normpath(os.path.join(models_base, "model_2026_11_07", "params.json"))
+        self.assertEqual(loaded_paths[-1], expected_fallback_path)
+
+    @patch("run_full_pipeline.get_next_game_time")
+    def test_get_todays_predictions_fills_unmapped_position_with_ignore_val_and_propagates_loader_error(self, mock_cutoff):
+        """Verify unmapped positions become IGNORE_VAL (-999, not 1/PG) and date loader errors propagate."""
+        pipeline = RunFullPipeline(load_params_from_model_id=1, initialize_daily_job=False)
+        today = get_current_date()
+        pipeline._run_date = today
+
+        # 1. Propagate ValueError when create_date_filtered_data_loader raises
+        mock_dataset = MagicMock(spec=MachineLearningDatasetCombinedFantasyBasketballPredictions)
+        mock_dataset.create_date_filtered_data_loader.side_effect = ValueError("No samples found for date")
+        pipeline.train_nn = MagicMock()
+        pipeline.train_nn.dataset_combined = mock_dataset
+        pipeline.train_nn._change_metrics_params_tuple_to_per_sample.side_effect = lambda x: x
+        pipeline.train_nn.params.training_params.metrics_params = ()
+        pipeline.train_nn.params.training_params.loss_params = ()
+
+        with self.assertRaises(ValueError):
+            pipeline._get_todays_predictions()
+
+        # 2. Unmapped position fills with IGNORE_VAL (-999), not 1 ('PG')
+        pipeline.train_nn.dataset_combined = None
+        pipeline.train_nn.predict.return_value = pd.DataFrame({
+            "DATE": [today],
+            "PLAYER_ID": [101],
+            "CollectTruePredictedOutputsParamsFantasyBasketballPredictions_YAHOO_POINTS": [30.0],
+        })
+        pipeline.stats_loaders_players.df = pd.DataFrame({
+            "DATE": [today],
+            "PLAYER_ID": [101],
+            "GAME_ID": [10001],
+            "TEAM_ID": [1610612738],
+            "YAHOO_POSITION": [np.nan],
+            "YAHOO_SALARY": [25.0],
+        })
+        pipeline.stats_loaders_players.get_player_name_to_id = MagicMock(return_value={"Player X": 101})
+        mock_template = pd.DataFrame({
+            "Name": ["Player X"],
+            "Position": ["UNKNOWN_POS"],
+            "Salary": [25],
+            "Time": [datetime.datetime.now(NY_TZ) + datetime.timedelta(hours=2)],
+        })
+        mock_cutoff.return_value = datetime.datetime.now(NY_TZ) - datetime.timedelta(hours=1)
+        pipeline._add_game_times_to_df = MagicMock(side_effect=lambda df, **kwargs: df.assign(
+            GAME_DATE_TIME=datetime.datetime.now(NY_TZ) + datetime.timedelta(hours=2)
+        ))
+
+        res = pipeline._get_todays_predictions(teams_template=mock_template)
+        self.assertEqual(res.loc[0, "YAHOO_POSITION"], -999)
 
 
 if __name__ == "__main__":

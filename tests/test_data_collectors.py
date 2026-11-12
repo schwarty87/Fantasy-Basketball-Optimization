@@ -767,7 +767,7 @@ class TestDataCollectors(unittest.TestCase):
     @patch.object(RunFullPipeline, "_reset")
     def test_run_full_pipeline_season_propagation(self, mock_reset, mock_calc, mock_teams, mock_players, mock_logger):
         """Verify RunFullPipeline propagates dynamic season to child loaders."""
-        pipeline = RunFullPipeline(load_params_from_model_id=1, season=None, params_update_dict={})
+        pipeline = RunFullPipeline(load_params_from_model_id=1, season=None)
         expected_season = get_current_season()
         self.assertEqual(pipeline.season, expected_season)
         mock_players.assert_called_once_with(season=expected_season)
@@ -1232,7 +1232,7 @@ class TestDataCollectors(unittest.TestCase):
 
     @patch("utils.load_nbacom_data")
     def test_scrape_season_schedules_fallback_on_network_error(self, mock_load):
-        """Verify scrape_season_schedules falls back to existing cached file on network exception."""
+        """Verify scrape_season_schedules falls back to existing cached file on network exception without bumping mtime."""
         with tempfile.TemporaryDirectory() as tmpdir:
             save_path = os.path.join(tmpdir, "2026.feather")
             pd.DataFrame({"test": [1]}).to_feather(save_path)
@@ -1244,6 +1244,8 @@ class TestDataCollectors(unittest.TestCase):
             # Should not raise exception because save_path exists
             scrape_season_schedules(2026, save_dir=tmpdir)
             mock_load.assert_called_once()
+            # mtime must remain old_time so subsequent runs retry scraping
+            self.assertAlmostEqual(os.path.getmtime(save_path), old_time, delta=1.0)
 
     @patch("utils.load_nbacom_data")
     def test_scrape_season_schedules_raises_when_no_cache(self, mock_load):
@@ -1270,6 +1272,8 @@ class TestDataCollectors(unittest.TestCase):
             })
             save_path = os.path.join(tmpdir, "2026.feather")
             sched_df.to_feather(save_path)
+            old_mtime = time.time() - (12 * 3600)
+            os.utime(save_path, (old_mtime, old_mtime))
 
             mock_load.return_value = {
                 "games": [
@@ -1284,6 +1288,8 @@ class TestDataCollectors(unittest.TestCase):
 
             result = update_todays_schedule_from_scoreboard(date="2026-11-08", season=2026, schedules_dir=tmpdir)
             self.assertTrue(result)
+            # Original mtime must be preserved so 24h full-schedule TTL is not reset
+            self.assertAlmostEqual(os.path.getmtime(save_path), old_mtime, delta=1.0)
 
             updated_df = pd.read_feather(save_path)
             self.assertEqual(updated_df.loc[0, "postponedStatus"], "Y")
@@ -1373,6 +1379,67 @@ class TestDataCollectors(unittest.TestCase):
         self.assertEqual(len(cf.updates_df), 1)
         self.assertEqual(cf.updates_df.iloc[0]["PLAYER_ID"], 201)
         self.assertTrue(pd.isna(cf.updates_df.iloc[0]["YEARS_SINCE_DRAFT"]))
+
+    def test_starters_collect_data_filters_ppd_teams_in_both_cached_and_live_paths(self):
+        """Verify Starters.collect_data filters out postponed teams in both cached feather and live scraper branches."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_date = datetime.date(2026, 11, 8)
+            # Schedule has only BOS & LAL (CHI @ PHI was PPD and dropped)
+            sched_df = pd.DataFrame({
+                "DATE": [target_date, target_date],
+                "TEAM": ["BOS", "LAL"],
+                "GAME_ID": [22600100, 22600100],
+            })
+            starters = Starters()
+            starters.save_dir = tmpdir
+            starters.schedule = sched_df
+
+            # Build a starters dataframe containing 5 BOS, 5 LAL, and 5 PPD CHI players
+            rows = []
+            for pos_idx, pos in enumerate(["PG", "SG", "SF", "PF", "C"]):
+                rows.append({"NAME": f"BOS_{pos}", "TEAM": "BOS", "START_POSITION": pos, "CONFIRMED": True, "PLAYER_ID": 100 + pos_idx})
+                rows.append({"NAME": f"LAL_{pos}", "TEAM": "LAL", "START_POSITION": pos, "CONFIRMED": True, "PLAYER_ID": 200 + pos_idx})
+                rows.append({"NAME": f"CHI_{pos}", "TEAM": "CHI", "START_POSITION": pos, "CONFIRMED": True, "PLAYER_ID": 300 + pos_idx})
+            cached_df = pd.DataFrame(rows)
+            save_path = os.path.join(tmpdir, "2026_11_08.feather")
+            cached_df.to_feather(save_path)
+
+            # 1. Cached branch (date != get_current_date()): must drop CHI rows
+            with patch("data_collectors.starters.get_current_date", return_value=datetime.date(2026, 11, 9)):
+                res_cached = starters.collect_data(date=target_date)
+            self.assertEqual(set(res_cached["TEAM"].unique()), {"BOS", "LAL"})
+            self.assertEqual(len(res_cached), 10)
+
+            # 2. Live scraper branch (date == get_current_date()): must drop CHI rows from scraped curr_df
+            class DummyLoader:
+                def __init__(self, fix_player_names_instance=None):
+                    self.df = cached_df.copy()
+                def run(self, date, schedule, out_players=None):
+                    pass
+
+            with patch("data_collectors.starters.get_current_date", return_value=target_date), \
+                 patch.object(starters, "all_load_classes", return_value=[DummyLoader]):
+                res_live = starters.collect_data(date=target_date)
+            self.assertEqual(set(res_live["TEAM"].unique()), {"BOS", "LAL"})
+            self.assertEqual(len(res_live), 10)
+
+    @patch("data_collectors.stats_loaders.load_schedule")
+    @patch("data_collectors.stats_loaders.load_and_cache_players_list")
+    @patch("data_collectors.stats_loaders.StatsLoader.call")
+    def test_stats_loader_players_call_refreshes_schedule_drop_ppd(self, mock_super_call, mock_players_list, mock_load_sched):
+        """Verify StatsLoaderPlayers.call refreshes self._schedule = load_schedule(drop_ppd=True)."""
+        init_sched = pd.DataFrame({"GAME_ID": [1, 2]})
+        refreshed_sched = pd.DataFrame({"GAME_ID": [1]})  # game 2 postponed
+        mock_load_sched.side_effect = [init_sched, refreshed_sched]
+        mock_players_list.return_value = pd.DataFrame({"PLAYER_ID": [101], "NAME": ["Player A"]})
+
+        loader = StatsLoaderPlayers(season=2026)
+        self.assertEqual(len(loader._schedule), 2)
+
+        loader.call(add_upcoming_games=True)
+        self.assertEqual(len(loader._schedule), 1)
+        self.assertEqual(mock_load_sched.call_count, 2)
+        mock_load_sched.assert_called_with(drop_ppd=True)
 
 
 if __name__ == "__main__":
