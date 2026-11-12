@@ -105,7 +105,7 @@ class FeaturesParams(AbstractParams):
 class TrainingParams(AbstractParams):
     """This class holds all parameters needed for training a neural network model."""
     learning_rate: float = 0.01
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-2
     batch_size: int | None = 256
     training_dtype: torch.dtype = torch.float32
     save_to_db: bool = True

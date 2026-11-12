@@ -229,7 +229,7 @@ def create_architecture_params(
         d_model=d_model,
         n_heads=n_heads,
         ffdim=d_model * 4,
-        dropout_rate=0.30,
+        dropout_rate=0.25,
         norm_at_beginning=True,
         n_bench_players=features_params.num_bench_players,
         num_layers=1,
@@ -244,7 +244,7 @@ def create_architecture_params(
         d_model=d_model,
         nhead=n_heads,
         dim_feedforward=d_model * 4,
-        dropout=0.30,
+        dropout=0.25,
         norm_first=True,
         num_layers=2,
         activation=ActivationFunction.GELU,
@@ -271,7 +271,7 @@ def create_architecture_params(
         num_nodes_per_layer=[64, num_outputs],
         use_batchnorm=True,
         activation=ActivationFunction.GELU,
-        dropout_rate=0.25,
+        dropout_rate=0.15,
     )
 
     # 9. Compute Yahoo Fantasy Points from predicted stats
@@ -377,8 +377,8 @@ def create_training_params(
 
     callbacks_params = (
         ModelCheckpointParams(),
-        EarlyStoppingParams(patience=4),
-        ReduceLearningRateOnPlateauParams(patience=2),
+        EarlyStoppingParams(),
+        ReduceLearningRateOnPlateauParams(patience=5),
         LogModelResultsParams(),
         CollectTruePredictedOutputsParamsFantasyBasketballPredictions(
             column_names={
@@ -407,7 +407,6 @@ def create_training_params(
         batch_size=None,
         num_days_per_batch=num_days_per_batch,
         learning_rate=0.001,
-        weight_decay=1e-4,
         num_epochs=None,
         training_dtype=torch.float32,
         dataloader_num_workers=0,

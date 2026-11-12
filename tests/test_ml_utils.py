@@ -892,9 +892,9 @@ class TestRegularizationAndWeightDecay(unittest.TestCase):
             self.head = nn.Linear(16, 2)
 
     def test_training_params_weight_decay(self):
-        """Verify TrainingParams default weight_decay and validation."""
+        """Verify TrainingParams default weight_decay=1e-2 and validation."""
         tp = TrainingParams(learning_rate=0.001)
-        self.assertEqual(tp.weight_decay, 1e-4)
+        self.assertEqual(tp.weight_decay, 1e-2)
 
         tp_custom = TrainingParams(learning_rate=0.001, weight_decay=1e-3)
         self.assertEqual(tp_custom.weight_decay, 1e-3)
@@ -902,39 +902,31 @@ class TestRegularizationAndWeightDecay(unittest.TestCase):
         with self.assertRaises(ValueError):
             TrainingParams(learning_rate=0.001, weight_decay=-0.01)
 
-    def test_decoupled_weight_decay_parameter_groups(self):
-        """Verify 2D weights get weight_decay while embeddings, biases, and norms get 0.0."""
+    def test_uniform_weight_decay_in_lightning_and_legacy_optimizers(self):
+        """Verify both Lightning and legacy optimizers apply weight_decay=1e-2 uniformly across all parameters."""
         model = self.SimpleModule()
         mock_params = MagicMock()
         mock_params.training_params.learning_rate = 0.001
-        mock_params.training_params.weight_decay = 1e-4
+        mock_params.training_params.weight_decay = 1e-2
         mock_params.training_params.callbacks_params = ()
 
         module = MachineLearningLightningModule(params=mock_params, model=model)
-
         optimizer = module.configure_optimizers()
         self.assertIsInstance(optimizer, torch.optim.AdamW)
-        self.assertEqual(len(optimizer.param_groups), 2)
+        self.assertEqual(len(optimizer.param_groups), 1)
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 1e-2)
+        self.assertEqual(len(optimizer.param_groups[0]["params"]), len(list(model.parameters())))
 
-        decay_group = optimizer.param_groups[0]
-        no_decay_group = optimizer.param_groups[1]
+        runner = MagicMock(spec=RunModel)
+        runner.params = mock_params
+        runner.model = model
+        legacy_opt = RunModel._define_optimizer(runner)
+        self.assertIsInstance(legacy_opt, torch.optim.AdamW)
+        self.assertEqual(len(legacy_opt.param_groups), 1)
+        self.assertEqual(legacy_opt.param_groups[0]["weight_decay"], 1e-2)
 
-        self.assertEqual(decay_group["weight_decay"], 1e-4)
-        self.assertEqual(no_decay_group["weight_decay"], 0.0)
-
-        # Decay group should contain linear.weight and head.weight (2D)
-        decay_shapes = [p.shape for p in decay_group["params"]]
-        self.assertIn(torch.Size([16, 8]), decay_shapes)
-        self.assertIn(torch.Size([2, 16]), decay_shapes)
-
-        # No decay group should contain embedding.weight, linear.bias, norm.weight, norm.bias, head.bias
-        no_decay_shapes = [p.shape for p in no_decay_group["params"]]
-        self.assertIn(torch.Size([10, 8]), no_decay_shapes)
-        self.assertIn(torch.Size([16]), no_decay_shapes)
-        self.assertIn(torch.Size([2]), no_decay_shapes)
-
-    def test_zero_weight_decay_falls_back_to_single_group(self):
-        """Verify weight_decay=0.0 does not create split decay groups."""
+    def test_zero_weight_decay_is_explicitly_preserved(self):
+        """Verify weight_decay=0.0 sets param_group weight_decay=0.0 instead of falling back to PyTorch's 0.01 default."""
         model = self.SimpleModule()
         mock_params = MagicMock()
         mock_params.training_params.learning_rate = 0.001
@@ -942,9 +934,16 @@ class TestRegularizationAndWeightDecay(unittest.TestCase):
         mock_params.training_params.callbacks_params = ()
 
         module = MachineLearningLightningModule(params=mock_params, model=model)
-
         optimizer = module.configure_optimizers()
         self.assertEqual(len(optimizer.param_groups), 1)
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.0)
+
+        runner = MagicMock(spec=RunModel)
+        runner.params = mock_params
+        runner.model = model
+        legacy_opt = RunModel._define_optimizer(runner)
+        self.assertEqual(len(legacy_opt.param_groups), 1)
+        self.assertEqual(legacy_opt.param_groups[0]["weight_decay"], 0.0)
 
 
 if __name__ == "__main__":

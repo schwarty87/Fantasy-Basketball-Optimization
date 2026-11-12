@@ -344,24 +344,8 @@ class RunModel:
 
     def _define_optimizer(self) -> torch.optim.Optimizer:
         lr = self.params.training_params.learning_rate
-        weight_decay = getattr(self.params.training_params, "weight_decay", 1e-4)
-        if weight_decay and weight_decay > 0 and self.model is not None:
-            decay_params = []
-            no_decay_params = []
-            for name, param in self.model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if param.ndim <= 1 or "bias" in name or "norm" in name.lower() or "embedding" in name.lower():
-                    no_decay_params.append(param)
-                else:
-                    decay_params.append(param)
-            param_groups = []
-            if decay_params:
-                param_groups.append({"params": decay_params, "weight_decay": weight_decay})
-            if no_decay_params:
-                param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
-            return torch.optim.AdamW(param_groups if param_groups else self.model.parameters(), lr=lr)
-        return torch.optim.AdamW(self.model.parameters(), lr=lr)
+        weight_decay = float(getattr(self.params.training_params, "weight_decay", 1e-2))
+        return torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
     def _should_update_optimizer(self, batch_num: int) -> bool:
         if not self.model.training:
