@@ -24,14 +24,15 @@ class FeaturesParamsFantasyBasketballPredictions(FeaturesParams):
         if self.features_path is None:
             self.features_path = os.path.join(update_dir_name('features'), 'features.feather')
 
-        self.all_feature_names_list = sorted(set(self.all_feature_names_list + ['EJECTED', 'LEFT_MIDGAME']))
-
-        # adding columns needed for calculating the mean ratio
-        for c in self.all_feature_names_list:
+        extra_cols = ['EJECTED', 'LEFT_MIDGAME']
+        for c in list(self.all_feature_names_list):
             if c.endswith('_mean_ratio'):
                 base_name = c.replace('_mean_ratio', '')
-                self.all_feature_names_list += [base_name, base_name + '_mean5']
-        self.all_feature_names_list = sorted(set(self.all_feature_names_list))
+                extra_cols.extend([base_name, base_name + '_mean5'])
+            elif '_t-' in c:
+                extra_cols.append(c.split('_t-')[0])
+
+        self.all_feature_names_list = sorted(set(self.all_feature_names_list + extra_cols))
 
         if self.sample_per_game and self.feature_type_to_input_shape is not None:
             num_players_per_game = 10 + 2 * self.num_bench_players

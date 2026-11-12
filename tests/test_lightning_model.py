@@ -43,15 +43,21 @@ class TestFantasyBasketballLightningModule(unittest.TestCase):
         ].feature_names
         n_players_per_game = (5 + self.params.features_params.num_bench_players) * 2  # 22 players
 
-        batch["tabular"] = torch.randn((num_games, n_players_per_game, 2), dtype=torch.float32)
+        fp_map = self.params.features_params.feature_name_to_machine_learning_dataset_params
+        tabular_dim = len(fp_map["tabular"].feature_names)
+        lagged_dim = len(fp_map["lagged"].feature_names)
+        pos_dim = len(fp_map["positional_encoding_features"].feature_names)
+        emb_dim = len(fp_map["embedding_features"].feature_names)
+
+        batch["tabular"] = torch.randn((num_games, n_players_per_game, tabular_dim), dtype=torch.float32)
         batch["lagged"] = torch.randn(
-            (num_games, n_players_per_game, len(output_features) * 9), dtype=torch.float32
+            (num_games, n_players_per_game, lagged_dim), dtype=torch.float32
         )
         batch["positional_encoding_features"] = torch.zeros(
-            (num_games, n_players_per_game, 2), dtype=torch.long
+            (num_games, n_players_per_game, pos_dim), dtype=torch.long
         )
         batch["embedding_features"] = torch.zeros(
-            (num_games, n_players_per_game, 5), dtype=torch.long
+            (num_games, n_players_per_game, emb_dim), dtype=torch.long
         )
         batch["true_label"] = torch.randn(
             (num_games, n_players_per_game, len(output_features)), dtype=torch.float32

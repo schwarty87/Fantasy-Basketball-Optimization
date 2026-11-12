@@ -96,13 +96,15 @@ def create_features_params() -> FeaturesParamsFantasyBasketballPredictions:
 
     feature_name_to_machine_learning_dataset_params = {
         'tabular': MachineLearningDatasetTabularScalingParams(
-            feature_names=['DAYS_REST', 'SEASON_PROGRESS'],
+            feature_names=[
+                'DAYS_REST', 'SEASON_PROGRESS',
+            ] + [f'{stat}_mean5' for stat in output_features] + [f'{stat}_mean10' for stat in output_features],
             relevant_keep_mask_dataset_name='real_player_mask',
             masked_fill_value=0.0,
             dtype=features_dtype,
         ),
         'lagged': MachineLearningDatasetTabularScalingParams(
-            feature_names=[f'{stat}_t-{lag}' for stat in output_features for lag in range(1, 10)],
+            feature_names=[f'{stat}_t-{lag}' for stat in output_features + ['STARTER'] for lag in range(1, 4)],
             relevant_keep_mask_dataset_name='real_player_mask',
             masked_fill_value=0.0,
             dtype=features_dtype,
@@ -112,7 +114,7 @@ def create_features_params() -> FeaturesParamsFantasyBasketballPredictions:
             dtype=features_dtype,
         ),
         'embedding_features': MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams(
-            feature_names=['PLAYER_ID', 'PLAYER_SEASON', 'SEASON_TEAM', 'SEASON_YEAR', 'TEAM_ID'],
+            feature_names=['PLAYER_ID', 'PLAYER_SEASON', 'SEASON_OPPONENT', 'SEASON_TEAM', 'SEASON_YEAR', 'TEAM_ID'],
             dtype=features_dtype,
         ),
         'true_label': MachineLearningDatasetTabularScalingParams(
@@ -166,6 +168,7 @@ def create_architecture_params(
     embedding_feature_dims = {
         'PLAYER_ID': 32,
         'PLAYER_SEASON': 12,
+        'SEASON_OPPONENT': 4,
         'SEASON_TEAM': 4,
         'SEASON_YEAR': 4,
         'TEAM_ID': 4,

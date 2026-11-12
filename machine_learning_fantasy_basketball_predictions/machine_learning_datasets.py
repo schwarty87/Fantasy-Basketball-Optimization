@@ -100,16 +100,12 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
     def _load_features(self) -> pd.DataFrame:
         df = super()._load_features()
 
-        # # TODO DELETE!!!!
-        # # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        # for c in ['YAHOO_POSITION', 'YAHOO_SALARY']:
-        #     mean_isnull = df.groupby('DATE')[c].apply(lambda x: x.isnull().mean())
-        #     remove_dates = mean_isnull.loc[mean_isnull > 0.1].index
-        #     df = df.loc[~df['DATE'].isin(remove_dates)]
-        # # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
         if 'YAHOO_POSITION' in df.columns:
             df['YAHOO_POSITION'] = df['YAHOO_POSITION'].map(POSITION_TO_NUM).fillna(IGNORE_VAL)
+
+        df = self._add_player_history_columns(df, self.params)
+
+        return df
 
         # if self.params.all_games_every_day:
         #     team_ids = set(TEAM_NAME_TO_ID.values())
@@ -245,53 +241,72 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         if 'IS_REAL_PLAYER' in missing_columns or 'IS_REAL_PLAYER' not in features_df.columns:
             features_df['IS_REAL_PLAYER'] = np.where(is_real_player, 1, IGNORE_VAL)
 
-        # adding mean ratios
-        for c in missing_columns:
-            if c.endswith('_mean_ratio'):
-                base_name = c.replace('_mean_ratio', '')
-                mean_name = base_name + '_mean5'
-                features_df[c] = features_df[base_name] / features_df[mean_name]
-                features_df[c].clip(upper=10, inplace=True)
-                features_df.loc[(features_df[mean_name] == 0) & (features_df[base_name] == 0), c] = 1
-                features_df.loc[(features_df[mean_name] == 0) & (features_df[base_name] != 0), c] = 10
-
-        # adding lagged data
-        lag_missing_cols = [c for c in missing_columns if '_t-' in c]
-        lags = [int(c.split('_t-')[-1]) for c in lag_missing_cols]
-        lag_stats = [c.split('_t-')[0] for c in lag_missing_cols]
-        all_lagged_features = list()
-        prev_lag_features_df = None
-        for lag in sorted(set(lags)):
-            inds = [ii for ii, v in enumerate(lags) if v == lag]
-            stats = [lag_stats[ii] for ii in inds]
-            lagged_features = features_df.groupby(['PLAYER_ID', 'STARTER'])[stats].shift(lag)
-
-            if lag == 1:
-                lagged_features2 = features_df.groupby(['PLAYER_ID'])[stats].shift(lag)
-                starter_inds = features_df['STARTER'] == True
-                lagged_features2.loc[starter_inds] = lagged_features2.loc[starter_inds] * 1.25
-                lagged_features2.loc[~starter_inds] = lagged_features2.loc[~starter_inds] * 0.75
-                lagged_features = lagged_features.fillna(lagged_features2)
-            else:
-                if prev_lag_features_df is not None:
-                    available_stats = [s for s in stats if s in prev_lag_features_df.columns]
-                    lagged_features[available_stats] = lagged_features[available_stats].fillna(prev_lag_features_df[available_stats])
-
-            # If a player has no prior games in history (e.g. debut), fill with the role/position
-            # baseline rather than zeros or naive un-grouped bfill (which leaks stats across players)
-            role_group_cols = [c for c in ['START_POSITION_CALCULATED', 'STARTER'] if c in features_df.columns]
-            if role_group_cols:
-                role_means = features_df.groupby(role_group_cols)[stats].transform('mean')
-                lagged_features = lagged_features.fillna(role_means)
-            lagged_features = lagged_features.fillna(0.0)
-
-            prev_lag_features_df = lagged_features.copy()
-
-            lagged_features_renamed = lagged_features.rename(columns={stat: f'{stat}_t-{lag}' for stat in stats})
-            all_lagged_features.append(lagged_features_renamed)
-        features_df = pd.concat([features_df] + all_lagged_features, axis=1)
+        # Idempotent fallback in case features were not loaded via _load_features (e.g. mocked tests)
+        features_df = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(features_df, params)
 
         return features_df
+
+    @classmethod
+    def _add_player_history_columns(cls, df: pd.DataFrame, params: FeaturesParamsFantasyBasketballPredictions) -> pd.DataFrame:
+        if df.empty:
+            return df
+
+        sort_cols = [c for c in ['DATE', 'GAME_ID', 'TEAM_ID', 'PLAYER_ID'] if c in df.columns]
+        if len(sort_cols) >= 2:
+            df = df.sort_values(sort_cols).reset_index(drop=True)
+
+        # 1. Mean ratios (e.g. PTS_mean_ratio = PTS / PTS_mean5)
+        for c in params.all_feature_names_list:
+            if c.endswith('_mean_ratio') and c not in df.columns:
+                base_name = c.replace('_mean_ratio', '')
+                mean_name = base_name + '_mean5'
+                if base_name in df.columns and mean_name in df.columns:
+                    ratio = df[base_name] / df[mean_name]
+                    ratio = ratio.clip(upper=10.0)
+                    ratio.loc[(df[mean_name] == 0) & (df[base_name] == 0)] = 1.0
+                    ratio.loc[(df[mean_name] == 0) & (df[base_name] != 0)] = 10.0
+                    df[c] = ratio.fillna(1.0).astype(np.float32)
+
+        # 3. Lagged features (e.g. *_t-{lag})
+        lag_cols = [c for c in params.all_feature_names_list if '_t-' in c and c not in df.columns]
+        if lag_cols and 'PLAYER_ID' in df.columns:
+            lags = [int(c.split('_t-')[-1]) for c in lag_cols]
+            lag_stats = [c.split('_t-')[0] for c in lag_cols]
+            all_lagged = []
+            prev_lag_df = None
+            for lag in sorted(set(lags)):
+                inds = [ii for ii, v in enumerate(lags) if v == lag]
+                stats = list(dict.fromkeys([lag_stats[ii] for ii in inds if lag_stats[ii] in df.columns]))
+                if not stats:
+                    continue
+                stats_df = df[stats].copy()
+                for s in stats:
+                    if pd.api.types.is_bool_dtype(stats_df[s]):
+                        stats_df[s] = stats_df[s].astype(np.float32)
+
+                lagged = stats_df.groupby(df['PLAYER_ID']).shift(lag)
+                if lag == 1 and 'STARTER' in df.columns:
+                    lagged_starter = stats_df.groupby([df['PLAYER_ID'], df['STARTER']]).shift(1)
+                    lagged = lagged_starter.fillna(lagged)
+
+                if prev_lag_df is not None:
+                    avail = [s for s in stats if s in prev_lag_df.columns]
+                    lagged[avail] = lagged[avail].fillna(prev_lag_df[avail])
+
+                role_cols = [c for c in ['START_POSITION_CALCULATED', 'STARTER'] if c in df.columns]
+                if role_cols:
+                    role_means = stats_df.groupby([df[c] for c in role_cols]).transform('mean')
+                    lagged = lagged.fillna(role_means)
+                lagged = lagged.fillna(0.0)
+                prev_lag_df = lagged.copy()
+
+                renamed = lagged.rename(columns={s: f'{s}_t-{lag}' for s in stats})
+                all_lagged.append(renamed)
+
+            if all_lagged:
+                df = pd.concat([df] + all_lagged, axis=1)
+
+        return df
 
     def _postprocess_datasets(self, machine_learning_datasets: Dict[str, AbstractMachineLearningDataset]):
         """
