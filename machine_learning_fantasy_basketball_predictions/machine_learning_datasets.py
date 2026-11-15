@@ -3,7 +3,7 @@ import logging
 import numpy as np
 import pandas as pd
 import torch
-from typing import Optional, Dict, List, Union, Sequence, Any
+from typing import Dict, List, Sequence, Any
 
 from torch.utils.data import Sampler, Subset, DataLoader
 
@@ -36,7 +36,7 @@ class MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictio
 
 @datasets_registry.register
 class MachineLearningDatasetSampleWeightsTabularFantasyBasketballPredictions(MachineLearningDatasetSampleWeightsTabular):
-    def _transform_features(self, keep_mask: Optional[np.ndarray] = None):
+    def _transform_features(self, keep_mask: np.ndarray | None = None):
         self._features_df[self.params.feature_names] = self._features_df[self.params.feature_names].round()
         super()._transform_features(keep_mask=keep_mask)
 
@@ -92,6 +92,14 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
 
         if 'YAHOO_POSITION' in df.columns:
             df['YAHOO_POSITION'] = df['YAHOO_POSITION'].map(POSITION_TO_NUM).fillna(IGNORE_VAL)
+
+        if 'STARTER' in df.columns:
+            df['STARTER'] = df['STARTER'].astype(np.float32)
+        if 'SITE_POSITION' in df.columns:
+            df['SITE_POSITION'] = df['SITE_POSITION'].fillna(3.0).astype(np.float32)
+            rounded_pos = df['SITE_POSITION'].round().clip(1, 5).astype(np.int32)
+            df['SITE_POSITION_ROUNDED'] = rounded_pos
+            df['COURT_POSITION'] = rounded_pos
 
         df = self._add_player_history_columns(df, self.params)
 
@@ -215,7 +223,14 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                     avail = [s for s in stats if s in prev_lag_df.columns]
                     lagged[avail] = lagged[avail].fillna(prev_lag_df[avail])
 
-                role_cols = [c for c in ['START_POSITION_CALCULATED', 'STARTER'] if c in df.columns]
+                ds_map = params.feature_name_to_machine_learning_dataset_params
+                spc_in_inputs = ds_map is None or any(
+                    'START_POSITION_CALCULATED' in p.feature_names for p in ds_map.values()
+                )
+                role_cols = [
+                    c for c in (['START_POSITION_CALCULATED', 'STARTER'] if spc_in_inputs else ['STARTER'])
+                    if c in df.columns
+                ]
                 if role_cols:
                     role_means = stats_df.groupby([df[c] for c in role_cols]).transform('mean')
                     lagged = lagged.fillna(role_means)
@@ -264,8 +279,8 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
 
     def create_date_filtered_data_loader(
         self,
-        target_dates: Union[datetime.date, str, Sequence[Any]],
-        batch_size: Optional[int] = None,
+        target_dates: datetime.date | str | Sequence[Any],
+        batch_size: int | None = None,
         num_workers: int = 0,
     ) -> DataLoader:
         """Create a DataLoader containing only samples for the specified target date(s)."""

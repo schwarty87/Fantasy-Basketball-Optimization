@@ -1,7 +1,7 @@
 import os
 import datetime
 from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Dict
 from utils import update_dir_name
 from machine_learning.params.params import FeaturesParams, MachineLearningParams, TrainingParams, ArchitectureParams
 from machine_learning.params.abstract_params import AbstractParams
@@ -17,7 +17,7 @@ class FeaturesParamsFantasyBasketballPredictions(FeaturesParams):
     # If True, add dummy games for teams that didn't play, so that we have a sample for every team for every day
     # This is used whhen we want to have access to all games in a given day together
     all_games_every_day: bool = False
-    extra_weight_on_certain_date: Optional[datetime.date] = None
+    extra_weight_on_certain_date: datetime.date | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -25,6 +25,10 @@ class FeaturesParamsFantasyBasketballPredictions(FeaturesParams):
             self.features_path = os.path.join(update_dir_name('features'), 'features.feather')
 
         extra_cols = ['EJECTED', 'LEFT_MIDGAME']
+        if self.sample_per_game:
+            extra_cols.append('START_POSITION_CALCULATED')
+        if 'COURT_POSITION' in self.all_feature_names_list or 'SITE_POSITION_ROUNDED' in self.all_feature_names_list:
+            extra_cols.append('SITE_POSITION')
         for c in list(self.all_feature_names_list):
             if c.endswith('_mean_ratio'):
                 base_name = c.replace('_mean_ratio', '')
@@ -63,7 +67,7 @@ class ArchitectureParamsFantasyBasketballPredictions(ArchitectureParams):
 @params_registry.register
 @dataclass
 class TrainingParamsFantasyBasketballPredictions(TrainingParams):
-    num_days_per_batch: Optional[int] = None
+    num_days_per_batch: int | None = None
 
     def __post_init__(self):
         super().__post_init__()

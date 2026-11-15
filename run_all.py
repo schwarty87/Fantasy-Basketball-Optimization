@@ -6,7 +6,7 @@ import logging
 import torch
 import numpy as np
 from dataclasses import dataclass, is_dataclass, fields
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, List, Sequence
 import pandas as pd
 from enums import Sites
 from utils import define_logger, update_dir_name
@@ -89,16 +89,51 @@ def compare_dataclasses(obj1: dataclass, obj2: dataclass, path: str = ""):
         assert obj1 == obj2, f'Value mismatch at {path}: {obj1} vs {obj2}'
 
 
-def create_features_params() -> FeaturesParamsFantasyBasketballPredictions:
+def create_features_params(
+    num_bench_players: int | None = None,
+    tabular_feature_names: Sequence[str] | None = None,
+    extra_tabular_features: Sequence[str] | None = None,
+    positional_encoding_feature_names: Sequence[str] | None = None,
+    embedding_feature_names: Sequence[str] | None = None,
+    bench_order_input: bool = True,
+) -> FeaturesParamsFantasyBasketballPredictions:
     features_path = os.path.join(update_dir_name('features'), 'features.feather')
     features_dtype = np.dtype('float32')
     output_features = ['REB', 'STL', 'AST', '3PM', 'BLK', 'TOV', '2PM', 'FG_MISSED', 'FTM', 'FT_MISSED', 'MIN']
 
+    default_tabular = (
+        ['DAYS_REST', 'SEASON_PROGRESS']
+        + [f'{stat}_mean5' for stat in output_features]
+        + [f'{stat}_mean10' for stat in output_features]
+    )
+    if tabular_feature_names is not None:
+        resolved_tabular = list(tabular_feature_names)
+    else:
+        resolved_tabular = list(default_tabular)
+        if not bench_order_input:
+            resolved_tabular += ['STARTER', 'SITE_POSITION']
+    if extra_tabular_features is not None:
+        for col in extra_tabular_features:
+            if col not in resolved_tabular:
+                resolved_tabular.append(col)
+
+    if positional_encoding_feature_names is not None:
+        resolved_pos_features = list(positional_encoding_feature_names)
+    elif not bench_order_input:
+        resolved_pos_features = ['HOME', 'COURT_POSITION']
+    else:
+        resolved_pos_features = ['HOME', 'START_POSITION_CALCULATED']
+
+    if embedding_feature_names is not None:
+        resolved_emb_features = list(embedding_feature_names)
+    else:
+        resolved_emb_features = ['PLAYER_ID', 'PLAYER_SEASON', 'SEASON_OPPONENT', 'SEASON_TEAM', 'SEASON_YEAR', 'TEAM_ID']
+
+    resolved_num_bench = num_bench_players if num_bench_players is not None else (6 if bench_order_input else 10)
+
     feature_name_to_machine_learning_dataset_params = {
         'tabular': MachineLearningDatasetTabularScalingParams(
-            feature_names=[
-                'DAYS_REST', 'SEASON_PROGRESS',
-            ] + [f'{stat}_mean5' for stat in output_features] + [f'{stat}_mean10' for stat in output_features],
+            feature_names=resolved_tabular,
             relevant_keep_mask_dataset_name='real_player_mask',
             masked_fill_value=0.0,
             dtype=features_dtype,
@@ -110,11 +145,11 @@ def create_features_params() -> FeaturesParamsFantasyBasketballPredictions:
             dtype=features_dtype,
         ),
         'positional_encoding_features': MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams(
-            feature_names=['HOME', 'START_POSITION_CALCULATED'],
+            feature_names=resolved_pos_features,
             dtype=features_dtype,
         ),
         'embedding_features': MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams(
-            feature_names=['PLAYER_ID', 'PLAYER_SEASON', 'SEASON_OPPONENT', 'SEASON_TEAM', 'SEASON_YEAR', 'TEAM_ID'],
+            feature_names=resolved_emb_features,
             dtype=features_dtype,
         ),
         'true_label': MachineLearningDatasetTabularScalingParams(
@@ -147,7 +182,7 @@ def create_features_params() -> FeaturesParamsFantasyBasketballPredictions:
     return FeaturesParamsFantasyBasketballPredictions(
         features_path=features_path,
         feature_name_to_machine_learning_dataset_params=feature_name_to_machine_learning_dataset_params,
-        num_bench_players=6,
+        num_bench_players=resolved_num_bench,
         impute_types=(ImputationType.NONE,),
         sample_per_game=True,
         all_games_every_day=True,
@@ -172,6 +207,9 @@ def create_architecture_params(
         'SEASON_TEAM': 4,
         'SEASON_YEAR': 4,
         'TEAM_ID': 4,
+        'COURT_POSITION': 5,
+        'SITE_POSITION_ROUNDED': 5,
+        'START_POSITION_CALCULATED': 11,
     }
     embedding_features = features_params.feature_name_to_machine_learning_dataset_params['embedding_features'].feature_names
     embeddings_dims = [embedding_feature_dims.get(f, 4) for f in embedding_features]
@@ -196,14 +234,19 @@ def create_architecture_params(
         dim=-1,
     )
 
-    # 3. Positional encodings (HOME, START_POSITION_CALCULATED)
-    num_positional_features = len(
-        features_params.feature_name_to_machine_learning_dataset_params['positional_encoding_features'].feature_names
-    )
+    # 3. Positional encodings (mapped by feature name since feature_names is sorted in __post_init__)
+    pos_dims_map = {
+        'COURT_POSITION': 5,
+        'HOME': 1,
+        'SITE_POSITION_ROUNDED': 5,
+        'START_POSITION_CALCULATED': 11,
+    }
+    pos_features = features_params.feature_name_to_machine_learning_dataset_params['positional_encoding_features'].feature_names
+    num_positional_features = len(pos_features)
     positional_encodings = EmbeddingsLayerParams(
         input_tensor_name='positional_encoding_features',
         output_tensor_name=[f'embedded_positional_encoding_{i}' for i in range(num_positional_features)],
-        embeddings_dims=[1, 11],
+        embeddings_dims=[pos_dims_map.get(f, 5) for f in pos_features],
         combine_params_kwargs={'dim': -1, 'combine_func_str': 'sum'},
         max_norm=1.0,
     )
@@ -287,7 +330,7 @@ def create_architecture_params(
     num_players_per_game = (5 + features_params.num_bench_players) * 2
     date_ind = metadata_feature_names.index('DATE')
 
-    def make_daily_reshape(output_name: str, sample_source: str, ind_in_sample: Optional[int] = None) -> ReshapeToSamplePerDayParams:
+    def make_daily_reshape(output_name: str, sample_source: str, ind_in_sample: int | None = None) -> ReshapeToSamplePerDayParams:
         input_tensors = [sample_source, METADATA] if sample_source != METADATA else [METADATA, METADATA]
         kwargs = dict(
             input_tensor_name=input_tensors,
@@ -417,9 +460,25 @@ def create_training_params(
     )
 
 
-def create_params(use_skip_connection: bool = False, d_model: int = 128) -> MachineLearningParamsFantasyBasketballPredictions:
+def create_params(
+    use_skip_connection: bool = False,
+    d_model: int = 128,
+    num_bench_players: int | None = None,
+    tabular_feature_names: Sequence[str] | None = None,
+    extra_tabular_features: Sequence[str] | None = None,
+    positional_encoding_feature_names: Sequence[str] | None = None,
+    embedding_feature_names: Sequence[str] | None = None,
+    bench_order_input: bool = True,
+) -> MachineLearningParamsFantasyBasketballPredictions:
     num_days_per_batch = 4
-    features_params = create_features_params()
+    features_params = create_features_params(
+        num_bench_players=num_bench_players,
+        tabular_feature_names=tabular_feature_names,
+        extra_tabular_features=extra_tabular_features,
+        positional_encoding_feature_names=positional_encoding_feature_names,
+        embedding_feature_names=embedding_feature_names,
+        bench_order_input=bench_order_input,
+    )
     architecture_params = create_architecture_params(
         features_params,
         num_days_per_batch=num_days_per_batch,
@@ -470,7 +529,7 @@ def clean_empty_model_dirs(project_name: str = PROJECT_NAME):
 
 def main(
     use_lightning: bool = False,
-    params: Optional[MachineLearningParamsFantasyBasketballPredictions] = None,
+    params: MachineLearningParamsFantasyBasketballPredictions | None = None,
     clean_dirs: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if clean_dirs:
@@ -561,12 +620,69 @@ if __name__ == '__main__':
         dest="d_model",
         help="Transformer embedding dimension (default: 128)",
     )
+    parser.add_argument(
+        "--num-bench-players",
+        "--num_bench_players",
+        type=int,
+        default=None,
+        dest="num_bench_players",
+        help="Number of bench players per team (default: 6, or 10 with --no-bench-order)",
+    )
+    parser.add_argument(
+        "--tabular-feature-names",
+        "--tabular_feature_names",
+        nargs="+",
+        default=None,
+        dest="tabular_feature_names",
+        help="Explicit list of tabular feature names (overrides default tabular features)",
+    )
+    parser.add_argument(
+        "--extra-tabular-features",
+        "--extra_tabular_features",
+        nargs="+",
+        default=None,
+        dest="extra_tabular_features",
+        help="Additional tabular feature names appended to the base tabular features (e.g. STARTER SITE_POSITION)",
+    )
+    parser.add_argument(
+        "--positional-encoding-feature-names",
+        "--positional_encoding_feature_names",
+        nargs="+",
+        default=None,
+        dest="positional_encoding_feature_names",
+        help="Positional encoding feature names (default: HOME START_POSITION_CALCULATED)",
+    )
+    parser.add_argument(
+        "--embedding-feature-names",
+        "--embedding_feature_names",
+        nargs="+",
+        default=None,
+        dest="embedding_feature_names",
+        help="Categorical embedding feature names (default: PLAYER_ID PLAYER_SEASON SEASON_OPPONENT SEASON_TEAM SEASON_YEAR TEAM_ID)",
+    )
+    parser.add_argument(
+        "--no-bench-order",
+        "--no_bench_order",
+        action="store_false",
+        dest="bench_order_input",
+        default=True,
+        help="Shorthand preset for --num-bench-players 10 --extra-tabular-features STARTER SITE_POSITION --positional-encoding-feature-names HOME COURT_POSITION",
+    )
     args = parser.parse_args()
 
     use_lightning = args.use_lightning
     use_skip = getattr(args, "skip_connection", False)
     d_model = getattr(args, "d_model", 128)
-    params = create_params(use_skip_connection=use_skip, d_model=d_model)
+    params = create_params(
+        use_skip_connection=use_skip,
+        d_model=d_model,
+        num_bench_players=args.num_bench_players,
+        tabular_feature_names=args.tabular_feature_names,
+        extra_tabular_features=args.extra_tabular_features,
+        positional_encoding_feature_names=args.positional_encoding_feature_names,
+        embedding_feature_names=args.embedding_feature_names,
+        bench_order_input=args.bench_order_input,
+    )
     if args.fast_dev_run:
         params.training_params.fast_dev_run = True
     if args.auto_lr_find:

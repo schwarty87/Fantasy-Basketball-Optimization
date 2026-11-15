@@ -13,7 +13,9 @@ from lightning.pytorch.callbacks import (
 )
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from run_all import main, clean_empty_model_dirs, compare_dataclasses, create_params
+from run_all import main, clean_empty_model_dirs, compare_dataclasses, create_params, test_params
+from machine_learning.architecture import ModelArchitecture
+from machine_learning.constants import METADATA
 from machine_learning_fantasy_basketball_predictions.run_model import (
     RunModelFantasyBasketballPredictions,
 )
@@ -415,6 +417,93 @@ class TestRunAll(unittest.TestCase):
 
         runner._save_eval_results_to_feather(pd.DataFrame({"loss": [0.5]}, index=["validation"]))
         self.assertTrue(os.path.isfile(os.path.join(expected_dir, "eval_results.arrow")))
+
+    def test_composable_feature_and_bench_flags_and_bench_permutation_equivariance(self):
+        """Verify composable flags (--num-bench-players, --extra-tabular-features, --positional-encoding-feature-names, --embedding-feature-names) and bench equivariance."""
+        # 1. Default params stay completely unchanged
+        default_params = create_params()
+        self.assertEqual(default_params.features_params.num_bench_players, 6)
+        default_ds = default_params.features_params.feature_name_to_machine_learning_dataset_params
+        self.assertNotIn('STARTER', default_ds['tabular'].feature_names)
+        self.assertNotIn('SITE_POSITION', default_ds['tabular'].feature_names)
+        self.assertEqual(
+            default_ds['positional_encoding_features'].feature_names,
+            ['HOME', 'START_POSITION_CALCULATED'],
+        )
+
+        # 2. Composable flags configure 30-player order-free grid cleanly
+        custom_params = create_params(
+            num_bench_players=10,
+            extra_tabular_features=['STARTER', 'SITE_POSITION'],
+            positional_encoding_feature_names=['HOME', 'SITE_POSITION_ROUNDED'],
+            embedding_feature_names=['PLAYER_ID', 'TEAM_ID'],
+        )
+        self.assertEqual(custom_params.features_params.num_bench_players, 10)
+        ds_map = custom_params.features_params.feature_name_to_machine_learning_dataset_params
+        for ds in ds_map.values():
+            self.assertNotIn('START_POSITION_CALCULATED', ds.feature_names)
+            self.assertNotIn('EXPECTED_ORDER', ds.feature_names)
+        self.assertIn('START_POSITION_CALCULATED', custom_params.features_params.all_feature_names_list)
+        self.assertIn('SITE_POSITION', custom_params.features_params.all_feature_names_list)
+        self.assertIn('STARTER', ds_map['tabular'].feature_names)
+        self.assertIn('SITE_POSITION', ds_map['tabular'].feature_names)
+        # Sorted alphabetically in __post_init__: ['HOME', 'SITE_POSITION_ROUNDED'] -> [1, 5]
+        self.assertEqual(ds_map['positional_encoding_features'].feature_names, ['HOME', 'SITE_POSITION_ROUNDED'])
+        pos_layer = next(
+            lp for lp in custom_params.architecture_params.layer_params_list
+            if getattr(lp, 'input_tensor_name', None) == 'positional_encoding_features'
+        )
+        self.assertEqual(pos_layer.embeddings_dims, [1, 5])
+        test_params(custom_params)
+
+        # 3. Also verify ['COURT_POSITION', 'HOME'] -> [5, 1] and --no-bench-order preset round-trip
+        no_bench_order_params = create_params(bench_order_input=False)
+        test_params(no_bench_order_params)
+        pos_layer_court = next(
+            lp for lp in no_bench_order_params.architecture_params.layer_params_list
+            if getattr(lp, 'input_tensor_name', None) == 'positional_encoding_features'
+        )
+        self.assertEqual(pos_layer_court.embeddings_dims, [5, 1])
+
+        # 4. Bench-slot permutation equivariance (swapping bench slots 5 and 12 produces identical swapped outputs)
+        no_bench_order_params.features_params.feature_type_to_input_shape = {
+            'tabular': (30, len(no_bench_order_params.features_params.feature_name_to_machine_learning_dataset_params['tabular'].feature_names)),
+            'lagged': (30, len(no_bench_order_params.features_params.feature_name_to_machine_learning_dataset_params['lagged'].feature_names)),
+            'embedding_features': (30, len(no_bench_order_params.features_params.feature_name_to_machine_learning_dataset_params['embedding_features'].feature_names)),
+            'positional_encoding_features': (30, 2),
+            'real_player_mask': (30, 1),
+            'keep_mask': (30, 1),
+            METADATA: (30, 6),
+        }
+        for lp in no_bench_order_params.architecture_params.layer_params_list:
+            if getattr(lp, 'input_tensor_name', None) == 'embedding_features':
+                lp.update_after_loading_data({'num_embeddings': [20] * len(lp.embeddings_dims)})
+            elif getattr(lp, 'input_tensor_name', None) == 'positional_encoding_features':
+                lp.update_after_loading_data({'num_embeddings': [6, 3]})
+
+        model = ModelArchitecture(
+            params=no_bench_order_params.architecture_params,
+            feature_type_to_input_shape=no_bench_order_params.features_params.feature_type_to_input_shape,
+        ).eval()
+
+        torch.manual_seed(123)
+        batch = {
+            'tabular': torch.randn(2, 30, 26),
+            'lagged': torch.randn(2, 30, 36),
+            'embedding_features': torch.randint(0, 10, (2, 30, 6)),
+            'positional_encoding_features': torch.randint(0, 2, (2, 30, 2)),
+            'real_player_mask': torch.ones(2, 30, 1),
+            'keep_mask': torch.ones(2, 30, 1),
+            METADATA: torch.ones(2, 30, 6),
+        }
+        perm = list(range(30))
+        perm[5], perm[12] = perm[12], perm[5]
+        batch_perm = {k: v[:, perm, :].clone() for k, v in batch.items()}
+
+        with torch.no_grad():
+            out1 = model(batch)['outputs_pred']
+            out2 = model(batch_perm)['outputs_pred']
+        torch.testing.assert_close(out1[:, perm, :], out2, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == "__main__":

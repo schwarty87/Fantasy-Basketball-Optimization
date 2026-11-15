@@ -124,6 +124,86 @@ class TestPreGridFeaturesAndLags(unittest.TestCase):
         res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df, params)
         self.assertEqual(list(res['PLAYER_ID']), [500, 0])
 
+    def test_debut_lag_fallback_ignores_bench_order_when_spc_excluded_from_inputs(self):
+        """Verify debut lag fallback groups only by STARTER when START_POSITION_CALCULATED is omitted from inputs."""
+        base_df = pd.DataFrame({
+            'DATE': [datetime.date(2023, 1, 1)] * 3,
+            'GAME_ID': [1, 1, 1],
+            'TEAM_ID': [10, 10, 10],
+            'PLAYER_ID': [101, 102, 103],
+            'MIN': [24.0, 6.0, 12.0],
+            'STARTER': [False, False, False],
+            'START_POSITION_CALCULATED': ['BN1', 'BN9', 'BN1'],
+        })
+        df_bn9 = base_df.copy()
+        df_bn9.loc[df_bn9['PLAYER_ID'] == 103, 'START_POSITION_CALCULATED'] = 'BN9'
+
+        params_no_spc = FeaturesParamsFantasyBasketballPredictions(
+            feature_name_to_machine_learning_dataset_params={
+                'lagged': unittest.mock.MagicMock(feature_names=['MIN_t-1']),
+                'positional_encoding_features': unittest.mock.MagicMock(feature_names=['HOME', 'SITE_POSITION_ROUNDED']),
+            }
+        )
+        res1 = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(base_df.copy(), params_no_spc)
+        res2 = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df_bn9.copy(), params_no_spc)
+        self.assertEqual(
+            res1.loc[res1['PLAYER_ID'] == 103, 'MIN_t-1'].iloc[0],
+            res2.loc[res2['PLAYER_ID'] == 103, 'MIN_t-1'].iloc[0],
+        )
+
+        params_with_spc = FeaturesParamsFantasyBasketballPredictions(
+            feature_name_to_machine_learning_dataset_params={
+                'lagged': unittest.mock.MagicMock(feature_names=['MIN_t-1']),
+                'positional_encoding_features': unittest.mock.MagicMock(feature_names=['HOME', 'START_POSITION_CALCULATED']),
+            }
+        )
+        res_with_1 = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(base_df.copy(), params_with_spc)
+        res_with_2 = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df_bn9.copy(), params_with_spc)
+        self.assertNotEqual(
+            res_with_1.loc[res_with_1['PLAYER_ID'] == 103, 'MIN_t-1'].iloc[0],
+            res_with_2.loc[res_with_2['PLAYER_ID'] == 103, 'MIN_t-1'].iloc[0],
+        )
+
+    def test_sort_features_30_player_grid_preserves_away_then_home_order(self):
+        """Verify 30-player grid keeps [HOME=0 PG..BN10, HOME=1 PG..BN10] even when Home TEAM_ID < Away TEAM_ID."""
+        positions = ['PG', 'SG', 'SF', 'PF', 'C'] + [f'BN{i}' for i in range(1, 11)]
+        rows = []
+        # Home team (TEAM_ID=10 < Away TEAM_ID=20)
+        for idx, pos in enumerate(positions[:8]):
+            rows.append({
+                'DATE': datetime.date(2023, 1, 1),
+                'SEASON_YEAR': 2023,
+                'GAME_ID': 100,
+                'HOME': 1.0,
+                'TEAM_ID': 10,
+                'TEAM': 'HOM',
+                'PLAYER_ID': 100 + idx,
+                'START_POSITION_CALCULATED': pos,
+            })
+        for idx, pos in enumerate(positions[:9]):
+            rows.append({
+                'DATE': datetime.date(2023, 1, 1),
+                'SEASON_YEAR': 2023,
+                'GAME_ID': 100,
+                'HOME': 0.0,
+                'TEAM_ID': 20,
+                'TEAM': 'AWY',
+                'PLAYER_ID': 200 + idx,
+                'START_POSITION_CALCULATED': pos,
+            })
+        df = pd.DataFrame(rows)
+        dummy_ds = unittest.mock.MagicMock()
+        dummy_ds.params.sample_per_game = True
+        dummy_ds.params.num_bench_players = 10
+        dummy_ds._get_start_positions_list = lambda: MachineLearningDatasetCombinedFantasyBasketballPredictions._get_start_positions_list(dummy_ds)
+        sorted_df = MachineLearningDatasetCombinedFantasyBasketballPredictions._sort_features(dummy_ds, df)
+
+        self.assertEqual(len(sorted_df), 30)
+        self.assertTrue((sorted_df.iloc[:15]['HOME'] == 0.0).all())
+        self.assertTrue((sorted_df.iloc[15:]['HOME'] == 1.0).all())
+        self.assertEqual(list(sorted_df.iloc[:15]['START_POSITION_CALCULATED']), positions)
+        self.assertEqual(list(sorted_df.iloc[15:]['START_POSITION_CALCULATED']), positions)
+
 
 if __name__ == '__main__':
     unittest.main()
