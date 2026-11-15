@@ -99,3 +99,12 @@ class QuantileRegressionLoss(AbstractMetric):
         return torch.max(self.params.quantile * e, (self.params.quantile - 1) * e)
 
 
+@metrics_registry.register
+class KLDivergenceLoss(AbstractMetric):
+    """Elementwise KL term p * log(p / q) for shares y_true=p and log-shares y_pred=log_q."""
+
+    def _error_unreduced(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        p = y_true.clamp(min=0.0)
+        return torch.xlogy(p, p) - p * y_pred
+
+

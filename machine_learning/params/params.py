@@ -12,7 +12,8 @@ from machine_learning.params.layers_params import TCNParams, TransformerEncoderP
     TemporalFusionTransformerParams, CombineTensorsParams, TransformerEncoderPytorchParams, SplitAttentionCombineParams, \
     TransformerEncoderCustomParams, SplitAttentionCombineWrapperParams
 from machine_learning.params.metrics_params import MAEMetricParams, BinaryCrossEntropyParams, ROCAUCParams, \
-    BinaryClassificationMetricsParams, MSELossParams, QuantileRegressionLossParams, MAPEMetricParams
+    BinaryClassificationMetricsParams, MSELossParams, QuantileRegressionLossParams, MAPEMetricParams, \
+    KLDivergenceLossParams
 from machine_learning.params.machine_learning_dataset_params import MachineLearningDatasetTimeseriesParams, \
     MachineLearningDatasetTabularParams, MachineLearningDatasetTabularScalingParams, \
     MachineLearningDatasetTabularCategoricalEncodingParams, MachineLearningDatasetTimeseriesScalingParams, \

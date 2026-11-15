@@ -67,7 +67,15 @@ class AbstractMetric(torch.nn.Module, ABC):
                                                                          keep_mask=keep_mask_postprocessed,
                                                                          sample_weights=sample_weights_postprocessed)
         self._add_batch_results_to_epoch_results(errors_sums, num_samples)
-        errors_reduced = errors_sums / num_samples if self._is_mean_reduction else errors_sums
+        if self._is_mean_reduction:
+            denom = (
+                num_samples
+                if self.params.accumulate
+                else torch.where(num_samples > 0, num_samples, torch.ones_like(num_samples))
+            )
+            errors_reduced = errors_sums / denom
+        else:
+            errors_reduced = errors_sums
         return errors_reduced
 
     @abstractmethod

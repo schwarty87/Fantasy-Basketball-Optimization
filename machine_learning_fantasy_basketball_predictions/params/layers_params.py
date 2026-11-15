@@ -102,3 +102,9 @@ class OptimizeTeamParams(LayerParams):
         if self.num_teams_in_set == 1:
             self.max_shared_players_in_teams_pairs = None
             self.avoid_single_player_in_all_sets = False
+
+
+@params_registry.register
+@dataclass(kw_only=True)
+class TeamAllocationParams(LayerParams):
+    n_bench_players: int = 6

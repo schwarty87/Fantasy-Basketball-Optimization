@@ -12,9 +12,9 @@ from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 
-from constants import Sites
+from constants import IGNORE_VAL, Sites, START_POSITIONS, UNKNOWN_PLAYER_ID
 from machine_learning.callbacks import CollectTruePredictedOutputs, CollectTruePredictedOutputsParams
-from machine_learning.constants import METADATA
+from machine_learning.constants import IGNORE, METADATA
 from machine_learning.enums import Reduction, ModelMode, DataSplitType
 from machine_learning.layers.layers import (
     EmbeddingsLayer,
@@ -31,7 +31,10 @@ from machine_learning.machine_learning_datasets import (
     dates_to_epoch_days,
 )
 from machine_learning.metrics.abstract_metrics import AbstractMetric
+from machine_learning.metrics.combined_metrics import LossesCombined
+from machine_learning.metrics.metrics import KLDivergenceLoss, MSELoss
 from machine_learning.params.abstract_params import AbstractMetricParams
+from machine_learning.params.metrics_params import KLDivergenceLossParams, MSELossParams
 from machine_learning.params.layers_params import (
     EmbeddingsLayerParams,
     TransformerEncoderPytorchParams,
@@ -52,6 +55,7 @@ from machine_learning_fantasy_basketball_predictions.layers import (
     ReshapeToSamplePerDay,
     OptimizeTeam,
     OptimizeTeamFn,
+    TeamAllocation,
 )
 from machine_learning_fantasy_basketball_predictions.machine_learning_datasets import (
     MachineLearningDatasetCombinedFantasyBasketballPredictions,
@@ -60,12 +64,14 @@ from machine_learning_fantasy_basketball_predictions.params.layers_params import
     CalculateFantasyPointsParams,
     ReshapeToSamplePerDayParams,
     OptimizeTeamParams,
+    TeamAllocationParams,
     update_calculate_fantasy_points_params,
 )
 from machine_learning_fantasy_basketball_predictions.params.metrics_params import OptimizeTeamsLossParams
 from machine_learning_fantasy_basketball_predictions.params.params import (
     FeaturesParamsFantasyBasketballPredictions,
 )
+from run_all import create_params
 from utils import convert_date_col_to_date
 
 
@@ -944,6 +950,346 @@ class TestRegularizationAndWeightDecay(unittest.TestCase):
         legacy_opt = RunModel._define_optimizer(runner)
         self.assertEqual(len(legacy_opt.param_groups), 1)
         self.assertEqual(legacy_opt.param_groups[0]["weight_decay"], 0.0)
+
+
+class TestZeroSampleAndKLLoss(unittest.TestCase):
+    def test_zero_sample_guard_accumulate_false(self):
+        mse_params = MSELossParams(
+            tensor_names_pred="outputs_pred",
+            tensor_names_true="true_label",
+            tensor_names_keep_mask="keep_mask",
+            name_for_logs="mse",
+            reduction=Reduction.MEAN,
+            accumulate=False,
+        )
+        loss_fn = MSELoss(params=mse_params)
+        y_pred = torch.tensor([[[1.0, 2.0]]], requires_grad=True)
+        y_true = torch.tensor([[[0.0, 0.0]]])
+        keep_mask = torch.zeros_like(y_true)
+
+        loss = loss_fn(y_pred=y_pred, y_true=y_true, keep_mask=keep_mask)
+        self.assertTrue(torch.isfinite(loss).all())
+        self.assertEqual(loss.item(), 0.0)
+
+        loss.backward()
+        self.assertIsNotNone(y_pred.grad)
+        self.assertTrue(torch.isfinite(y_pred.grad).all())
+        self.assertTrue(torch.all(y_pred.grad == 0.0))
+
+    def test_zero_sample_guard_accumulate_true_and_reduction_none(self):
+        mse_params = MSELossParams(
+            tensor_names_pred="outputs_pred",
+            tensor_names_true="true_label",
+            tensor_names_keep_mask="keep_mask",
+            name_for_logs="mse",
+            reduction=Reduction.MEAN,
+            reduction_dim=(1,),
+            accumulate=True,
+        )
+        loss_fn = MSELoss(params=mse_params)
+
+        # Batch 1: completely masked out -> forward yields NaN so accumulate ignores empty rows
+        y_pred_empty = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+        y_true_empty = torch.zeros_like(y_pred_empty)
+        keep_mask_empty = torch.zeros_like(y_pred_empty)
+        out_empty = loss_fn(y_pred=y_pred_empty, y_true=y_true_empty, keep_mask=keep_mask_empty)
+        self.assertTrue(torch.isnan(out_empty).all())
+
+        # Batch 2: one valid row -> (2^2 + 4^2) / 2 = 10.0, second row empty -> NaN
+        y_pred_valid = torch.tensor([[[2.0, 4.0], [5.0, 5.0]]])
+        y_true_valid = torch.zeros_like(y_pred_valid)
+        keep_mask_valid = torch.tensor([[[1.0, 1.0], [0.0, 0.0]]])
+        out_valid = loss_fn(y_pred=y_pred_valid, y_true=y_true_valid, keep_mask=keep_mask_valid)
+        self.assertAlmostEqual(out_valid[0].item(), 10.0, places=5)
+        self.assertTrue(torch.isnan(out_valid[1]))
+
+        loss_fn.summarize()
+        self.assertAlmostEqual(float(np.nanmean(loss_fn.epoch_results["mse"].values)), 10.0, places=5)
+
+        mse_none = MSELoss(
+            params=MSELossParams(
+                tensor_names_pred="outputs_pred",
+                tensor_names_true="true_label",
+                tensor_names_keep_mask="keep_mask",
+                name_for_logs="mse_none",
+                reduction=Reduction.NONE,
+                accumulate=False,
+            )
+        )
+        out_none = mse_none(y_pred=y_pred_empty, y_true=y_true_empty, keep_mask=keep_mask_empty)
+        self.assertEqual(out_none.shape, y_pred_empty.shape)
+        self.assertTrue(torch.isnan(out_none).all())
+
+    def test_fractional_sample_weights(self):
+        mse_fn = MSELoss(
+            params=MSELossParams(
+                tensor_names_pred="outputs_pred",
+                tensor_names_true="true_label",
+                tensor_names_keep_mask="keep_mask",
+                tensor_names_sample_weights="sample_weights",
+                name_for_logs="mse",
+                reduction=Reduction.MEAN,
+                accumulate=False,
+            )
+        )
+        y_pred = torch.tensor([[[3.0]]])
+        y_true = torch.tensor([[[1.0]]])
+        keep_mask = torch.ones_like(y_true)
+        sample_weights = torch.tensor([[[0.25]]])
+        loss = mse_fn(y_pred=y_pred, y_true=y_true, keep_mask=keep_mask, sample_weights=sample_weights)
+        # (3 - 1)^2 * 0.25 / 0.25 == 4.0 (verifies > 0 guard does not clamp fractional weight to 1.0)
+        self.assertAlmostEqual(loss.item(), 4.0, places=5)
+
+    def test_kl_divergence_and_losses_combined_logs(self):
+        p = torch.tensor([[[0.5, 0.0], [0.5, 1.0]]])
+        q = torch.tensor([[[0.25, 0.2], [0.75, 0.8]]])
+        log_q = torch.log(q)
+        kl_mask = torch.ones_like(p)
+
+        kl_fn = KLDivergenceLoss(
+            params=KLDivergenceLossParams(
+                tensor_names_pred="stage1_log_share",
+                tensor_names_true="stage1_label",
+                tensor_names_keep_mask="stage1_keep_mask",
+                name_for_logs="stage1_kl",
+                weight=10.0,
+                column_names=["MIN_SHARE", "PLAYS_SHARE"],
+                accumulate=False,
+            )
+        )
+        kl_val = kl_fn(y_pred=log_q, y_true=p, keep_mask=kl_mask)
+        expected_elements = torch.tensor([
+            0.5 * np.log(0.5 / 0.25),
+            0.0,
+            0.5 * np.log(0.5 / 0.75),
+            1.0 * np.log(1.0 / 0.8),
+        ])
+        self.assertAlmostEqual(kl_val.item(), float(expected_elements.mean()), places=5)
+
+        for accumulate in (False, True):
+            red_dim = (1,) if accumulate else None
+            mse_params = MSELossParams(
+                tensor_names_pred="outputs_pred",
+                tensor_names_true="true_label",
+                tensor_names_keep_mask="keep_mask",
+                name_for_logs="mse",
+                weight=1.0,
+                reduction_dim=red_dim,
+                accumulate=accumulate,
+            )
+            kl_params = KLDivergenceLossParams(
+                tensor_names_pred="stage1_log_share",
+                tensor_names_true="stage1_label",
+                tensor_names_keep_mask="stage1_keep_mask",
+                name_for_logs="stage1_kl",
+                weight=10.0,
+                reduction_dim=red_dim,
+                accumulate=accumulate,
+            )
+            combined = LossesCombined((mse_params, kl_params), device=torch.device("cpu"), name="loss")
+            tensors = {
+                "outputs_pred": torch.tensor([[[2.0, 2.0], [1.0, 1.0]]]),
+                "true_label": torch.tensor([[[0.0, 0.0], [1.0, 1.0]]]),
+                "keep_mask": torch.ones((1, 2, 2)),
+                "stage1_log_share": log_q,
+                "stage1_label": p,
+                "stage1_keep_mask": kl_mask,
+            }
+            total = combined.forward(tensors)
+            self.assertTrue(torch.isfinite(total).all())
+            combined.summarize()
+            logs = combined.get_logs()
+            self.assertIn("loss", logs)
+            self.assertIn("mse", logs)
+            self.assertIn("stage1_kl", logs)
+            if not accumulate:
+                self.assertTrue(np.isfinite(logs["loss"]))
+                self.assertAlmostEqual(float(logs["loss"]), float(logs["mse"]) + 10.0 * float(logs["stage1_kl"]), places=5)
+            else:
+                self.assertTrue(np.isfinite(logs["loss"].values).all())
+                self.assertTrue(np.isfinite(logs["mse"].values).all())
+                self.assertTrue(np.isfinite(logs["stage1_kl"].values).all())
+
+
+class TestTeamAllocation(unittest.TestCase):
+    @staticmethod
+    def _make_layer(n_bench_players: int = 6) -> TeamAllocation:
+        total_players = 2 * (5 + n_bench_players)
+        params = TeamAllocationParams(
+            input_tensor_name={"x": "stage1_raw", "mask": "real_player_mask"},
+            output_tensor_name=["stage1_log_share", "stage1_alloc"],
+            n_bench_players=n_bench_players,
+        )
+        return TeamAllocation(params=params, input_shape={"x": (total_players, 2), "mask": (total_players, 1)})
+
+    def _assert_team_invariants(
+        self,
+        away_logits_min: list[float],
+        n_valid_away: int,
+        n_bench_players: int = 6,
+        dtype: torch.dtype = torch.float32,
+        atol: float = 1e-5,
+    ):
+        p = 5 + n_bench_players
+        layer = self._make_layer(n_bench_players=n_bench_players)
+        raw = torch.zeros(1, 2 * p, 2, dtype=dtype)
+        mask = torch.zeros(1, 2 * p, 1, dtype=dtype)
+        raw[0, : len(away_logits_min), 0] = torch.tensor(away_logits_min, dtype=dtype)
+        raw[0, :n_valid_away, 1] = torch.linspace(2.0, -1.0, n_valid_away, dtype=dtype)
+        mask[0, :n_valid_away, 0] = 1.0
+        # Give Home team valid players too
+        mask[0, p : p + 6, 0] = 1.0
+        raw[0, p : p + 6, 0] = torch.tensor([3.0, 2.0, 1.0, 0.0, -1.0, -2.0], dtype=dtype)
+
+        out = layer({"x": raw, "mask": mask})
+        alloc = out["stage1_alloc"]
+        self.assertFalse(alloc.requires_grad)
+
+        away_alloc = alloc[0, :p, :].float()
+        away_valid = away_alloc[:n_valid_away, :]
+        away_dummy = away_alloc[n_valid_away:, :]
+
+        # Masked dummy players must be exact zero
+        self.assertTrue(torch.all(away_dummy == 0.0))
+        # Per-team sums equal 5.0 (for both MIN_ALLOC and PLAYS_ALLOC)
+        self.assertAlmostEqual(away_valid[:, 0].sum().item(), 5.0, delta=atol)
+        self.assertAlmostEqual(away_valid[:, 1].sum().item(), 5.0, delta=atol)
+
+        expected_cap_alloc = 5.0 * max(1.0 / n_valid_away, 0.20)
+        if n_valid_away >= 5:
+            self.assertTrue(torch.all(away_valid[:, 0] <= 1.0 + max(1e-6, atol)))
+        else:
+            self.assertTrue(torch.all(away_valid[:, 0] <= expected_cap_alloc + max(1e-6, atol)))
+
+    def test_kl_gradient_nonzero_when_saturated_and_zero_cross_team(self):
+        layer = self._make_layer(n_bench_players=6)
+        raw = torch.zeros(1, 22, 2, requires_grad=True)
+        with torch.no_grad():
+            # Player 0 has unconstrained MIN softmax share > 0.20
+            raw_init = torch.zeros(1, 22, 2)
+            raw_init[0, 0, 0] = 5.0
+            raw_init[0, 11:16, :] = 1.0
+        raw = raw_init.clone().detach().requires_grad_(True)
+        mask = torch.ones(1, 22, 1)
+
+        out = layer({"x": raw, "mask": mask})
+        log_share = out["stage1_log_share"]
+        alloc = out["stage1_alloc"]
+        self.assertFalse(alloc.requires_grad)
+
+        target = torch.full((1, 22, 2), 1.0 / 11.0)
+        kl = torch.mean(torch.xlogy(target, target) - target * log_share)
+        kl.backward()
+        self.assertIsNotNone(raw.grad)
+        self.assertTrue(torch.isfinite(raw.grad).all())
+        self.assertGreater(abs(raw.grad[0, 0, 0].item()), 1e-4)
+
+        # Cross-team invariance
+        raw_perturbed = raw_init.clone()
+        raw_perturbed[0, :11, :] += 7.5
+        out_base = layer({"x": raw_init, "mask": mask})
+        out_pert = layer({"x": raw_perturbed, "mask": mask})
+        self.assertTrue(torch.equal(out_base["stage1_log_share"][:, 11:, :], out_pert["stage1_log_share"][:, 11:, :]))
+        self.assertTrue(torch.equal(out_base["stage1_alloc"][:, 11:, :], out_pert["stage1_alloc"][:, 11:, :]))
+
+    def test_capped_simplex_projection_edge_cases(self):
+        # Star-heavy logits
+        self._assert_team_invariants([5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0], n_valid_away=8)
+        # 6-man cascade: 4 saturate 0.20 and 5th exceeds 0.20 on first redistribution
+        self._assert_team_invariants([10.0, 10.0, 10.0, 10.0, 3.0, 0.0], n_valid_away=6)
+        # Extreme z_min: [+40*4, -40]
+        self._assert_team_invariants([40.0, 40.0, 40.0, 40.0, -40.0], n_valid_away=5)
+        # 13 valid players: [30*4, 7*9]
+        self._assert_team_invariants([30.0] * 4 + [7.0] * 9, n_valid_away=13, n_bench_players=10)
+        # Fewer than 5 valid players: 3 valid players -> cap == 5/3, sum == 5.0
+        self._assert_team_invariants([5.0, 0.0, -5.0], n_valid_away=3)
+        # float16 logits producing unconstrained [~0.25*4, 3e-7, ~0.0]
+        self._assert_team_invariants(
+            [0.0, 0.0, 0.0, 0.0, -13.6, -20.0],
+            n_valid_away=6,
+            dtype=torch.float16,
+            atol=5e-3,
+        )
+        self._assert_team_invariants(
+            [0.0, 0.0, 0.0, 0.0, -13.6, -100.0],
+            n_valid_away=6,
+            dtype=torch.float16,
+            atol=5e-3,
+        )
+
+
+class TestStage1PostGridTargets(unittest.TestCase):
+    def test_add_additional_columns_computes_team_shares_and_exit_masks(self):
+        params = create_params(two_stage=True).features_params
+        positions = START_POSITIONS + [f"BN{i}" for i in range(1, 7)]
+
+        rows = []
+        # Away team (HOME=0): 6 real players, player 1 left midgame
+        away_mins = [30.0, 10.0, 40.0, 40.0, 40.0, 80.0]
+        away_fga = [10.0, 4.0, 12.0, 8.0, 6.0, 20.0]
+        away_fta = [0.0, 0.0, 5.0, 0.0, 5.0, 0.0]
+        away_tov = [1.0, 1.0, 2.0, 1.0, 1.0, 4.0]
+        for idx in range(len(positions)):
+            is_real = idx < len(away_mins)
+            rows.append({
+                "DATE": datetime.date(2024, 1, 10),
+                "SEASON_YEAR": 2023,
+                "GAME_ID": 1001,
+                "HOME": 0.0,
+                "PLAYER_ID": 100 + idx if is_real else UNKNOWN_PLAYER_ID,
+                "MIN": away_mins[idx] if is_real else 0.0,
+                "FGA": away_fga[idx] if is_real else 0.0,
+                "FTA": away_fta[idx] if is_real else 0.0,
+                "TOV": away_tov[idx] if is_real else 0.0,
+                "EJECTED": False,
+                "LEFT_MIDGAME": is_real and idx == 1,
+            })
+
+        # Home team (HOME=1): 5 real players, no exits/ejections
+        home_mins = [48.0, 48.0, 48.0, 48.0, 48.0]
+        home_fga = [15.0, 10.0, 10.0, 5.0, 10.0]
+        home_fta = [5.0, 0.0, 0.0, 0.0, 0.0]
+        home_tov = [2.8, 1.0, 1.0, 1.0, 2.0]
+        for idx in range(len(positions)):
+            is_real = idx < len(home_mins)
+            rows.append({
+                "DATE": datetime.date(2024, 1, 10),
+                "SEASON_YEAR": 2023,
+                "GAME_ID": 1001,
+                "HOME": 1.0,
+                "PLAYER_ID": 200 + idx if is_real else UNKNOWN_PLAYER_ID,
+                "MIN": home_mins[idx] if is_real else 0.0,
+                "FGA": home_fga[idx] if is_real else 0.0,
+                "FTA": home_fta[idx] if is_real else 0.0,
+                "TOV": home_tov[idx] if is_real else 0.0,
+                "EJECTED": False,
+                "LEFT_MIDGAME": False,
+            })
+
+        df = pd.DataFrame(rows)
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_additional_columns(df, params)
+
+        away = res[res["HOME"] == 0.0]
+        home = res[res["HOME"] == 1.0]
+        away_real = away[away["PLAYER_ID"] != UNKNOWN_PLAYER_ID]
+        away_dummy = away[away["PLAYER_ID"] == UNKNOWN_PLAYER_ID]
+        home_real = home[home["PLAYER_ID"] != UNKNOWN_PLAYER_ID]
+        home_dummy = home[home["PLAYER_ID"] == UNKNOWN_PLAYER_ID]
+
+        # Shares sum to 1.0 per team over real players and 0.0 on dummy rows
+        self.assertAlmostEqual(float(away_real["MIN_SHARE"].sum()), 1.0, places=5)
+        self.assertAlmostEqual(float(away_real["PLAYS_SHARE"].sum()), 1.0, places=5)
+        self.assertAlmostEqual(float(home_real["MIN_SHARE"].sum()), 1.0, places=5)
+        self.assertAlmostEqual(float(home_real["PLAYS_SHARE"].sum()), 1.0, places=5)
+        self.assertTrue((away_dummy["MIN_SHARE"] == 0.0).all())
+        self.assertTrue((away_dummy["PLAYS_SHARE"] == 0.0).all())
+        self.assertTrue((home_dummy["MIN_SHARE"] == 0.0).all())
+        self.assertTrue((home_dummy["PLAYS_SHARE"] == 0.0).all())
+
+        # Any exit/ejection masks the entire team's STAGE1_NOT_IGNORE, without affecting opposing clean team
+        self.assertTrue((away["STAGE1_NOT_IGNORE"] == IGNORE_VAL).all())
+        self.assertTrue((home_real["STAGE1_NOT_IGNORE"] == 1).all())
+        self.assertTrue((home_dummy["STAGE1_NOT_IGNORE"] == IGNORE_VAL).all())
 
 
 if __name__ == "__main__":

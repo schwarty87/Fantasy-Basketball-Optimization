@@ -72,6 +72,10 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
         result = {
             "outputs_pred": all_tensors["outputs_pred"].detach().cpu(),
         }
+        if "stage1_alloc" in all_tensors:
+            result["stage1_alloc"] = all_tensors["stage1_alloc"].detach().cpu()
+        if "stage1_label" in all_tensors:
+            result["stage1_label"] = all_tensors["stage1_label"].detach().cpu()
         if "true_label" in all_tensors:
             result["true_label"] = all_tensors["true_label"].detach().cpu()
         if METADATA in all_tensors:
@@ -80,6 +84,17 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
             result["keep_mask"] = all_tensors["keep_mask"].detach().cpu()
         return result
 
+    @staticmethod
+    def _stack_batch_tensor(predict_batches: List[Dict[str, torch.Tensor]], key: str) -> np.ndarray:
+        chunks = []
+        for batch in predict_batches:
+            if key in batch and batch[key].numel() > 0:
+                arr = batch[key].numpy()
+                if arr.ndim == 3:
+                    arr = arr.reshape(-1, arr.shape[-1])
+                chunks.append(arr)
+        return np.vstack(chunks) if chunks else np.empty((0, 0))
+
     def format_predictions(
         self, predict_batches: List[Dict[str, torch.Tensor]]
     ) -> pd.DataFrame:
@@ -87,39 +102,12 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
         Converts the list of batch outputs from trainer.predict into a fully formatted,
         unscaled DataFrame compatible with downstream pipelines (e.g. run_full_pipeline.py).
         """
-        all_preds = []
-        all_trues = []
-        all_metas = []
-        all_masks = []
-
-        for batch in predict_batches:
-            preds = batch["outputs_pred"].numpy()
-            if preds.ndim == 3:
-                preds = preds.reshape(-1, preds.shape[-1])
-            all_preds.append(preds)
-
-            if "true_label" in batch and batch["true_label"].numel() > 0:
-                trues = batch["true_label"].numpy()
-                if trues.ndim == 3:
-                    trues = trues.reshape(-1, trues.shape[-1])
-                all_trues.append(trues)
-
-            if METADATA in batch and batch[METADATA].numel() > 0:
-                meta = batch[METADATA].numpy()
-                if meta.ndim == 3:
-                    meta = meta.reshape(-1, meta.shape[-1])
-                all_metas.append(meta)
-
-            if "keep_mask" in batch and batch["keep_mask"].numel() > 0:
-                mask = batch["keep_mask"].numpy()
-                if mask.ndim == 3:
-                    mask = mask.reshape(-1, mask.shape[-1])
-                all_masks.append(mask)
-
-        all_preds = np.vstack(all_preds) if all_preds else np.empty((0, 0))
-        all_trues = np.vstack(all_trues) if all_trues else np.empty((0, 0))
-        all_metas = np.vstack(all_metas) if all_metas else np.empty((0, 0))
-        all_masks = np.vstack(all_masks) if all_masks else np.empty((0, 0))
+        all_preds = self._stack_batch_tensor(predict_batches, "outputs_pred")
+        all_trues = self._stack_batch_tensor(predict_batches, "true_label")
+        all_metas = self._stack_batch_tensor(predict_batches, METADATA)
+        all_masks = self._stack_batch_tensor(predict_batches, "keep_mask")
+        all_stage1_preds = self._stack_batch_tensor(predict_batches, "stage1_alloc")
+        all_stage1_trues = self._stack_batch_tensor(predict_batches, "stage1_label")
 
         # Unscale targets if fitted scaler is available
         scaler = self._load_target_scaler()
@@ -151,6 +139,10 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
             dfs.append(pd.DataFrame(all_preds, columns=[f"{c}_pred" for c in target_stats]))
         if all_trues.size > 0:
             dfs.append(pd.DataFrame(all_trues, columns=[f"{c}_true" for c in target_stats]))
+        if all_stage1_preds.size > 0:
+            dfs.append(pd.DataFrame(all_stage1_preds, columns=["MIN_ALLOC_pred", "PLAYS_ALLOC_pred"]))
+        if all_stage1_trues.size > 0:
+            dfs.append(pd.DataFrame(all_stage1_trues, columns=["MIN_SHARE_true", "PLAYS_SHARE_true"]))
         if all_metas.size > 0:
             dfs.append(pd.DataFrame(all_metas, columns=meta_cols))
         if all_masks.size > 0:

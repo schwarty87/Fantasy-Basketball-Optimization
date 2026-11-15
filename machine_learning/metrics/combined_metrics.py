@@ -10,10 +10,11 @@ from machine_learning.enums import Reduction
 from machine_learning.metrics.abstract_metrics import LossFunctionAndWeight, AbstractMetric, get_column_names, \
     fix_y_size
 from machine_learning.metrics.metrics import MAEMetric, MAPEMetric, BinaryCrossEntropyLoss, ROCAUC, \
-    BinaryClassificationMetrics, MSELoss, QuantileRegressionLoss
+    BinaryClassificationMetrics, MSELoss, QuantileRegressionLoss, KLDivergenceLoss
 from machine_learning.params.abstract_params import AbstractMetricParams, AbstractParams
 from machine_learning.params.metrics_params import MAEMetricParams, MAPEMetricParams, BinaryCrossEntropyParams, \
-    ROCAUCParams, BinaryClassificationMetricsParams, MSELossParams, QuantileRegressionLossParams
+    ROCAUCParams, BinaryClassificationMetricsParams, MSELossParams, QuantileRegressionLossParams, \
+    KLDivergenceLossParams
 from machine_learning.utils import variable_is_number
 from machine_learning.registries import metrics_registry
 

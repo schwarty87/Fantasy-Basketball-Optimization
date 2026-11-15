@@ -174,6 +174,23 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         if 'IS_REAL_PLAYER' in missing_columns or 'IS_REAL_PLAYER' not in features_df.columns:
             features_df['IS_REAL_PLAYER'] = np.where(is_real_player, 1, IGNORE_VAL)
 
+        if {'MIN_SHARE', 'PLAYS_SHARE', 'STAGE1_NOT_IGNORE'} & set(missing_columns):
+            real_min = np.where(is_real_player, np.maximum(features_df['MIN'].fillna(0.0).astype(np.float64), 0.0), 0.0)
+            plays_raw = (
+                features_df['FGA'].fillna(0.0)
+                + 0.44 * features_df['FTA'].fillna(0.0)
+                + features_df['TOV'].fillna(0.0)
+            ).astype(np.float64)
+            real_plays = np.where(is_real_player, np.maximum(plays_raw, 0.0), 0.0)
+            keys = [features_df['GAME_ID'], features_df['HOME']]
+            team_min = pd.Series(real_min, index=features_df.index).groupby(keys).transform('sum').values
+            team_plays = pd.Series(real_plays, index=features_df.index).groupby(keys).transform('sum').values
+            features_df['MIN_SHARE'] = np.where(team_min > 0, real_min / np.maximum(team_min, 1e-8), 0.0).astype(np.float32)
+            features_df['PLAYS_SHARE'] = np.where(team_plays > 0, real_plays / np.maximum(team_plays, 1e-8), 0.0).astype(np.float32)
+            team_had_exit = pd.Series(is_real_player & (~not_ignore), index=features_df.index).groupby(keys).transform('any').values
+            stage1_valid = is_real_player & (~team_had_exit) & (team_min > 0) & (team_plays > 0)
+            features_df['STAGE1_NOT_IGNORE'] = np.where(stage1_valid, 1, IGNORE_VAL)
+
         return features_df
 
     @classmethod

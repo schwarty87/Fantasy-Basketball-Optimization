@@ -6,13 +6,14 @@ import logging
 import torch
 import numpy as np
 from dataclasses import dataclass, is_dataclass, fields
-from typing import Dict, Tuple, List, Sequence
+from typing import Dict, Tuple, List, Sequence, Literal
 import pandas as pd
 from enums import Sites
 from utils import define_logger, update_dir_name
 from machine_learning.enums import SampleWeightType, ImputationType, ActivationFunction, FeatureType
 from machine_learning.constants import METADATA
 from machine_learning.utils import models_dir, get_next_model_id
+from machine_learning.params.abstract_params import AbstractLossParams
 from machine_learning.params.callbacks_params import ModelCheckpointParams, ReduceLearningRateOnPlateauParams, \
     LogModelResultsParams, EarlyStoppingParams
 from machine_learning.params.machine_learning_dataset_params import MachineLearningDatasetTabularScalingParams, \
@@ -22,14 +23,14 @@ from machine_learning.params.machine_learning_dataset_params import MachineLearn
 from machine_learning.params.layers_params import DenseLayersParams, EmbeddingsLayerParams, CombineTensorsParams, \
     TransformerEncoderPytorchParams, TSMixerParams, SplitAttentionCombineParams, SplitAttentionCombineWrapperParams
 from machine_learning.params.metrics_params import BinaryCrossEntropyParams, MSELossParams, MAEMetricParams, \
-    QuantileRegressionLossParams, MAPEMetricParams
+    QuantileRegressionLossParams, MAPEMetricParams, KLDivergenceLossParams
 from machine_learning_fantasy_basketball_predictions.params.params import FeaturesParamsFantasyBasketballPredictions,\
     MachineLearningParamsFantasyBasketballPredictions, TrainingParamsFantasyBasketballPredictions, \
     ArchitectureParamsFantasyBasketballPredictions
 from machine_learning_fantasy_basketball_predictions.constants import PROJECT_NAME
 from machine_learning_fantasy_basketball_predictions.run_model import RunModelFantasyBasketballPredictions
 from machine_learning_fantasy_basketball_predictions.params.layers_params import \
-    CalculateFantasyPointsParams, ReshapeToSamplePerDayParams, OptimizeTeamParams
+    CalculateFantasyPointsParams, ReshapeToSamplePerDayParams, OptimizeTeamParams, TeamAllocationParams
 from machine_learning_fantasy_basketball_predictions.params.machine_learning_dataset_params import \
     MachineLearningDatasetSampleWeightsTabularFantasyBasketballPredictionsParams, \
     MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams
@@ -96,6 +97,7 @@ def create_features_params(
     positional_encoding_feature_names: Sequence[str] | None = None,
     embedding_feature_names: Sequence[str] | None = None,
     bench_order_input: bool = True,
+    two_stage: bool = False,
 ) -> FeaturesParamsFantasyBasketballPredictions:
     features_path = os.path.join(update_dir_name('features'), 'features.feather')
     features_dtype = np.dtype('float32')
@@ -179,6 +181,17 @@ def create_features_params(
         ),
     }
 
+    if two_stage:
+        feature_name_to_machine_learning_dataset_params['stage1_label'] = MachineLearningDatasetTabularParams(
+            feature_names=['MIN_SHARE', 'PLAYS_SHARE'],
+            relevant_keep_mask_dataset_name=None,
+            dtype=features_dtype,
+        )
+        feature_name_to_machine_learning_dataset_params['stage1_keep_mask'] = MachineLearningDatasetKeepMaskTabularParams(
+            feature_names=['STAGE1_NOT_IGNORE'],
+            dtype=features_dtype,
+        )
+
     return FeaturesParamsFantasyBasketballPredictions(
         features_path=features_path,
         feature_name_to_machine_learning_dataset_params=feature_name_to_machine_learning_dataset_params,
@@ -195,7 +208,11 @@ def create_architecture_params(
     use_skip_connection: bool = False,
     d_model: int = 128,
     n_heads: int = 8,
+    two_stage: bool = False,
+    stage1_layout: Literal['split1_global1_global1', 'split2_global1'] = 'split1_global1_global1',
 ) -> ArchitectureParamsFantasyBasketballPredictions:
+    if stage1_layout not in ('split1_global1_global1', 'split2_global1'):
+        raise ValueError(f"Unsupported stage1_layout: {stage1_layout}")
     output_feature_names = features_params.feature_name_to_machine_learning_dataset_params['true_label'].feature_names
     num_outputs = len(output_feature_names)
 
@@ -265,6 +282,7 @@ def create_architecture_params(
     )
 
     # 5. Team-level contextual attention (within vs between teams)
+    stage1_split_layers = 2 if (two_stage and stage1_layout == 'split2_global1') else 1
     transformer_encoder_params_1 = SplitAttentionCombineWrapperParams(
         input_tensor_name={'x': inputs_encoder_params.output_tensor_name,
                            'mask': 'real_player_mask'},
@@ -275,13 +293,68 @@ def create_architecture_params(
         dropout_rate=0.25,
         norm_at_beginning=True,
         n_bench_players=features_params.num_bench_players,
-        num_layers=1,
+        num_layers=stage1_split_layers,
         activation=ActivationFunction.GELU,
     )
 
-    # 6. Global multi-head self-attention across all 22 active players
+    # 5b. Optional Stage-1 conserved (MIN_SHARE, PLAYS_SHARE) allocation head
+    if two_stage:
+        if stage1_layout == 'split1_global1_global1':
+            stage1_global = TransformerEncoderPytorchParams(
+                input_tensor_name={'x': transformer_encoder_params_1.output_tensor_name,
+                                   'mask': 'real_player_mask'},
+                output_tensor_name='stage1_transformer_output',
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=d_model * 4,
+                dropout=0.25,
+                norm_first=True,
+                num_layers=1,
+                activation=ActivationFunction.GELU,
+            )
+            stage1_trunk_out = stage1_global.output_tensor_name
+        else:
+            stage1_global = None
+            stage1_trunk_out = transformer_encoder_params_1.output_tensor_name
+
+        stage1_head = DenseLayersParams(
+            input_tensor_name=stage1_trunk_out,
+            output_tensor_name='stage1_logits',
+            num_nodes_per_layer=[64, 2],
+            use_batchnorm=True,
+            activation=ActivationFunction.GELU,
+            dropout_rate=0.15,
+        )
+        team_allocation = TeamAllocationParams(
+            input_tensor_name={'x': stage1_head.output_tensor_name, 'mask': 'real_player_mask'},
+            output_tensor_name=['stage1_log_share', 'stage1_alloc'],
+            n_bench_players=features_params.num_bench_players,
+        )
+        stage2_concat = CombineTensorsParams(
+            input_tensor_name=[stage1_trunk_out, 'stage1_alloc'],
+            output_tensor_name='stage2_concat',
+            combine_func_str='concat',
+            dim=-1,
+        )
+        stage2_proj = DenseLayersParams(
+            input_tensor_name=stage2_concat.output_tensor_name,
+            output_tensor_name='stage2_inputs',
+            num_nodes_per_layer=[d_model],
+        )
+        stage1_extra_layers = (
+            ([stage1_global] if stage1_global is not None else [])
+            + [stage1_head, team_allocation, stage2_concat, stage2_proj]
+        )
+        stage2_in_name = stage2_proj.output_tensor_name
+        stage2_num_layers = 1
+    else:
+        stage1_extra_layers = []
+        stage2_in_name = transformer_encoder_params_1.output_tensor_name
+        stage2_num_layers = 2
+
+    # 6. Global multi-head self-attention across active players
     transformer_encoder_params = TransformerEncoderPytorchParams(
-        input_tensor_name={'x': transformer_encoder_params_1.output_tensor_name,
+        input_tensor_name={'x': stage2_in_name,
                            'mask': 'real_player_mask'},
         output_tensor_name='transformer_output',
         d_model=d_model,
@@ -289,15 +362,20 @@ def create_architecture_params(
         dim_feedforward=d_model * 4,
         dropout=0.25,
         norm_first=True,
-        num_layers=2,
+        num_layers=stage2_num_layers,
         activation=ActivationFunction.GELU,
     )
 
-    # 7. Optional residual / skip connection
+    # 7. Optional residual / skip / Stage-1 allocation concat before output head
+    head_concat_inputs = [transformer_encoder_params.output_tensor_name]
     if use_skip_connection:
+        head_concat_inputs.append(inputs_encoder_params.output_tensor_name)
+    if two_stage:
+        head_concat_inputs.append('stage1_alloc')
+
+    if len(head_concat_inputs) > 1:
         post_transformer_features = CombineTensorsParams(
-            input_tensor_name=[transformer_encoder_params.output_tensor_name,
-                               inputs_encoder_params.output_tensor_name],
+            input_tensor_name=head_concat_inputs,
             output_tensor_name='post_transformer_combined',
             combine_func_str='concat',
             dim=-1,
@@ -376,7 +454,7 @@ def create_architecture_params(
     layer_params_list = [
         embeddings, tabular_features, combined_tabular_embeddings,
         positional_encodings, with_positional_encoding, inputs_encoder_params,
-        transformer_encoder_params_1, transformer_encoder_params,
+        transformer_encoder_params_1, *stage1_extra_layers, transformer_encoder_params,
     ]
     if post_transformer_features is not None:
         layer_params_list.append(post_transformer_features)
@@ -387,15 +465,19 @@ def create_architecture_params(
         optimize_teams_params,
     ]
 
+    output_tensor_names = ['outputs_pred'] + (['stage1_log_share', 'stage1_alloc'] if two_stage else [])
+
     return ArchitectureParamsFantasyBasketballPredictions(
         layer_params_list=layer_params_list,
-        output_tensor_names=['outputs_pred'],
+        output_tensor_names=output_tensor_names,
     )
 
 
 def create_training_params(
     features_params: FeaturesParamsFantasyBasketballPredictions,
     num_days_per_batch: int,
+    two_stage: bool = False,
+    stage1_loss_weight: float = 10.0,
 ) -> TrainingParamsFantasyBasketballPredictions:
     model_id = get_next_model_id(PROJECT_NAME)
     true_label_dataset = features_params.feature_name_to_machine_learning_dataset_params['true_label']
@@ -410,6 +492,19 @@ def create_training_params(
         tensor_names_true='true_label',
         tensor_names_keep_mask='keep_mask',
     )
+    all_loss_params: List[AbstractLossParams] = [loss_params]
+    if two_stage:
+        all_loss_params.append(
+            KLDivergenceLossParams(
+                name_for_logs='stage1_kl',
+                column_names=['MIN_SHARE', 'PLAYS_SHARE'],
+                tensor_names_pred='stage1_log_share',
+                tensor_names_true='stage1_label',
+                tensor_names_keep_mask='stage1_keep_mask',
+                tensor_names_sample_weights=None,
+                weight=stage1_loss_weight,
+            )
+        )
 
     optimize_teams_loss_params = OptimizeTeamsLossParams(
         tensor_names_true='fantasy_points_true_sample_per_day',
@@ -418,18 +513,24 @@ def create_training_params(
         name_for_logs='optimize_teams_loss',
     )
 
+    tracked_metric = 'eval_mse' if len(all_loss_params) > 1 else 'eval_loss'
+    collect_column_names = {
+        'true_label': [f'{c}_true' for c in true_label_names],
+        'outputs_pred': [f'{c}_pred' for c in true_label_names],
+        METADATA: features_params.feature_name_to_machine_learning_dataset_params[METADATA].feature_names,
+        'keep_mask': ['NOT_IGNORE'],
+    }
+    if two_stage:
+        collect_column_names['stage1_alloc'] = ['MIN_ALLOC_pred', 'PLAYS_ALLOC_pred']
+        collect_column_names['stage1_label'] = ['MIN_SHARE_true', 'PLAYS_SHARE_true']
+
     callbacks_params = (
-        ModelCheckpointParams(),
-        EarlyStoppingParams(),
-        ReduceLearningRateOnPlateauParams(patience=5),
+        ModelCheckpointParams(value_to_track=tracked_metric),
+        EarlyStoppingParams(value_to_track=tracked_metric),
+        ReduceLearningRateOnPlateauParams(patience=5, value_to_track=tracked_metric),
         LogModelResultsParams(),
         CollectTruePredictedOutputsParamsFantasyBasketballPredictions(
-            column_names={
-                'true_label': [f'{c}_true' for c in true_label_names],
-                'outputs_pred': [f'{c}_pred' for c in true_label_names],
-                METADATA: features_params.feature_name_to_machine_learning_dataset_params[METADATA].feature_names,
-                'keep_mask': ['NOT_IGNORE'],
-            },
+            column_names=collect_column_names,
             scaler_dir=os.path.join(models_dir(PROJECT_NAME), str(model_id), 'scalers') if true_label_is_scaled else None,
         ),
     )
@@ -454,7 +555,7 @@ def create_training_params(
         training_dtype=torch.float32,
         dataloader_num_workers=0,
         gradient_clip_val=1.0,
-        loss_params=(loss_params,),
+        loss_params=tuple(all_loss_params),
         callbacks_params=callbacks_params,
         metrics_params=metrics_params,
     )
@@ -469,6 +570,9 @@ def create_params(
     positional_encoding_feature_names: Sequence[str] | None = None,
     embedding_feature_names: Sequence[str] | None = None,
     bench_order_input: bool = True,
+    two_stage: bool = False,
+    stage1_layout: Literal['split1_global1_global1', 'split2_global1'] = 'split1_global1_global1',
+    stage1_loss_weight: float = 10.0,
 ) -> MachineLearningParamsFantasyBasketballPredictions:
     num_days_per_batch = 4
     features_params = create_features_params(
@@ -478,14 +582,22 @@ def create_params(
         positional_encoding_feature_names=positional_encoding_feature_names,
         embedding_feature_names=embedding_feature_names,
         bench_order_input=bench_order_input,
+        two_stage=two_stage,
     )
     architecture_params = create_architecture_params(
         features_params,
         num_days_per_batch=num_days_per_batch,
         use_skip_connection=use_skip_connection,
         d_model=d_model,
+        two_stage=two_stage,
+        stage1_layout=stage1_layout,
     )
-    training_params = create_training_params(features_params, num_days_per_batch=num_days_per_batch)
+    training_params = create_training_params(
+        features_params,
+        num_days_per_batch=num_days_per_batch,
+        two_stage=two_stage,
+        stage1_loss_weight=stage1_loss_weight,
+    )
     return MachineLearningParamsFantasyBasketballPredictions(
         features_params=features_params,
         architecture_params=architecture_params,
@@ -668,6 +780,29 @@ if __name__ == '__main__':
         default=True,
         help="Shorthand preset for --num-bench-players 10 --extra-tabular-features STARTER SITE_POSITION --positional-encoding-feature-names HOME COURT_POSITION",
     )
+    parser.add_argument(
+        "--two-stage",
+        "--two_stage",
+        action="store_true",
+        dest="two_stage",
+        help="Enable conserved two-stage (MIN_SHARE, PLAYS_SHARE) allocation head",
+    )
+    parser.add_argument(
+        "--stage1-layout",
+        "--stage1_layout",
+        choices=["split1_global1_global1", "split2_global1"],
+        default="split1_global1_global1",
+        dest="stage1_layout",
+        help="Transformer layout between Stage 1 and Stage 2 when --two-stage is enabled",
+    )
+    parser.add_argument(
+        "--stage1-loss-weight",
+        "--stage1_loss_weight",
+        type=float,
+        default=10.0,
+        dest="stage1_loss_weight",
+        help="Weight for Stage-1 KL divergence loss when --two-stage is enabled (default: 10.0)",
+    )
     args = parser.parse_args()
 
     use_lightning = args.use_lightning
@@ -682,6 +817,9 @@ if __name__ == '__main__':
         positional_encoding_feature_names=args.positional_encoding_feature_names,
         embedding_feature_names=args.embedding_feature_names,
         bench_order_input=args.bench_order_input,
+        two_stage=args.two_stage,
+        stage1_layout=args.stage1_layout,
+        stage1_loss_weight=args.stage1_loss_weight,
     )
     if args.fast_dev_run:
         params.training_params.fast_dev_run = True

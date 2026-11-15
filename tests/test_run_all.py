@@ -16,6 +16,16 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from run_all import main, clean_empty_model_dirs, compare_dataclasses, create_params, test_params
 from machine_learning.architecture import ModelArchitecture
 from machine_learning.constants import METADATA
+from machine_learning.metrics.combined_metrics import LossesCombined
+from machine_learning.params.callbacks_params import (
+    ModelCheckpointParams,
+    EarlyStoppingParams,
+    ReduceLearningRateOnPlateauParams,
+)
+from machine_learning.params.layers_params import (
+    SplitAttentionCombineWrapperParams,
+    TransformerEncoderPytorchParams,
+)
 from machine_learning_fantasy_basketball_predictions.run_model import (
     RunModelFantasyBasketballPredictions,
 )
@@ -504,6 +514,84 @@ class TestRunAll(unittest.TestCase):
             out1 = model(batch)['outputs_pred']
             out2 = model(batch_perm)['outputs_pred']
         torch.testing.assert_close(out1[:, perm, :], out2, atol=1e-5, rtol=1e-5)
+
+    def test_two_stage_params_and_forward_backward(self):
+        """Verify two-stage config layouts, metric tracking, param parity, and forward/backward pass."""
+        baseline = create_params(two_stage=False)
+        for cb in baseline.training_params.callbacks_params:
+            if isinstance(cb, (ModelCheckpointParams, EarlyStoppingParams, ReduceLearningRateOnPlateauParams)):
+                self.assertEqual(cb.value_to_track, 'eval_loss')
+
+        self.assertEqual(
+            sum(lp.num_layers for lp in baseline.architecture_params.layer_params_list if isinstance(lp, SplitAttentionCombineWrapperParams)),
+            1,
+        )
+        self.assertEqual(
+            sum(lp.num_layers for lp in baseline.architecture_params.layer_params_list if isinstance(lp, TransformerEncoderPytorchParams)),
+            2,
+        )
+
+        with self.assertRaises(ValueError):
+            create_params(two_stage=True, stage1_layout='invalid_layout')
+
+        for layout, kl_weight in [('split1_global1_global1', 10.0), ('split2_global1', 5.0)]:
+            params = create_params(two_stage=True, stage1_layout=layout, stage1_loss_weight=kl_weight)
+            test_params(params)
+
+            for cb in params.training_params.callbacks_params:
+                if isinstance(cb, (ModelCheckpointParams, EarlyStoppingParams, ReduceLearningRateOnPlateauParams)):
+                    self.assertEqual(cb.value_to_track, 'eval_mse')
+
+            expected_split = 1 if layout == 'split1_global1_global1' else 2
+            expected_global = 2 if layout == 'split1_global1_global1' else 1
+            self.assertEqual(
+                sum(lp.num_layers for lp in params.architecture_params.layer_params_list if isinstance(lp, SplitAttentionCombineWrapperParams)),
+                expected_split,
+            )
+            self.assertEqual(
+                sum(lp.num_layers for lp in params.architecture_params.layer_params_list if isinstance(lp, TransformerEncoderPytorchParams)),
+                expected_global,
+            )
+
+            for lp in params.architecture_params.layer_params_list:
+                if hasattr(lp, 'embeddings_dims') and hasattr(lp, 'num_embeddings'):
+                    lp.update_after_loading_data({'num_embeddings': [50] * len(lp.embeddings_dims)})
+
+            model = ModelArchitecture(
+                params=params.architecture_params,
+                feature_type_to_input_shape=params.features_params.feature_type_to_input_shape,
+            ).train()
+            losses = LossesCombined(params.training_params.loss_params, device=torch.device('cpu'), name='loss')
+
+            torch.manual_seed(42)
+            batch = {}
+            for name, shape in params.features_params.feature_type_to_input_shape.items():
+                if name in ('embedding_features', 'positional_encoding_features'):
+                    batch[name] = torch.randint(0, 5, (2, *shape))
+                elif name in ('real_player_mask', 'keep_mask', 'stage1_keep_mask') or 'weight' in name:
+                    batch[name] = torch.ones((2, *shape), dtype=torch.float32)
+                elif name == 'stage1_label':
+                    batch[name] = torch.full((2, *shape), 1.0 / 11.0, dtype=torch.float32)
+                else:
+                    batch[name] = torch.randn((2, *shape), dtype=torch.float32)
+
+            outputs = model(batch)
+            self.assertIn('outputs_pred', outputs)
+            self.assertIn('stage1_log_share', outputs)
+            self.assertIn('stage1_alloc', outputs)
+            self.assertEqual(outputs['stage1_log_share'].shape, (2, 22, 2))
+            self.assertEqual(outputs['stage1_alloc'].shape, (2, 22, 2))
+
+            all_tensors = {**batch, **outputs}
+            total_loss = losses.forward(all_tensors)
+            self.assertTrue(torch.isfinite(total_loss).all())
+            total_loss.backward()
+
+            grad_norms = [p.grad.abs().sum().item() for p in model.parameters() if p.requires_grad and p.grad is not None]
+            self.assertGreater(len(grad_norms), 0)
+            for p in model.parameters():
+                if p.grad is not None:
+                    self.assertTrue(torch.isfinite(p.grad).all())
 
 
 if __name__ == "__main__":

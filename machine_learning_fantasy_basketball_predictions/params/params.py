@@ -29,6 +29,8 @@ class FeaturesParamsFantasyBasketballPredictions(FeaturesParams):
             extra_cols.append('START_POSITION_CALCULATED')
         if 'COURT_POSITION' in self.all_feature_names_list or 'SITE_POSITION_ROUNDED' in self.all_feature_names_list:
             extra_cols.append('SITE_POSITION')
+        if {'MIN_SHARE', 'PLAYS_SHARE', 'STAGE1_NOT_IGNORE'} & set(self.all_feature_names_list):
+            extra_cols.extend(['MIN', 'FGA', 'FTA', 'TOV'])
         for c in list(self.all_feature_names_list):
             if c.endswith('_mean_ratio'):
                 base_name = c.replace('_mean_ratio', '')

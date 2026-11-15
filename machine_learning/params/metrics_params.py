@@ -54,3 +54,9 @@ class MSELossParams(AbstractLossParams):
 @dataclass
 class QuantileRegressionLossParams(AbstractLossParams):
     quantile: float = 0.5
+
+
+@params_registry.register
+@dataclass
+class KLDivergenceLossParams(AbstractLossParams):
+    pass

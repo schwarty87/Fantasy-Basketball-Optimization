@@ -3,14 +3,18 @@ from joblib import Parallel, delayed
 import numpy as np
 import torch
 import torch.nn.functional as F
-from constants import SCORING, Sites, NUM_TO_POSITION
-from typing import Tuple, Dict, Any, Callable
+from constants import SCORING, Sites, NUM_TO_POSITION, START_POSITIONS
+from typing import Tuple, Dict, Any, Callable, List
 from find_best_team_linear_programming import (FindBestSetOfTeamsLinearProgrammingYahoo,
                                                FindBestSetOfTeamsLinearProgrammingYahooScipy)
 from machine_learning.registries import layers_registry
 from machine_learning.layers.abstract_layer import AbstractLayer, LayersInputOutputShape
-from machine_learning_fantasy_basketball_predictions.params.layers_params import (CalculateFantasyPointsParams,
-  OptimizeTeamParams, ReshapeToSamplePerDayParams)
+from machine_learning_fantasy_basketball_predictions.params.layers_params import (
+    CalculateFantasyPointsParams,
+    OptimizeTeamParams,
+    ReshapeToSamplePerDayParams,
+    TeamAllocationParams,
+)
 
 
 @layers_registry.register
@@ -299,3 +303,49 @@ class OptimizeTeam(AbstractLayer):
 
     def output_shape(self) -> LayersInputOutputShape:
         return self.input_shape[0]
+
+
+@layers_registry.register
+class TeamAllocation(AbstractLayer):
+    """Per-team masked softmax over [z_min, z_min + z_rate]; smooth KL log-shares and <=48m detached allocation."""
+
+    def __init__(self, params: TeamAllocationParams, input_shape: LayersInputOutputShape):
+        super().__init__(params=params, input_shape=input_shape)
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        logits, real = x['x'], x['mask'] > 0
+        b, p = logits.shape[0], len(START_POSITIONS) + self.params.n_bench_players
+        z_min, z_rate = logits.unbind(-1)
+        paired = torch.stack([z_min, z_min + z_rate], dim=-1).reshape(b, 2, p, 2)
+        real4 = real.reshape(b, 2, p, 1)
+        paired = paired.masked_fill(~real4, torch.finfo(paired.dtype).min)
+        log_share4 = F.log_softmax(paired, dim=2).masked_fill(~real4, 0.0)
+
+        # Water-fill detached min_share in fp32 onto {0 <= s <= max(1/n_valid, 0.20), sum s = 1}
+        share4 = log_share4.detach().float().exp().masked_fill(~real4, 0.0)
+        s_min = share4[..., 0:1]
+        n_valid = real4.float().sum(dim=2, keepdim=True).clamp(min=1.0)
+        cap = (1.0 / n_valid).clamp(min=0.20)
+        capped = torch.zeros_like(real4)
+        for _ in range(5):
+            capped = capped | (real4 & (s_min >= cap))
+            free = real4 & (~capped)
+            rem = (1.0 - capped.float().sum(dim=2, keepdim=True) * cap).clamp(min=0.0)
+            free_sum = (s_min * free.float()).sum(dim=2, keepdim=True)
+            n_free = free.float().sum(dim=2, keepdim=True).clamp(min=1.0)
+            scaled = torch.where(
+                free_sum > 1e-12,
+                (s_min / free_sum.clamp(min=1e-12)) * rem,
+                rem / n_free,
+            )
+            s_min = torch.where(capped, cap, torch.where(free, scaled, torch.zeros_like(s_min)))
+
+        alloc4 = float(len(START_POSITIONS)) * torch.cat([s_min, share4[..., 1:2]], dim=-1)
+        log_share_name, alloc_name = self.params.output_tensor_name
+        return {
+            log_share_name: log_share4.reshape(b, 2 * p, 2),
+            alloc_name: alloc4.reshape(b, 2 * p, 2).to(dtype=logits.dtype).detach(),
+        }
+
+    def output_shape(self) -> List[Tuple[int, ...]]:
+        return [self.input_shape['x'], self.input_shape['x']]

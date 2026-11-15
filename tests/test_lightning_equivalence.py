@@ -14,6 +14,7 @@ from lightning.pytorch.callbacks import (
     LearningRateMonitor,
 )
 
+from machine_learning.constants import METADATA
 from machine_learning.enums import DataSplitType, ModelMode
 from machine_learning.params.callbacks_params import (
     ModelCheckpointParams,
@@ -21,6 +22,12 @@ from machine_learning.params.callbacks_params import (
     ReduceLearningRateOnPlateauParams,
 )
 from machine_learning.run_model import RunModel
+from machine_learning_fantasy_basketball_predictions.callbacks import (
+    CollectTruePredictedOutputsFantasyBasketballPredictions,
+)
+from machine_learning_fantasy_basketball_predictions.params.callbacks_params import (
+    CollectTruePredictedOutputsParamsFantasyBasketballPredictions,
+)
 from machine_learning_fantasy_basketball_predictions.run_model import (
     RunModelFantasyBasketballPredictions,
 )
@@ -420,6 +427,72 @@ class TestLightningEquivalence(unittest.TestCase):
         module.loss_function.get_logs = MagicMock(return_value={"loss": 2.0, "mse": 1.2})
         module.on_train_epoch_end()
         module.loss_function.reset.assert_called_once()
+
+    def test_stage1_prediction_export_parity(self):
+        """Verify Lightning format_predictions and CollectTruePredictedOutputs export identical unscaled Stage-1 columns."""
+        params = create_params(two_stage=True)
+        for p in params.architecture_params.layer_params_list:
+            if hasattr(p, "embeddings_dims") and hasattr(p, "num_embeddings"):
+                p.num_embeddings = [50] * len(p.embeddings_dims)
+
+        module = FantasyBasketballLightningModule(params=params, scaler_dir=None)
+        collect_params = copy.deepcopy(
+            [
+                cb
+                for cb in params.training_params.callbacks_params
+                if isinstance(cb, CollectTruePredictedOutputsParamsFantasyBasketballPredictions)
+            ][0]
+        )
+        collect_params.scaler_dir = None
+        callback = CollectTruePredictedOutputsFantasyBasketballPredictions(params=collect_params, model_dir=None)
+
+        shape_map = params.features_params.feature_type_to_input_shape
+        num_players = shape_map["true_label"][0]
+        num_targets = shape_map["true_label"][1]
+        meta_cols = params.features_params.feature_name_to_machine_learning_dataset_params[METADATA].feature_names
+
+        torch.manual_seed(7)
+        meta_tensor = torch.zeros((1, num_players, len(meta_cols)), dtype=torch.float32)
+        if "DATE" in meta_cols:
+            meta_tensor[0, :, meta_cols.index("DATE")] = 20000.0
+        if "PLAYER_ID" in meta_cols:
+            meta_tensor[0, :, meta_cols.index("PLAYER_ID")] = torch.arange(1, num_players + 1, dtype=torch.float32)
+        if "GAME_ID" in meta_cols:
+            meta_tensor[0, :, meta_cols.index("GAME_ID")] = 500.0
+        if "split_type" in meta_cols:
+            meta_tensor[0, :, meta_cols.index("split_type")] = float(DataSplitType.TEST.value)
+
+        stage1_alloc = torch.rand((1, num_players, 2), dtype=torch.float32)
+        stage1_label = torch.rand((1, num_players, 2), dtype=torch.float32)
+        batch_out = {
+            "outputs_pred": torch.randn((1, num_players, num_targets), dtype=torch.float32),
+            "true_label": torch.randn((1, num_players, num_targets), dtype=torch.float32),
+            "stage1_alloc": stage1_alloc,
+            "stage1_label": stage1_label,
+            METADATA: meta_tensor,
+            "keep_mask": torch.ones((1, num_players, 1), dtype=torch.float32),
+        }
+
+        lightning_df = module.format_predictions([batch_out]).reset_index(drop=True)
+        callback.on_predict_batch_end(0, batch_out)
+        legacy_df = callback.on_predict_end().reset_index(drop=True)
+
+        stage1_cols = ["MIN_ALLOC_pred", "PLAYS_ALLOC_pred", "MIN_SHARE_true", "PLAYS_SHARE_true"]
+        for col in stage1_cols:
+            self.assertIn(col, lightning_df.columns)
+            self.assertIn(col, legacy_df.columns)
+            np.testing.assert_allclose(lightning_df[col].values, legacy_df[col].values, atol=1e-6, rtol=1e-6)
+
+        np.testing.assert_allclose(
+            lightning_df[["MIN_ALLOC_pred", "PLAYS_ALLOC_pred"]].values,
+            stage1_alloc[0].numpy(),
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            lightning_df[["MIN_SHARE_true", "PLAYS_SHARE_true"]].values,
+            stage1_label[0].numpy(),
+            atol=1e-6,
+        )
 
 
 if __name__ == "__main__":
