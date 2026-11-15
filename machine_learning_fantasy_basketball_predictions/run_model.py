@@ -7,7 +7,7 @@ from scipy.stats import spearmanr, pearsonr
 import lightning.pytorch as pl
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from typing import Optional, Type, Tuple
+from typing import Type, Tuple
 
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
@@ -37,7 +37,7 @@ from machine_learning_fantasy_basketball_predictions.params.layers_params import
 
 class RunModelFantasyBasketballPredictions(RunModel):
     def __init__(self, params: MachineLearningParamsFantasyBasketballPredictions, project_name: str = PROJECT_NAME,
-                 description: Optional[str] = None, use_lightning: bool = False):
+                 description: str | None = None, use_lightning: bool = False):
         super().__init__(params=params, project_name=project_name, description=description, use_lightning=use_lightning)
 
     def update_categorical_params(self):
@@ -84,7 +84,11 @@ class RunModelFantasyBasketballPredictions(RunModel):
         return contests_df[['contestId', 'score', 'DATE', 'entry_fee']]
 
     @classmethod
-    def _process_predictions_df(cls, predictions_df: pd.DataFrame, contests_df: pd.DataFrame) -> pd.DataFrame:
+    def _process_predictions_df(
+        cls,
+        predictions_df: pd.DataFrame,
+        contests_df: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
         collect_cols = [c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]
         if collect_cols:
             predictions_df = predictions_df[collect_cols].copy()
@@ -93,14 +97,15 @@ class RunModelFantasyBasketballPredictions(RunModel):
             predictions_df = predictions_df.copy()
 
         if 'NOT_IGNORE' in predictions_df.columns:
-            predictions_df = predictions_df.loc[predictions_df['NOT_IGNORE'].astype(bool)].drop(columns='NOT_IGNORE')
+            predictions_df = predictions_df.drop(columns='NOT_IGNORE')
 
         true_cols = [c for c in predictions_df if '_true' in c]
         if true_cols:
             predictions_df = predictions_df.loc[(predictions_df[true_cols] != IGNORE).all(axis=1)]
 
         predictions_df['DATE'] = convert_date_col_to_date(predictions_df['DATE'])
-        predictions_df = predictions_df.loc[predictions_df['DATE'].isin(contests_df['DATE'].unique())]
+        if contests_df is not None:
+            predictions_df = predictions_df.loc[predictions_df['DATE'].isin(contests_df['DATE'].unique())]
 
         # adding yahoo points if needed
         add_missing_points_columns_to_predictions(predictions_df=predictions_df)
@@ -221,8 +226,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
             logging.warning(f"Could not load DFS contest results: {e}. Skipping extra DFS contest metrics.")
             return eval_results
 
-        predict_results = self._process_predictions_df(
-            predictions_df=predict_results, contests_df=contests_df)
+        predict_results = self._process_predictions_df(predictions_df=predict_results)
 
         find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(points_col='YAHOO_POINTS_pred',
                                                                   num_teams_in_set=1,
@@ -234,7 +238,10 @@ class RunModelFantasyBasketballPredictions(RunModel):
             if day_df.shape[0] < 50:
                 continue
             player_to_true_points = day_df.set_index('PLAYER_ID')[true_points_col].to_dict()
-            predicted_best_team = find_best_team.run(df=day_df).iloc[0]
+            try:
+                predicted_best_team = find_best_team.run(df=day_df).iloc[0]
+            except ValueError:
+                continue
             chosen_players = predicted_best_team[find_best_team.positions()]
 
             has_true_points = np.array([v in player_to_true_points.keys() for v in chosen_players.values])
@@ -243,8 +250,21 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 raise ValueError(f"There are players that we don't have true points for on date {curr_date}: "
                                  f"{players_without_true_points}")
             score_per_day[curr_date] = chosen_players.map(player_to_true_points).sum()
-        score_per_day = pd.Series(score_per_day).to_frame().reset_index().rename(
+        score_per_day = pd.Series(score_per_day, dtype=float).to_frame().reset_index().rename(
             columns={'index': 'DATE', 0: 'predicted_score'})
+
+        if 'split_type' in predict_results.columns and not score_per_day.empty:
+            all_dates_scores = score_per_day.merge(
+                predict_results[['DATE', 'split_type']].drop_duplicates(),
+                on='DATE',
+                how='left',
+            )
+            for raw_split, grp in all_dates_scores.groupby('split_type', sort=False):
+                split_key = raw_split.name if hasattr(raw_split, 'name') else str(raw_split)
+                if split_key not in eval_results.index and split_key.upper() in eval_results.index:
+                    split_key = split_key.upper()
+                eval_results.loc[split_key, 'mean_lineup_score_all_dates'] = grp['predicted_score'].mean()
+                eval_results.loc[split_key, 'n_lineup_dates'] = len(grp)
 
         dfs_contests_df = contests_df.merge(score_per_day, on='DATE', how='inner')
         dfs_contests_df['predicted_is_better'] = dfs_contests_df['predicted_score'] > dfs_contests_df['score']

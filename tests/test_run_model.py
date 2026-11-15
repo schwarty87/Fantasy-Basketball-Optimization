@@ -189,6 +189,98 @@ class TestBacktestEvaluatorRawPoints(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_midgame_exit_starter_retained_in_lp_while_dummy_slots_dropped(self):
+        """Verify NOT_IGNORE==0 midgame-exit starter remains eligible in backtest LP while -999 dummy slots are dropped."""
+        d1 = datetime.date(2023, 1, 1)
+        # Player 1 is a $30 starter projected at 55 FP who exited mid-game (NOT_IGNORE=0, YAHOO_POINTS_raw=6.0)
+        # Players 2..8 are 7 other $24 starters projected at 40 FP with YAHOO_POINTS_raw=40.0
+        # Players 9..60 are $10 bench players projected at 5 FP with YAHOO_POINTS_raw=5.0
+        # Player 61 is a dummy slot with MIN_true=-999 (must be dropped even though pred=99.0)
+        predict_df = pd.DataFrame({
+            'DATE': [d1] * 61,
+            'PLAYER_ID': list(range(1, 62)),
+            'YAHOO_POSITION': [1, 2, 3, 4, 5, 1, 3, 5] + [1] * 52 + [1],
+            'YAHOO_SALARY': [30.0] + [24.0] * 7 + [10.0] * 52 + [10.0],
+            'YAHOO_POINTS_pred': [55.0] + [40.0] * 7 + [5.0] * 52 + [99.0],
+            'YAHOO_POINTS_true': [6.0] + [40.0] * 7 + [5.0] * 52 + [-999.0],
+            'MIN_true': [8.0] + [34.0] * 7 + [12.0] * 52 + [-999.0],
+            'YAHOO_POINTS_raw': [6.0] + [40.0] * 7 + [5.0] * 52 + [0.0],
+            'NOT_IGNORE': [0] + [1] * 59 + [0],
+            'split_type': ['test'] * 61,
+        })
+        contests_df = pd.DataFrame({
+            'DATE': [d1] * 5,
+            'contestId': [1001] * 5,
+            'entry_fee': [5.0] * 5,
+            'score': [300.0] * 5,
+        })
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            mock_params = MagicMock()
+            mock_params.continue_model_id = None
+            with patch('machine_learning.run_model.models_dir', return_value=temp_dir), \
+                 patch('machine_learning.run_model.get_next_model_id', return_value=9999), \
+                 patch('machine_learning_fantasy_basketball_predictions.run_model.FantasyBasketballDataModule'), \
+                 patch('machine_learning_fantasy_basketball_predictions.run_model.FantasyBasketballLightningModule'):
+                runner = RunModelFantasyBasketballPredictions(params=mock_params, use_lightning=True)
+            eval_df = pd.DataFrame(index=['TEST'], data={'loss': [0.5]})
+
+            with patch.object(runner, '_load_contests_df', return_value=contests_df):
+                result = runner._add_extra_metrics_to_eval_results(eval_df, predict_df)
+
+            # Player 1 (6.0) + 7 * 40.0 (280.0) = 286.0
+            self.assertAlmostEqual(result.loc['TEST', 'mean_score_paid'], 286.0, places=5)
+            self.assertAlmostEqual(result.loc['TEST', 'mean_lineup_score_all_dates'], 286.0, places=5)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_mean_lineup_score_all_dates_includes_non_contest_dates(self):
+        """Verify mean_lineup_score_all_dates averages over D1 and D2 while contest metrics use only D1."""
+        d1 = datetime.date(2023, 1, 1)
+        d2 = datetime.date(2023, 1, 2)
+
+        def _make_day(d: datetime.date, starter_raw: float) -> pd.DataFrame:
+            return pd.DataFrame({
+                'DATE': [d] * 60,
+                'PLAYER_ID': list(range(1, 61)),
+                'YAHOO_POSITION': [1, 2, 3, 4, 5, 1, 3, 5] + [1] * 52,
+                'YAHOO_SALARY': [25.0] * 8 + [10.0] * 52,
+                'YAHOO_POINTS_pred': [40.0] * 8 + [5.0] * 52,
+                'YAHOO_POINTS_true': [starter_raw] * 8 + [5.0] * 52,
+                'YAHOO_POINTS_raw': [starter_raw] * 8 + [5.0] * 52,
+                'split_type': ['test'] * 60,
+            })
+
+        # D1 lineup scores 8 * 45 = 360.0; D2 lineup scores 8 * 30 = 240.0
+        predict_df = pd.concat([_make_day(d1, 45.0), _make_day(d2, 30.0)], ignore_index=True)
+        contests_df = pd.DataFrame({
+            'DATE': [d1] * 5,
+            'contestId': [1001] * 5,
+            'entry_fee': [5.0] * 5,
+            'score': [300.0] * 5,
+        })
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            mock_params = MagicMock()
+            mock_params.continue_model_id = None
+            with patch('machine_learning.run_model.models_dir', return_value=temp_dir), \
+                 patch('machine_learning.run_model.get_next_model_id', return_value=9999), \
+                 patch('machine_learning_fantasy_basketball_predictions.run_model.FantasyBasketballDataModule'), \
+                 patch('machine_learning_fantasy_basketball_predictions.run_model.FantasyBasketballLightningModule'):
+                runner = RunModelFantasyBasketballPredictions(params=mock_params, use_lightning=True)
+            eval_df = pd.DataFrame(index=['TEST'], data={'loss': [0.5]})
+
+            with patch.object(runner, '_load_contests_df', return_value=contests_df):
+                result = runner._add_extra_metrics_to_eval_results(eval_df, predict_df)
+
+            self.assertAlmostEqual(result.loc['TEST', 'mean_lineup_score_all_dates'], 300.0, places=5)
+            self.assertEqual(result.loc['TEST', 'n_lineup_dates'], 2)
+            self.assertAlmostEqual(result.loc['TEST', 'mean_score_paid'], 360.0, places=5)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == '__main__':
     unittest.main()
