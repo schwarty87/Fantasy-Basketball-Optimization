@@ -18,6 +18,7 @@ from machine_learning.constants import IGNORE, METADATA
 from machine_learning.enums import Reduction, ModelMode, DataSplitType
 from machine_learning.layers.layers import (
     EmbeddingsLayer,
+    ReshapeLayer,
     _build_safe_key_padding_mask,
     TransformerEncoderPytorch,
     SplitAttentionCombineWrapper,
@@ -37,6 +38,7 @@ from machine_learning.params.abstract_params import AbstractMetricParams
 from machine_learning.params.metrics_params import KLDivergenceLossParams, MSELossParams
 from machine_learning.params.layers_params import (
     EmbeddingsLayerParams,
+    ReshapeLayerParams,
     TransformerEncoderPytorchParams,
     SplitAttentionCombineParams,
     SplitAttentionCombineWrapperParams,
@@ -1409,6 +1411,65 @@ class TestRateScaleHead(unittest.TestCase):
         self.assertEqual(cfp.scaler_scale, list(self.SCALE))
         self.assertEqual(rsh.scaler_mean, list(self.MEAN))
         self.assertEqual(rsh.scaler_scale, list(self.SCALE))
+
+
+class TestFPLossAlignment(unittest.TestCase):
+    STAT_NAMES = [
+        'MIN', '2PM', '3PM', 'FG_MISSED', 'FTM', 'FT_MISSED', 'TOV',
+        'REB', 'AST', 'STL', 'BLK',
+    ]
+
+    def test_fp_mse_unreduced_shape_no_broadcast_for_b1_and_b30(self):
+        """Verify fantasy_points -> ReshapeLayer -> fp_mse keeps exact (B, P, 1) unreduced shape for B=1, 22, 30."""
+        for num_players in (22, 30):
+            cfp_params = CalculateFantasyPointsParams(
+                input_tensor_name='outputs_pred',
+                output_tensor_name='fantasy_points',
+                stat_names=list(self.STAT_NAMES),
+                scaler_mean=[20.0] + [1.5] * 10,
+                scaler_scale=[10.0] + [1.2] * 10,
+            )
+            cfp_layer = CalculateFantasyPoints(cfp_params, input_shape=(num_players, len(self.STAT_NAMES)))
+            reshape_params = ReshapeLayerParams(
+                input_tensor_name='fantasy_points',
+                output_tensor_name='fantasy_points_3d',
+                shape=(num_players, 1),
+            )
+            reshape_layer = ReshapeLayer(reshape_params, input_shape=cfp_layer.output_shape())
+            self.assertEqual(reshape_layer.output_shape(), (num_players, 1))
+
+            fp_loss_params = MSELossParams(
+                name_for_logs='fp_mse',
+                column_names=['YAHOO_POINTS'],
+                tensor_names_pred='fantasy_points_3d',
+                tensor_names_true='yahoo_points_label',
+                tensor_names_keep_mask='keep_mask',
+                tensor_names_sample_weights=None,
+                weight=0.05,
+            )
+            fp_loss = MSELoss(fp_loss_params)
+
+            for batch_size in (1, num_players):
+                preds_stat = torch.randn(batch_size, num_players, len(self.STAT_NAMES), requires_grad=True)
+                fp_2d = cfp_layer(preds_stat)
+                self.assertEqual(fp_2d.shape, (batch_size, num_players))
+                fp_3d = reshape_layer(fp_2d)
+                self.assertEqual(fp_3d.shape, (batch_size, num_players, 1))
+
+                y_true = torch.randn(batch_size, num_players, 1)
+                mask = torch.ones(batch_size, num_players, 1)
+                mask[:, -2:, :] = 0.0
+
+                unreduced = fp_loss._error_unreduced(y_true, fp_3d)
+                self.assertEqual(unreduced.shape, (batch_size, num_players, 1))
+
+                reduced = fp_loss(y_pred=fp_3d, y_true=y_true, keep_mask=mask)
+                self.assertTrue(torch.isfinite(reduced).all())
+                reduced.sum().backward()
+                self.assertIsNotNone(preds_stat.grad)
+                self.assertTrue(torch.isfinite(preds_stat.grad).all())
+                # Masked dummy rows must receive exact zero gradient
+                self.assertTrue(torch.equal(preds_stat.grad[:, -2:, :], torch.zeros_like(preds_stat.grad[:, -2:, :])))
 
 
 if __name__ == "__main__":

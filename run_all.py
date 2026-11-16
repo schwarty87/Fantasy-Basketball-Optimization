@@ -21,7 +21,8 @@ from machine_learning.params.machine_learning_dataset_params import MachineLearn
     MachineLearningDatasetSampleWeightsTabularParams, MachineLearningDatasetMetadataParams, \
     MachineLearningDatasetKeepMaskTabularParams
 from machine_learning.params.layers_params import DenseLayersParams, EmbeddingsLayerParams, CombineTensorsParams, \
-    TransformerEncoderPytorchParams, TSMixerParams, SplitAttentionCombineParams, SplitAttentionCombineWrapperParams
+    TransformerEncoderPytorchParams, TSMixerParams, SplitAttentionCombineParams, SplitAttentionCombineWrapperParams, \
+    ReshapeLayerParams
 from machine_learning.params.metrics_params import BinaryCrossEntropyParams, MSELossParams, MAEMetricParams, \
     QuantileRegressionLossParams, MAPEMetricParams, KLDivergenceLossParams
 from machine_learning_fantasy_basketball_predictions.params.params import FeaturesParamsFantasyBasketballPredictions,\
@@ -99,7 +100,11 @@ def create_features_params(
     embedding_feature_names: Sequence[str] | None = None,
     bench_order_input: bool = True,
     two_stage: bool = False,
+    use_histogram_weights: bool = True,
+    fp_loss_weight: float = 0.0,
 ) -> FeaturesParamsFantasyBasketballPredictions:
+    if fp_loss_weight < 0.0:
+        raise ValueError(f"fp_loss_weight must be >= 0.0, got {fp_loss_weight}")
     features_path = os.path.join(update_dir_name('features'), 'features.feather')
     features_dtype = np.dtype('float32')
     output_features = ['REB', 'STL', 'AST', '3PM', 'BLK', 'TOV', '2PM', 'FG_MISSED', 'FTM', 'FT_MISSED', 'MIN']
@@ -160,14 +165,6 @@ def create_features_params(
             relevant_keep_mask_dataset_name='keep_mask',
             dtype=features_dtype,
         ),
-        'sample_weights': MachineLearningDatasetSampleWeightsTabularFantasyBasketballPredictionsParams(
-            feature_names=output_features,
-            dtype=features_dtype,
-            sample_weight_type=SampleWeightType.BY_HISTOGRAM,
-            weights_per_column_or_all_together=True,
-            max_class_weight=1,
-            relevant_keep_mask_dataset_name='keep_mask',
-        ),
         METADATA: MachineLearningDatasetMetadataParams(
             feature_names=['DATE', 'split_type', 'PLAYER_ID', 'YAHOO_SALARY', 'YAHOO_POSITION', 'YAHOO_POINTS'],
             dtype=features_dtype,
@@ -182,6 +179,18 @@ def create_features_params(
         ),
     }
 
+    if use_histogram_weights:
+        feature_name_to_machine_learning_dataset_params['sample_weights'] = (
+            MachineLearningDatasetSampleWeightsTabularFantasyBasketballPredictionsParams(
+                feature_names=output_features,
+                dtype=features_dtype,
+                sample_weight_type=SampleWeightType.BY_HISTOGRAM,
+                weights_per_column_or_all_together=True,
+                max_class_weight=1,
+                relevant_keep_mask_dataset_name='keep_mask',
+            )
+        )
+
     if two_stage:
         feature_name_to_machine_learning_dataset_params['stage1_label'] = MachineLearningDatasetTabularParams(
             feature_names=['MIN_SHARE', 'PLAYS_SHARE'],
@@ -190,6 +199,13 @@ def create_features_params(
         )
         feature_name_to_machine_learning_dataset_params['stage1_keep_mask'] = MachineLearningDatasetKeepMaskTabularParams(
             feature_names=['STAGE1_NOT_IGNORE'],
+            dtype=features_dtype,
+        )
+
+    if fp_loss_weight > 0.0:
+        feature_name_to_machine_learning_dataset_params['yahoo_points_label'] = MachineLearningDatasetTabularParams(
+            feature_names=['YAHOO_POINTS'],
+            relevant_keep_mask_dataset_name=None,
             dtype=features_dtype,
         )
 
@@ -213,6 +229,7 @@ def create_architecture_params(
     stage1_layout: Literal['split1_global1_global1', 'split2_global1'] = 'split1_global1_global1',
     stage2_head: Literal['additive', 'multiplicative'] = 'additive',
     detach_z_min: bool = False,
+    fp_loss_weight: float = 0.0,
 ) -> ArchitectureParamsFantasyBasketballPredictions:
     if stage1_layout not in ('split1_global1_global1', 'split2_global1'):
         raise ValueError(f"Unsupported stage1_layout: {stage1_layout}")
@@ -222,6 +239,8 @@ def create_architecture_params(
         raise ValueError("stage2_head='multiplicative' requires two_stage=True")
     if detach_z_min and not two_stage:
         raise ValueError("detach_z_min=True requires two_stage=True")
+    if fp_loss_weight < 0.0:
+        raise ValueError(f"fp_loss_weight must be >= 0.0, got {fp_loss_weight}")
     output_feature_names = features_params.feature_name_to_machine_learning_dataset_params['true_label'].feature_names
     num_outputs = len(output_feature_names)
 
@@ -426,10 +445,21 @@ def create_architecture_params(
         stat_names=output_feature_names,
     )
 
-    # 10. Reshape to daily batches for DFS lineup optimization
+    # 10. Reshape to daily batches for DFS lineup optimization (and 3D shape when supervising FP directly)
     metadata_feature_names = features_params.feature_name_to_machine_learning_dataset_params[METADATA].feature_names
     num_players_per_game = (5 + features_params.num_bench_players) * 2
     date_ind = metadata_feature_names.index('DATE')
+    fp_3d_extra_layers = (
+        [
+            ReshapeLayerParams(
+                input_tensor_name=calculate_fantasy_points_params.output_tensor_name,
+                output_tensor_name='fantasy_points_3d',
+                shape=(num_players_per_game, 1),
+            )
+        ]
+        if fp_loss_weight > 0.0
+        else []
+    )
 
     def make_daily_reshape(output_name: str, sample_source: str, ind_in_sample: int | None = None) -> ReshapeToSamplePerDayParams:
         input_tensors = [sample_source, METADATA] if sample_source != METADATA else [METADATA, METADATA]
@@ -483,12 +513,17 @@ def create_architecture_params(
         layer_params_list.append(post_transformer_features)
     layer_params_list += [
         output_dense, *stage2_head_extra_layers, calculate_fantasy_points_params,
+        *fp_3d_extra_layers,
         fp_pred_reshape, fp_true_reshape, salary_reshape, position_reshape,
         date_reshape, keep_mask_reshape, true_fp_and_salary_combined,
         optimize_teams_params,
     ]
 
-    output_tensor_names = ['outputs_pred'] + (['stage1_log_share', 'stage1_alloc'] if two_stage else [])
+    output_tensor_names = (
+        ['outputs_pred']
+        + (['stage1_log_share', 'stage1_alloc'] if two_stage else [])
+        + (['fantasy_points_3d'] if fp_loss_weight > 0.0 else [])
+    )
 
     return ArchitectureParamsFantasyBasketballPredictions(
         layer_params_list=layer_params_list,
@@ -501,16 +536,22 @@ def create_training_params(
     num_days_per_batch: int,
     two_stage: bool = False,
     stage1_loss_weight: float = 10.0,
+    use_histogram_weights: bool = True,
+    fp_loss_weight: float = 0.0,
 ) -> TrainingParamsFantasyBasketballPredictions:
+    if fp_loss_weight < 0.0:
+        raise ValueError(f"fp_loss_weight must be >= 0.0, got {fp_loss_weight}")
     model_id = get_next_model_id(PROJECT_NAME)
-    true_label_dataset = features_params.feature_name_to_machine_learning_dataset_params['true_label']
+    datasets = features_params.feature_name_to_machine_learning_dataset_params
+    true_label_dataset = datasets['true_label']
     true_label_names = true_label_dataset.feature_names
     true_label_is_scaled = isinstance(true_label_dataset, MachineLearningDatasetTabularScalingParams)
+    has_sample_weights = use_histogram_weights and ('sample_weights' in datasets)
 
     loss_params = MSELossParams(
         name_for_logs='mse',
         column_names=true_label_names,
-        tensor_names_sample_weights='sample_weights',
+        tensor_names_sample_weights='sample_weights' if has_sample_weights else None,
         tensor_names_pred='outputs_pred',
         tensor_names_true='true_label',
         tensor_names_keep_mask='keep_mask',
@@ -528,6 +569,18 @@ def create_training_params(
                 weight=stage1_loss_weight,
             )
         )
+    if fp_loss_weight > 0.0:
+        all_loss_params.append(
+            MSELossParams(
+                name_for_logs='fp_mse',
+                column_names=['YAHOO_POINTS'],
+                tensor_names_pred='fantasy_points_3d',
+                tensor_names_true='yahoo_points_label',
+                tensor_names_keep_mask='keep_mask',
+                tensor_names_sample_weights=None,
+                weight=fp_loss_weight,
+            )
+        )
 
     optimize_teams_loss_params = OptimizeTeamsLossParams(
         tensor_names_true='fantasy_points_true_sample_per_day',
@@ -536,7 +589,7 @@ def create_training_params(
         name_for_logs='optimize_teams_loss',
     )
 
-    tracked_metric = 'eval_mse' if len(all_loss_params) > 1 else 'eval_loss'
+    tracked_metric = 'eval_mse' if two_stage else 'eval_loss'
     collect_column_names = {
         'true_label': [f'{c}_true' for c in true_label_names],
         'outputs_pred': [f'{c}_pred' for c in true_label_names],
@@ -598,6 +651,8 @@ def create_params(
     stage1_loss_weight: float = 10.0,
     stage2_head: Literal['additive', 'multiplicative'] = 'additive',
     detach_z_min: bool = False,
+    use_histogram_weights: bool = True,
+    fp_loss_weight: float = 0.0,
 ) -> MachineLearningParamsFantasyBasketballPredictions:
     num_days_per_batch = 4
     features_params = create_features_params(
@@ -608,6 +663,8 @@ def create_params(
         embedding_feature_names=embedding_feature_names,
         bench_order_input=bench_order_input,
         two_stage=two_stage,
+        use_histogram_weights=use_histogram_weights,
+        fp_loss_weight=fp_loss_weight,
     )
     architecture_params = create_architecture_params(
         features_params,
@@ -618,12 +675,15 @@ def create_params(
         stage1_layout=stage1_layout,
         stage2_head=stage2_head,
         detach_z_min=detach_z_min,
+        fp_loss_weight=fp_loss_weight,
     )
     training_params = create_training_params(
         features_params,
         num_days_per_batch=num_days_per_batch,
         two_stage=two_stage,
         stage1_loss_weight=stage1_loss_weight,
+        use_histogram_weights=use_histogram_weights,
+        fp_loss_weight=fp_loss_weight,
     )
     return MachineLearningParamsFantasyBasketballPredictions(
         features_params=features_params,
@@ -846,6 +906,22 @@ if __name__ == '__main__':
         dest="detach_z_min",
         help="Detach z_min inside z_min + z_rate in TeamAllocation so PLAYS_SHARE KL updates only z_rate (requires --two-stage).",
     )
+    parser.add_argument(
+        "--no-histogram-weights",
+        "--no_histogram_weights",
+        action="store_false",
+        dest="use_histogram_weights",
+        default=True,
+        help="Disable BY_HISTOGRAM sample weights on the 11-stat Stage-2 MSE loss.",
+    )
+    parser.add_argument(
+        "--fp-loss-weight",
+        "--fp_loss_weight",
+        type=float,
+        default=0.0,
+        dest="fp_loss_weight",
+        help="Weight for auxiliary MSE loss on predicted Yahoo fantasy points (default: 0.0).",
+    )
     args = parser.parse_args()
 
     use_lightning = args.use_lightning
@@ -865,6 +941,8 @@ if __name__ == '__main__':
         stage1_loss_weight=args.stage1_loss_weight,
         stage2_head=args.stage2_head,
         detach_z_min=args.detach_z_min,
+        use_histogram_weights=args.use_histogram_weights,
+        fp_loss_weight=args.fp_loss_weight,
     )
     if args.fast_dev_run:
         params.training_params.fast_dev_run = True

@@ -33,6 +33,7 @@ from machine_learning.params.callbacks_params import (
     ReduceLearningRateOnPlateauParams,
 )
 from machine_learning.params.layers_params import (
+    ReshapeLayerParams,
     SplitAttentionCombineWrapperParams,
     TransformerEncoderPytorchParams,
 )
@@ -705,6 +706,105 @@ class TestRunAll(unittest.TestCase):
         with torch.no_grad():
             rebuilt_out = rebuilt_model(batch)
         torch.testing.assert_close(orig_out['outputs_pred'], rebuilt_out['outputs_pred'], atol=0.0, rtol=0.0)
+
+    def test_cl4_no_histogram_weights_and_fp_loss_weight(self):
+        """Verify --no-histogram-weights and --fp-loss-weight wiring, round-trips, and forward/backward passes."""
+        with self.assertRaisesRegex(ValueError, "fp_loss_weight must be >= 0.0"):
+            create_params(fp_loss_weight=-0.01)
+
+        # 1. Single-stage with --no-histogram-weights and --fp-loss-weight 0.05 (bench=10 -> 30 players/game)
+        p_single = create_params(
+            bench_order_input=False,
+            two_stage=False,
+            use_histogram_weights=False,
+            fp_loss_weight=0.05,
+        )
+        test_params(p_single)
+        ds_single = p_single.features_params.feature_name_to_machine_learning_dataset_params
+        self.assertNotIn('sample_weights', ds_single)
+        self.assertIn('yahoo_points_label', ds_single)
+        self.assertEqual(ds_single['yahoo_points_label'].feature_names, ['YAHOO_POINTS'])
+        self.assertIn('fantasy_points_3d', p_single.architecture_params.output_tensor_names)
+
+        reshape_layers = [
+            lp for lp in p_single.architecture_params.layer_params_list
+            if isinstance(lp, ReshapeLayerParams) and lp.output_tensor_name == 'fantasy_points_3d'
+        ]
+        self.assertEqual(len(reshape_layers), 1)
+        self.assertEqual(reshape_layers[0].shape, (30, 1))
+
+        loss_names_single = [lp.name_for_logs for lp in p_single.training_params.loss_params]
+        self.assertEqual(loss_names_single, ['mse', 'fp_mse'])
+        self.assertIsNone(p_single.training_params.loss_params[0].tensor_names_sample_weights)
+        self.assertEqual(p_single.training_params.loss_params[1].weight, 0.05)
+
+        for cb in p_single.training_params.callbacks_params:
+            if isinstance(cb, (ModelCheckpointParams, EarlyStoppingParams, ReduceLearningRateOnPlateauParams)):
+                self.assertEqual(cb.value_to_track, 'eval_loss')
+
+        # 2. Two-stage multiplicative combined with --no-histogram-weights and --fp-loss-weight 0.005
+        p_two = create_params(
+            two_stage=True,
+            stage2_head='multiplicative',
+            use_histogram_weights=False,
+            fp_loss_weight=0.005,
+        )
+        test_params(p_two)
+        for cb in p_two.training_params.callbacks_params:
+            if isinstance(cb, (ModelCheckpointParams, EarlyStoppingParams, ReduceLearningRateOnPlateauParams)):
+                self.assertEqual(cb.value_to_track, 'eval_mse')
+
+        for lp in p_two.architecture_params.layer_params_list:
+            if hasattr(lp, 'embeddings_dims') and hasattr(lp, 'num_embeddings'):
+                lp.update_after_loading_data({'num_embeddings': [50] * len(lp.embeddings_dims)})
+
+        stat_names = p_two.features_params.feature_name_to_machine_learning_dataset_params['true_label'].feature_names
+        class DummyScaler:
+            feature_names_in_ = np.array(stat_names)
+            mean_ = np.arange(1.0, len(stat_names) + 1.0, dtype=np.float64)
+            scale_ = np.linspace(0.5, 5.5, len(stat_names), dtype=np.float64)
+
+        combined = type("Combined", (), {
+            "machine_learning_datasets_stacked": type("Stacked", (), {
+                "datasets": {"true_label": type("DS", (), {"scaler": DummyScaler()})()}
+            })()
+        })()
+        update_calculate_fantasy_points_params(params=p_two, dataset_combined=combined)
+
+        model = ModelArchitecture(
+            params=p_two.architecture_params,
+            feature_type_to_input_shape=p_two.features_params.feature_type_to_input_shape,
+        ).train()
+        losses = LossesCombined(p_two.training_params.loss_params, device=torch.device('cpu'), name='loss')
+
+        torch.manual_seed(19)
+        batch = {}
+        for name, shape in p_two.features_params.feature_type_to_input_shape.items():
+            if name in ('embedding_features', 'positional_encoding_features'):
+                batch[name] = torch.randint(0, 5, (2, *shape))
+            elif name in ('real_player_mask', 'keep_mask', 'stage1_keep_mask'):
+                batch[name] = torch.ones((2, *shape), dtype=torch.float32)
+            elif name == 'stage1_label':
+                batch[name] = torch.full((2, *shape), 1.0 / 11.0, dtype=torch.float32)
+            else:
+                batch[name] = torch.randn((2, *shape), dtype=torch.float32)
+
+        outputs = model(batch)
+        self.assertEqual(outputs['fantasy_points_3d'].shape, (2, 22, 1))
+        total_loss = losses.forward({**batch, **outputs})
+        self.assertTrue(torch.isfinite(total_loss).all())
+        total_loss.backward()
+        losses.summarize()
+        logs = losses.get_logs()
+        self.assertIn('loss', logs)
+        self.assertIn('mse', logs)
+        self.assertIn('stage1_kl', logs)
+        self.assertIn('fp_mse', logs)
+        self.assertAlmostEqual(
+            float(logs['loss']),
+            float(logs['mse']) + 10.0 * float(logs['stage1_kl']) + 0.005 * float(logs['fp_mse']),
+            places=5,
+        )
 
 
 if __name__ == "__main__":
