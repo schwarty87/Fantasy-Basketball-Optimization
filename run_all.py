@@ -30,7 +30,8 @@ from machine_learning_fantasy_basketball_predictions.params.params import Featur
 from machine_learning_fantasy_basketball_predictions.constants import PROJECT_NAME
 from machine_learning_fantasy_basketball_predictions.run_model import RunModelFantasyBasketballPredictions
 from machine_learning_fantasy_basketball_predictions.params.layers_params import \
-    CalculateFantasyPointsParams, ReshapeToSamplePerDayParams, OptimizeTeamParams, TeamAllocationParams
+    CalculateFantasyPointsParams, ReshapeToSamplePerDayParams, OptimizeTeamParams, TeamAllocationParams, \
+    RateScaleHeadParams
 from machine_learning_fantasy_basketball_predictions.params.machine_learning_dataset_params import \
     MachineLearningDatasetSampleWeightsTabularFantasyBasketballPredictionsParams, \
     MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams
@@ -210,9 +211,17 @@ def create_architecture_params(
     n_heads: int = 8,
     two_stage: bool = False,
     stage1_layout: Literal['split1_global1_global1', 'split2_global1'] = 'split1_global1_global1',
+    stage2_head: Literal['additive', 'multiplicative'] = 'additive',
+    detach_z_min: bool = False,
 ) -> ArchitectureParamsFantasyBasketballPredictions:
     if stage1_layout not in ('split1_global1_global1', 'split2_global1'):
         raise ValueError(f"Unsupported stage1_layout: {stage1_layout}")
+    if stage2_head not in ('additive', 'multiplicative'):
+        raise ValueError(f"Unsupported stage2_head: {stage2_head!r}")
+    if stage2_head == 'multiplicative' and not two_stage:
+        raise ValueError("stage2_head='multiplicative' requires two_stage=True")
+    if detach_z_min and not two_stage:
+        raise ValueError("detach_z_min=True requires two_stage=True")
     output_feature_names = features_params.feature_name_to_machine_learning_dataset_params['true_label'].feature_names
     num_outputs = len(output_feature_names)
 
@@ -329,6 +338,7 @@ def create_architecture_params(
             input_tensor_name={'x': stage1_head.output_tensor_name, 'mask': 'real_player_mask'},
             output_tensor_name=['stage1_log_share', 'stage1_alloc'],
             n_bench_players=features_params.num_bench_players,
+            detach_z_min=detach_z_min,
         )
         stage2_concat = CombineTensorsParams(
             input_tensor_name=[stage1_trunk_out, 'stage1_alloc'],
@@ -385,14 +395,27 @@ def create_architecture_params(
         post_transformer_features = None
         head_input_tensor_name = transformer_encoder_params.output_tensor_name
 
-    # 8. Output dense head: predicts the 11 target stats
+    # 8. Output dense head: emits standardized stats directly ('additive') or pre-rate logits
+    # fed into RateScaleHead ('multiplicative') to reconstruct physical stats * opportunity shares.
     output_dense = DenseLayersParams(
         input_tensor_name=head_input_tensor_name,
-        output_tensor_name='outputs_pred',
+        output_tensor_name='stage2_raw_rates' if stage2_head == 'multiplicative' else 'outputs_pred',
         num_nodes_per_layer=[64, num_outputs],
         use_batchnorm=True,
         activation=ActivationFunction.GELU,
         dropout_rate=0.15,
+    )
+    # Constructed upfront (never mutated post-init) so save/load round-trips preserve exact graph topology.
+    stage2_head_extra_layers = (
+        [
+            RateScaleHeadParams(
+                input_tensor_name={'raw': output_dense.output_tensor_name, 'alloc': 'stage1_alloc'},
+                output_tensor_name='outputs_pred',
+                stat_names=output_feature_names,
+            )
+        ]
+        if stage2_head == 'multiplicative'
+        else []
     )
 
     # 9. Compute Yahoo Fantasy Points from predicted stats
@@ -459,7 +482,7 @@ def create_architecture_params(
     if post_transformer_features is not None:
         layer_params_list.append(post_transformer_features)
     layer_params_list += [
-        output_dense, calculate_fantasy_points_params,
+        output_dense, *stage2_head_extra_layers, calculate_fantasy_points_params,
         fp_pred_reshape, fp_true_reshape, salary_reshape, position_reshape,
         date_reshape, keep_mask_reshape, true_fp_and_salary_combined,
         optimize_teams_params,
@@ -573,6 +596,8 @@ def create_params(
     two_stage: bool = False,
     stage1_layout: Literal['split1_global1_global1', 'split2_global1'] = 'split1_global1_global1',
     stage1_loss_weight: float = 10.0,
+    stage2_head: Literal['additive', 'multiplicative'] = 'additive',
+    detach_z_min: bool = False,
 ) -> MachineLearningParamsFantasyBasketballPredictions:
     num_days_per_batch = 4
     features_params = create_features_params(
@@ -591,6 +616,8 @@ def create_params(
         d_model=d_model,
         two_stage=two_stage,
         stage1_layout=stage1_layout,
+        stage2_head=stage2_head,
+        detach_z_min=detach_z_min,
     )
     training_params = create_training_params(
         features_params,
@@ -803,6 +830,22 @@ if __name__ == '__main__':
         dest="stage1_loss_weight",
         help="Weight for Stage-1 KL divergence loss when --two-stage is enabled (default: 10.0)",
     )
+    parser.add_argument(
+        "--stage2-head",
+        "--stage2_head",
+        dest="stage2_head",
+        type=str,
+        default="additive",
+        choices=["additive", "multiplicative"],
+        help="Stage-2 output head mode ('additive' or 'multiplicative'; 'multiplicative' requires --two-stage).",
+    )
+    parser.add_argument(
+        "--detach-z-min",
+        "--detach_z_min",
+        action="store_true",
+        dest="detach_z_min",
+        help="Detach z_min inside z_min + z_rate in TeamAllocation so PLAYS_SHARE KL updates only z_rate (requires --two-stage).",
+    )
     args = parser.parse_args()
 
     use_lightning = args.use_lightning
@@ -820,6 +863,8 @@ if __name__ == '__main__':
         two_stage=args.two_stage,
         stage1_layout=args.stage1_layout,
         stage1_loss_weight=args.stage1_loss_weight,
+        stage2_head=args.stage2_head,
+        detach_z_min=args.detach_z_min,
     )
     if args.fast_dev_run:
         params.training_params.fast_dev_run = True

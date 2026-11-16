@@ -4,8 +4,10 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pandas as pd
 import torch
+import lightning.pytorch as pl
 from lightning.pytorch.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
@@ -13,7 +15,15 @@ from lightning.pytorch.callbacks import (
 )
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from run_all import main, clean_empty_model_dirs, compare_dataclasses, create_params, test_params
+from run_all import (
+    main,
+    clean_empty_model_dirs,
+    compare_dataclasses,
+    create_architecture_params,
+    create_features_params,
+    create_params,
+    test_params,
+)
 from machine_learning.architecture import ModelArchitecture
 from machine_learning.constants import METADATA
 from machine_learning.metrics.combined_metrics import LossesCombined
@@ -25,6 +35,18 @@ from machine_learning.params.callbacks_params import (
 from machine_learning.params.layers_params import (
     SplitAttentionCombineWrapperParams,
     TransformerEncoderPytorchParams,
+)
+from machine_learning_fantasy_basketball_predictions.lightning_model import (
+    FantasyBasketballLightningModule,
+)
+from machine_learning_fantasy_basketball_predictions.params.layers_params import (
+    CalculateFantasyPointsParams,
+    RateScaleHeadParams,
+    TeamAllocationParams,
+    update_calculate_fantasy_points_params,
+)
+from machine_learning_fantasy_basketball_predictions.params.params import (
+    MachineLearningParamsFantasyBasketballPredictions,
 )
 from machine_learning_fantasy_basketball_predictions.run_model import (
     RunModelFantasyBasketballPredictions,
@@ -592,6 +614,97 @@ class TestRunAll(unittest.TestCase):
             for p in model.parameters():
                 if p.grad is not None:
                     self.assertTrue(torch.isfinite(p.grad).all())
+
+    def test_multiplicative_stage2_head_validation_params_and_ckpt_parity(self):
+        """Verify --stage2-head multiplicative requires --two-stage, passes round-trips, and matches across reloads."""
+        feat_params = create_features_params(two_stage=False)
+        with self.assertRaisesRegex(ValueError, "requires two_stage=True"):
+            create_architecture_params(feat_params, num_days_per_batch=4, two_stage=False, stage2_head='multiplicative')
+        with self.assertRaisesRegex(ValueError, "requires two_stage=True"):
+            create_params(two_stage=False, stage2_head='multiplicative')
+        with self.assertRaisesRegex(ValueError, "requires two_stage=True"):
+            create_params(two_stage=False, detach_z_min=True)
+
+        detached_params = create_params(two_stage=True, detach_z_min=True)
+        ta_det = next(lp for lp in detached_params.architecture_params.layer_params_list if isinstance(lp, TeamAllocationParams))
+        self.assertTrue(ta_det.detach_z_min)
+        test_params(detached_params)
+
+        params = create_params(two_stage=True, stage2_head='multiplicative')
+        ta_default = next(lp for lp in params.architecture_params.layer_params_list if isinstance(lp, TeamAllocationParams))
+        self.assertFalse(ta_default.detach_z_min)
+        rsh_list = [lp for lp in params.architecture_params.layer_params_list if isinstance(lp, RateScaleHeadParams)]
+        self.assertEqual(len(rsh_list), 1)
+        self.assertEqual(rsh_list[0].input_tensor_name, {'raw': 'stage2_raw_rates', 'alloc': 'stage1_alloc'})
+        self.assertEqual(rsh_list[0].output_tensor_name, 'outputs_pred')
+
+        for lp in params.architecture_params.layer_params_list:
+            if hasattr(lp, 'embeddings_dims') and hasattr(lp, 'num_embeddings'):
+                lp.update_after_loading_data({'num_embeddings': [50] * len(lp.embeddings_dims)})
+
+        stat_names = params.features_params.feature_name_to_machine_learning_dataset_params['true_label'].feature_names
+        class DummyScaler:
+            feature_names_in_ = np.array(stat_names)
+            mean_ = np.arange(1.0, len(stat_names) + 1.0, dtype=np.float64)
+            scale_ = np.linspace(0.5, 5.5, len(stat_names), dtype=np.float64)
+
+        combined = type("Combined", (), {
+            "machine_learning_datasets_stacked": type("Stacked", (), {
+                "datasets": {"true_label": type("DS", (), {"scaler": DummyScaler()})()}
+            })()
+        })()
+        update_calculate_fantasy_points_params(params=params, dataset_combined=combined)
+        self.assertIsNotNone(rsh_list[0].scaler_mean)
+        cfp = next(lp for lp in params.architecture_params.layer_params_list if isinstance(lp, CalculateFantasyPointsParams))
+        self.assertEqual(rsh_list[0].scaler_mean, cfp.scaler_mean)
+        self.assertEqual(rsh_list[0].scaler_scale, cfp.scaler_scale)
+
+        test_params(params)
+
+        module = FantasyBasketballLightningModule(params=params)
+        module.eval()
+
+        torch.manual_seed(7)
+        batch = {}
+        for name, shape in params.features_params.feature_type_to_input_shape.items():
+            if name in ('embedding_features', 'positional_encoding_features'):
+                batch[name] = torch.randint(0, 5, (2, *shape))
+            elif name in ('real_player_mask', 'keep_mask', 'stage1_keep_mask') or 'weight' in name:
+                batch[name] = torch.ones((2, *shape), dtype=torch.float32)
+            elif name == 'stage1_label':
+                batch[name] = torch.full((2, *shape), 1.0 / 11.0, dtype=torch.float32)
+            else:
+                batch[name] = torch.randn((2, *shape), dtype=torch.float32)
+
+        with torch.no_grad():
+            orig_out = module.model(batch)
+
+        # Verify Lightning .ckpt save & reload parity (including non-persistent scaler buffers restored from params)
+        ckpt_path = os.path.join(self.temp_dir, 'mult_head.ckpt')
+        trainer = pl.Trainer(default_root_dir=self.temp_dir, accelerator='cpu', logger=False, enable_checkpointing=False)
+        trainer.strategy.connect(module)
+        trainer.save_checkpoint(ckpt_path)
+
+        reloaded_module = FantasyBasketballLightningModule.load_from_checkpoint(ckpt_path)
+        reloaded_module.eval()
+        with torch.no_grad():
+            reloaded_ckpt_out = reloaded_module.model(batch)
+        torch.testing.assert_close(orig_out['outputs_pred'], reloaded_ckpt_out['outputs_pred'], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(orig_out['fantasy_points'], reloaded_ckpt_out['fantasy_points'], atol=0.0, rtol=0.0)
+
+        # Verify params.json + ModelArchitecture.load_state_dict parity
+        params_path = os.path.join(self.temp_dir, 'params.json')
+        params.save_to_json(path=params_path)
+        loaded_params = MachineLearningParamsFantasyBasketballPredictions.load_params(params_path)
+        rebuilt_model = ModelArchitecture(
+            params=loaded_params.architecture_params,
+            feature_type_to_input_shape=loaded_params.features_params.feature_type_to_input_shape,
+        )
+        rebuilt_model.load_state_dict(module.model.state_dict(), strict=True)
+        rebuilt_model.eval()
+        with torch.no_grad():
+            rebuilt_out = rebuilt_model(batch)
+        torch.testing.assert_close(orig_out['outputs_pred'], rebuilt_out['outputs_pred'], atol=0.0, rtol=0.0)
 
 
 if __name__ == "__main__":

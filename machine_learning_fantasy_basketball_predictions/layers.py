@@ -1,3 +1,4 @@
+import math
 from functools import partial
 from joblib import Parallel, delayed
 import numpy as np
@@ -14,6 +15,7 @@ from machine_learning_fantasy_basketball_predictions.params.layers_params import
     OptimizeTeamParams,
     ReshapeToSamplePerDayParams,
     TeamAllocationParams,
+    RateScaleHeadParams,
 )
 
 
@@ -307,7 +309,20 @@ class OptimizeTeam(AbstractLayer):
 
 @layers_registry.register
 class TeamAllocation(AbstractLayer):
-    """Per-team masked softmax over [z_min, z_min + z_rate]; smooth KL log-shares and <=48m detached allocation."""
+    """Allocate conserved per-team minute and play shares from Stage-1 `[z_min, z_rate]` logits.
+
+    ``stage1_head`` predicts ``[z_min, z_rate]`` separately, and this layer forms
+    ``[z_min, z_min + z_rate]`` (or ``[z_min, z_min.detach() + z_rate]`` when
+    ``params.detach_z_min`` is True) before ``log_softmax``. In physical space that equates
+    play share to ``minutes * exp(z_rate)`` normalized across the team so high-minute players
+    naturally inherit baseline usage while weight decay shrinks ``z_rate -> 0`` (team-average
+    usage rate).
+
+    Returns two tensors over the ``(B, 2*P, 2)`` game grid:
+    - Smooth masked per-team log-shares (differentiable) for Stage-1 KL supervision.
+    - Detached starter-equivalent allocations ``5 * share``, with ``MIN_ALLOC`` projected onto
+      the capped simplex ``0 <= s <= max(1 / n_valid, 0.20)`` so no player exceeds 48 minutes.
+    """
 
     def __init__(self, params: TeamAllocationParams, input_shape: LayersInputOutputShape):
         super().__init__(params=params, input_shape=input_shape)
@@ -316,12 +331,16 @@ class TeamAllocation(AbstractLayer):
         logits, real = x['x'], x['mask'] > 0
         b, p = logits.shape[0], len(START_POSITIONS) + self.params.n_bench_players
         z_min, z_rate = logits.unbind(-1)
-        paired = torch.stack([z_min, z_min + z_rate], dim=-1).reshape(b, 2, p, 2)
+
+        base_z_min = z_min.detach() if getattr(self.params, 'detach_z_min', False) else z_min
+        # Reshape into (batch, 2 teams, P players per team, 2 heads) and mask dummy bench slots.
+        paired = torch.stack([z_min, base_z_min + z_rate], dim=-1).reshape(b, 2, p, 2)
         real4 = real.reshape(b, 2, p, 1)
         paired = paired.masked_fill(~real4, torch.finfo(paired.dtype).min)
         log_share4 = F.log_softmax(paired, dim=2).masked_fill(~real4, 0.0)
 
-        # Water-fill detached min_share in fp32 onto {0 <= s <= max(1/n_valid, 0.20), sum s = 1}
+        # Project MIN shares in fp32 water-filling onto the <= 1.0 starter-equivalent (48m) cap,
+        # detached from Stage-1 weights so Stage-2 losses refine rates without distorting KL calibration.
         share4 = log_share4.detach().float().exp().masked_fill(~real4, 0.0)
         s_min = share4[..., 0:1]
         n_valid = real4.float().sum(dim=2, keepdim=True).clamp(min=1.0)
@@ -340,6 +359,7 @@ class TeamAllocation(AbstractLayer):
             )
             s_min = torch.where(capped, cap, torch.where(free, scaled, torch.zeros_like(s_min)))
 
+        # Scale team-sum-1 shares by 5 starters so average rotation allocation is ~0.5 and cap is 1.0 (48m).
         alloc4 = float(len(START_POSITIONS)) * torch.cat([s_min, share4[..., 1:2]], dim=-1)
         log_share_name, alloc_name = self.params.output_tensor_name
         return {
@@ -349,3 +369,56 @@ class TeamAllocation(AbstractLayer):
 
     def output_shape(self) -> List[Tuple[int, ...]]:
         return [self.input_shape['x'], self.input_shape['x']]
+
+
+@layers_registry.register
+class RateScaleHead(AbstractLayer):
+    """Convert raw rate logits and Stage-1 allocations into standardized physical stat predictions.
+
+    For every stat except ``MIN``, computes:
+        ``phys = (alloc_stat / a_bar) * mean.clamp(min=0.05) * (softplus(raw) / ln(2))``
+    so ``softplus(0) / ln(2) == 1.0`` predicts the dataset baseline at average opportunity share
+    ``a_bar = 5 / n_teams_active`` while remaining strictly non-negative. Volume/shooting stats use
+    ``PLAYS_ALLOC``, box-score rate stats use ``MIN_ALLOC``, and ``MIN`` itself is locked directly
+    to ``48.0 * MIN_ALLOC`` so predicted team minutes strictly conserve 240.0.
+    """
+
+    def __init__(self, params: RateScaleHeadParams, input_shape: Dict[str, Tuple[int, ...]]):
+        super().__init__(params=params, input_shape=input_shape)
+        n = len(params.stat_names)
+        # Non-persistent buffers avoid polluting model.pt / .ckpt state_dicts with derived scaler constants;
+        # values are restored from params on checkpoint reload via update_calculate_fantasy_points_params.
+        self.register_buffer(
+            'scaler_mean',
+            torch.tensor(params.scaler_mean if params.scaler_mean is not None else [0.0] * n, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            'scaler_scale',
+            torch.tensor(params.scaler_scale if params.scaler_scale is not None else [1.0] * n, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            'is_plays',
+            torch.tensor([s in params.plays_scaled_stats for s in params.stat_names], dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            'is_min',
+            torch.tensor([s == 'MIN' for s in params.stat_names], dtype=torch.bool),
+            persistent=False,
+        )
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
+        raw, alloc = x['raw'], x['alloc'].to(dtype=x['raw'].dtype)  # (B, T, 11), (B, T, 2)
+        mean = self.scaler_mean.to(device=raw.device, dtype=raw.dtype)
+        scale = self.scaler_scale.to(device=raw.device, dtype=raw.dtype).clamp(min=1e-6)
+        a_bar = float(len(START_POSITIONS)) / float(self.params.n_teams_active)  # 0.5
+        opp = torch.where(self.is_plays.to(device=raw.device), alloc[..., 1:2], alloc[..., 0:1]) / a_bar
+        rate_phys = opp * mean.clamp(min=0.05) * (F.softplus(raw) / math.log(2.0))
+        phys = torch.where(self.is_min.to(device=raw.device), 48.0 * alloc[..., 0:1], rate_phys)
+        return (phys - mean) / scale
+
+    def output_shape(self) -> Tuple[int, ...]:
+        return self.input_shape['raw']
+

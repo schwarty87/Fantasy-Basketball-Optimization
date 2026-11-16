@@ -4,7 +4,7 @@ from enums import Sites
 from machine_learning.enums import DataSplitType
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
 from machine_learning.registries import params_registry
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from machine_learning.params.abstract_params import LayerParams
 from machine_learning.constants import METADATA
 
@@ -31,12 +31,20 @@ class CalculateFantasyPointsParams(LayerParams):
 
 
 def update_calculate_fantasy_points_params(params: Any, dataset_combined: Any = None, data_loaders: Any = None) -> None:
-    """Populates scaler_mean and scaler_scale on CalculateFantasyPointsParams from the true_label scaler."""
+    """Populate `scaler_mean` and `scaler_scale` on physical-scaling layers from `true_label`'s scaler.
+
+    Both `CalculateFantasyPointsParams` (which unscales standardized predictions before taking the
+    DFS scoring dot product) and `RateScaleHeadParams` (which converts physical opportunity-scaled
+    rates back into standardized stat space) require matching target `StandardScaler` statistics.
+    """
     arch_params = getattr(params, 'architecture_params', None)
     if arch_params is None or not hasattr(arch_params, 'layer_params_list'):
         return
 
-    cfp_layers = [p for p in arch_params.layer_params_list if isinstance(p, CalculateFantasyPointsParams)]
+    cfp_layers = [
+        p for p in arch_params.layer_params_list
+        if isinstance(p, (CalculateFantasyPointsParams, RateScaleHeadParams))
+    ]
     if not cfp_layers:
         return
 
@@ -107,4 +115,39 @@ class OptimizeTeamParams(LayerParams):
 @params_registry.register
 @dataclass(kw_only=True)
 class TeamAllocationParams(LayerParams):
+    """Configuration for `TeamAllocation` (Stage-1 layer; used only when `two_stage=True`).
+
+    Attributes:
+        n_bench_players: Number of padded bench slots per team alongside the 5 starter slots,
+            defining the fixed per-team roster width `5 + n_bench_players`.
+        detach_z_min: If True, detach `z_min` inside `z_min + z_rate` so `PLAYS_SHARE` KL loss
+            updates only `z_rate` without backpropagating into `z_min` (two-stage only).
+    """
     n_bench_players: int = 6
+    detach_z_min: bool = False
+
+
+@params_registry.register
+@dataclass(kw_only=True)
+class RateScaleHeadParams(LayerParams):
+    """Configuration for `RateScaleHead` multiplicative Stage-2 stat reconstruction.
+
+    Attributes:
+        stat_names: Ordered target stat column names matching `outputs_pred`'s last dimension.
+        plays_scaled_stats: Counting/shot/turnover stats scaled by `PLAYS_ALLOC` rather than `MIN_ALLOC`.
+        n_teams_active: Typical rotation size per team (`a_bar = 5 / n_teams_active = 0.5`) used to
+            normalize opportunity shares so `softplus(0) / ln(2) == 1.0` maps to `scaler_mean`.
+        scaler_mean: Training-set `StandardScaler.mean_` vector populated before model init.
+        scaler_scale: Training-set `StandardScaler.scale_` vector populated before model init.
+    """
+    stat_names: List[str]
+    plays_scaled_stats: Tuple[str, ...] = ('2PM', '3PM', 'FG_MISSED', 'FTM', 'FT_MISSED', 'TOV')
+    n_teams_active: int = 10
+    scaler_mean: List[float] | None = None
+    scaler_scale: List[float] | None = None
+
+    def update_after_loading_data(self, updated_params: Dict[str, Any]):
+        if 'scaler_mean' in updated_params:
+            self.scaler_mean = updated_params['scaler_mean']
+        if 'scaler_scale' in updated_params:
+            self.scaler_scale = updated_params['scaler_scale']

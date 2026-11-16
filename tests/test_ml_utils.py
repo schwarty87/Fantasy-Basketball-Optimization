@@ -56,6 +56,7 @@ from machine_learning_fantasy_basketball_predictions.layers import (
     OptimizeTeam,
     OptimizeTeamFn,
     TeamAllocation,
+    RateScaleHead,
 )
 from machine_learning_fantasy_basketball_predictions.machine_learning_datasets import (
     MachineLearningDatasetCombinedFantasyBasketballPredictions,
@@ -65,6 +66,7 @@ from machine_learning_fantasy_basketball_predictions.params.layers_params import
     ReshapeToSamplePerDayParams,
     OptimizeTeamParams,
     TeamAllocationParams,
+    RateScaleHeadParams,
     update_calculate_fantasy_points_params,
 )
 from machine_learning_fantasy_basketball_predictions.params.metrics_params import OptimizeTeamsLossParams
@@ -1113,12 +1115,13 @@ class TestZeroSampleAndKLLoss(unittest.TestCase):
 
 class TestTeamAllocation(unittest.TestCase):
     @staticmethod
-    def _make_layer(n_bench_players: int = 6) -> TeamAllocation:
+    def _make_layer(n_bench_players: int = 6, detach_z_min: bool = False) -> TeamAllocation:
         total_players = 2 * (5 + n_bench_players)
         params = TeamAllocationParams(
             input_tensor_name={"x": "stage1_raw", "mask": "real_player_mask"},
             output_tensor_name=["stage1_log_share", "stage1_alloc"],
             n_bench_players=n_bench_players,
+            detach_z_min=detach_z_min,
         )
         return TeamAllocation(params=params, input_shape={"x": (total_players, 2), "mask": (total_players, 1)})
 
@@ -1183,6 +1186,25 @@ class TestTeamAllocation(unittest.TestCase):
         self.assertIsNotNone(raw.grad)
         self.assertTrue(torch.isfinite(raw.grad).all())
         self.assertGreater(abs(raw.grad[0, 0, 0].item()), 1e-4)
+
+        # PLAYS_SHARE supervision updates both z_min and z_rate equally by default,
+        # and updates only z_rate when detach_z_min=True while keeping identical forward outputs.
+        raw_plays = raw_init.clone().detach().requires_grad_(True)
+        out_plays = layer({"x": raw_plays, "mask": mask})
+        plays_loss = torch.mean(torch.xlogy(target[..., 1], target[..., 1]) - target[..., 1] * out_plays["stage1_log_share"][..., 1])
+        plays_loss.backward()
+        self.assertGreater(raw_plays.grad[..., 0].abs().max().item(), 1e-4)
+        torch.testing.assert_close(raw_plays.grad[..., 0], raw_plays.grad[..., 1], atol=1e-6, rtol=1e-6)
+
+        layer_det = self._make_layer(n_bench_players=6, detach_z_min=True)
+        raw_det = raw_init.clone().detach().requires_grad_(True)
+        out_det = layer_det({"x": raw_det, "mask": mask})
+        self.assertTrue(torch.equal(out_det["stage1_log_share"], out_plays["stage1_log_share"].detach()))
+        self.assertTrue(torch.equal(out_det["stage1_alloc"], out_plays["stage1_alloc"]))
+        det_loss = torch.mean(torch.xlogy(target[..., 1], target[..., 1]) - target[..., 1] * out_det["stage1_log_share"][..., 1])
+        det_loss.backward()
+        self.assertTrue(torch.equal(raw_det.grad[..., 0], torch.zeros_like(raw_det.grad[..., 0])))
+        torch.testing.assert_close(raw_det.grad[..., 1], raw_plays.grad[..., 1], atol=1e-6, rtol=1e-6)
 
         # Cross-team invariance
         raw_perturbed = raw_init.clone()
@@ -1290,6 +1312,103 @@ class TestStage1PostGridTargets(unittest.TestCase):
         self.assertTrue((away["STAGE1_NOT_IGNORE"] == IGNORE_VAL).all())
         self.assertTrue((home_real["STAGE1_NOT_IGNORE"] == 1).all())
         self.assertTrue((home_dummy["STAGE1_NOT_IGNORE"] == IGNORE_VAL).all())
+
+
+class TestRateScaleHead(unittest.TestCase):
+    STAT_NAMES = [
+        'MIN', '2PM', '3PM', 'FG_MISSED', 'FTM', 'FT_MISSED', 'TOV',
+        'REB', 'AST', 'STL', 'BLK',
+    ]
+    MEAN = [24.0, 2.5, 1.0, 4.0, 1.5, 0.4, 1.2, 4.0, 2.2, 0.7, 0.5]
+    SCALE = [10.0, 2.0, 1.2, 3.0, 1.6, 0.6, 1.1, 3.0, 2.0, 0.8, 0.7]
+
+    def _make_layer(self, with_scaler: bool = True) -> RateScaleHead:
+        params = RateScaleHeadParams(
+            input_tensor_name={'raw': 'stage2_raw_rates', 'alloc': 'stage1_alloc'},
+            output_tensor_name='outputs_pred',
+            stat_names=list(self.STAT_NAMES),
+            scaler_mean=list(self.MEAN) if with_scaler else None,
+            scaler_scale=list(self.SCALE) if with_scaler else None,
+        )
+        return RateScaleHead(params=params, input_shape={'raw': (22, 11), 'alloc': (22, 2)})
+
+    def test_zero_alloc_yields_negative_mean_over_scale(self):
+        layer = self._make_layer()
+        raw = torch.randn(2, 22, 11)
+        alloc = torch.zeros(2, 22, 2)
+        out = layer({'raw': raw, 'alloc': alloc})
+        expected = -torch.tensor(self.MEAN) / torch.tensor(self.SCALE)
+        torch.testing.assert_close(out, expected.view(1, 1, -1).expand_as(out), atol=1e-5, rtol=1e-5)
+
+    def test_neutral_point_and_directional_opportunity_scaling(self):
+        layer = self._make_layer()
+        mean_t = torch.tensor(self.MEAN)
+        scale_t = torch.tensor(self.SCALE)
+
+        # At raw = 0 (softplus(0)/ln(2) = 1.0) and alloc = 0.5 (opp = 1.0): phys = mean -> out = 0.0
+        raw_zero = torch.zeros(1, 22, 11)
+        alloc_half = torch.full((1, 22, 2), 0.5)
+        out_neutral = layer({'raw': raw_zero, 'alloc': alloc_half})
+        torch.testing.assert_close(out_neutral, torch.zeros_like(out_neutral), atol=1e-5, rtol=1e-5)
+
+        # Non-zero raw rates: verify doubling alloc_plays doubles ONLY play-scaled stats
+        raw = torch.randn(1, 22, 11)
+        alloc_base = torch.tensor([0.3, 0.3]).view(1, 1, 2).expand(1, 22, 2).clone()
+        alloc_2x_plays = alloc_base.clone()
+        alloc_2x_plays[..., 1] = 0.6
+
+        phys_base = layer({'raw': raw, 'alloc': alloc_base}) * scale_t + mean_t
+        phys_2x_plays = layer({'raw': raw, 'alloc': alloc_2x_plays}) * scale_t + mean_t
+
+        plays_set = {'2PM', '3PM', 'FG_MISSED', 'FTM', 'FT_MISSED', 'TOV'}
+        for idx, stat in enumerate(self.STAT_NAMES):
+            if stat in plays_set:
+                torch.testing.assert_close(phys_2x_plays[..., idx], 2.0 * phys_base[..., idx], atol=1e-5, rtol=1e-5)
+            else:
+                torch.testing.assert_close(phys_2x_plays[..., idx], phys_base[..., idx], atol=1e-5, rtol=1e-5)
+
+        # Verify doubling alloc_min doubles MIN and minute-scaled stats, leaving play-scaled stats unchanged
+        alloc_2x_min = alloc_base.clone()
+        alloc_2x_min[..., 0] = 0.6
+        phys_2x_min = layer({'raw': raw, 'alloc': alloc_2x_min}) * scale_t + mean_t
+
+        for idx, stat in enumerate(self.STAT_NAMES):
+            if stat in plays_set:
+                torch.testing.assert_close(phys_2x_min[..., idx], phys_base[..., idx], atol=1e-5, rtol=1e-5)
+            else:
+                torch.testing.assert_close(phys_2x_min[..., idx], 2.0 * phys_base[..., idx], atol=1e-5, rtol=1e-5)
+
+        # Verify MIN physical value equals 48.0 * alloc_min regardless of raw[MIN]
+        min_idx = self.STAT_NAMES.index('MIN')
+        torch.testing.assert_close(phys_base[..., min_idx], 48.0 * alloc_base[..., 0], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(phys_2x_min[..., min_idx], 48.0 * alloc_2x_min[..., 0], atol=1e-5, rtol=1e-5)
+
+    def test_update_calculate_fantasy_points_params_populates_rate_scale_head(self):
+        cfp = CalculateFantasyPointsParams(input_tensor_name='outputs_pred', stat_names=list(self.STAT_NAMES))
+        rsh = RateScaleHeadParams(
+            input_tensor_name={'raw': 'stage2_raw_rates', 'alloc': 'stage1_alloc'},
+            output_tensor_name='outputs_pred',
+            stat_names=list(self.STAT_NAMES),
+        )
+        arch = type("Arch", (), {"layer_params_list": [rsh, cfp]})()
+        params = type("Params", (), {"architecture_params": arch})()
+
+        class DummyScaler:
+            feature_names_in_ = np.array(TestRateScaleHead.STAT_NAMES)
+            mean_ = np.array(TestRateScaleHead.MEAN)
+            scale_ = np.array(TestRateScaleHead.SCALE)
+
+        combined = type("Combined", (), {
+            "machine_learning_datasets_stacked": type("Stacked", (), {
+                "datasets": {"true_label": type("DS", (), {"scaler": DummyScaler()})()}
+            })()
+        })()
+
+        update_calculate_fantasy_points_params(params=params, dataset_combined=combined)
+        self.assertEqual(cfp.scaler_mean, list(self.MEAN))
+        self.assertEqual(cfp.scaler_scale, list(self.SCALE))
+        self.assertEqual(rsh.scaler_mean, list(self.MEAN))
+        self.assertEqual(rsh.scaler_scale, list(self.SCALE))
 
 
 if __name__ == "__main__":

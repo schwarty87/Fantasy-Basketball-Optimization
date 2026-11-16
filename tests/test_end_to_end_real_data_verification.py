@@ -31,6 +31,7 @@ from machine_learning_fantasy_basketball_predictions.machine_learning_datasets i
 )
 from machine_learning_fantasy_basketball_predictions.params.layers_params import (
     CalculateFantasyPointsParams,
+    RateScaleHeadParams,
     update_calculate_fantasy_points_params,
 )
 from machine_learning_fantasy_basketball_predictions.run_model import (
@@ -336,6 +337,76 @@ class TestEndToEndRealDataVerification(unittest.TestCase):
             for j in range(i + 1, 3):
                 shared = set(best_set.loc[i, pos_cols].values) & set(best_set.loc[j, pos_cols].values)
                 self.assertLessEqual(len(shared), 4)
+
+    def test_6_real_data_team_minutes_conservation_and_multiplicative_head(self):
+        """Verify features.feather median team MIN ~240 and RateScaleHead yields conserved <=48m MIN on real scaler."""
+        real_rows = self.raw_slice_df.loc[self.raw_slice_df["PLAYER_ID"] != UNKNOWN_PLAYER_ID]
+        team_min_sums = real_rows.groupby(["GAME_ID", "TEAM_ID"])["MIN"].sum()
+        self.assertGreater(len(team_min_sums), 10)
+        self.assertLessEqual(abs(float(team_min_sums.median()) - 240.0), 5.0)
+
+        params = create_params(two_stage=True, stage2_head="multiplicative")
+        true_cols = params.features_params.feature_name_to_machine_learning_dataset_params["true_label"].feature_names
+        target_scaler = StandardScaler()
+        target_scaler.fit(real_rows[true_cols].dropna())
+        combined = type("Combined", (), {
+            "machine_learning_datasets_stacked": type("Stacked", (), {
+                "datasets": {"true_label": type("DS", (), {"scaler": target_scaler})()}
+            })()
+        })()
+        update_calculate_fantasy_points_params(params=params, dataset_combined=combined)
+
+        rsh = next(lp for lp in params.architecture_params.layer_params_list if isinstance(lp, RateScaleHeadParams))
+        self.assertEqual(rsh.scaler_mean, target_scaler.mean_.tolist())
+        self.assertEqual(rsh.scaler_scale, target_scaler.scale_.tolist())
+
+        for lp in params.architecture_params.layer_params_list:
+            if hasattr(lp, "num_embeddings"):
+                lp.num_embeddings = [100] * len(lp.embeddings_dims)
+
+        neural_layers = [
+            lp for lp in params.architecture_params.layer_params_list
+            if lp.__class__.__name__ not in ("ReshapeToSamplePerDayParams", "OptimizeTeamParams")
+            and "sample_per_day" not in getattr(lp, "output_tensor_name", "")
+        ]
+        params.architecture_params.layer_params_list = neural_layers
+        params.architecture_params.output_tensor_names = ["outputs_pred", "stage1_alloc", "fantasy_points"]
+
+        model = ModelArchitecture(
+            params=params.architecture_params,
+            feature_type_to_input_shape=params.features_params.feature_type_to_input_shape,
+        )
+        model.eval()
+
+        B, S = 2, 22
+        torch.manual_seed(99)
+        real_mask = torch.ones(B, S, 1)
+        real_mask[:, [9, 10, 20, 21], :] = 0.0
+        batch = {
+            "tabular": torch.randn(B, S, params.features_params.feature_type_to_input_shape["tabular"][-1]),
+            "lagged": torch.randn(B, S, params.features_params.feature_type_to_input_shape["lagged"][-1]),
+            "positional_encoding_features": torch.randint(
+                0, 2, (B, S, params.features_params.feature_type_to_input_shape["positional_encoding_features"][-1]), dtype=torch.long
+            ),
+            "embedding_features": torch.randint(
+                0, 50, (B, S, params.features_params.feature_type_to_input_shape["embedding_features"][-1]), dtype=torch.long
+            ),
+            "real_player_mask": real_mask,
+        }
+        with torch.no_grad():
+            outputs = model(batch)
+
+        mean_t = torch.tensor(target_scaler.mean_, dtype=torch.float32)
+        scale_t = torch.tensor(target_scaler.scale_, dtype=torch.float32)
+        phys_pred = outputs["outputs_pred"] * scale_t + mean_t
+        min_idx = true_cols.index("MIN")
+        min_pred = phys_pred[..., min_idx]
+
+        self.assertTrue((min_pred >= -1e-4).all())
+        self.assertTrue((min_pred <= 48.0 + 1e-4).all())
+        torch.testing.assert_close(min_pred[:, :11].sum(dim=-1), torch.full((B,), 240.0), atol=1e-3, rtol=1e-5)
+        torch.testing.assert_close(min_pred[:, 11:].sum(dim=-1), torch.full((B,), 240.0), atol=1e-3, rtol=1e-5)
+        torch.testing.assert_close(phys_pred[:, [9, 10, 20, 21], :], torch.zeros(B, 4, len(true_cols)), atol=1e-4, rtol=1e-5)
 
 
 if __name__ == "__main__":
