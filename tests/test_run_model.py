@@ -6,6 +6,7 @@ import datetime
 import tempfile
 import shutil
 
+from compare_models import average_prediction_dfs, compute_mde, paired_bootstrap_test
 from utils import sharpe
 from machine_learning_fantasy_basketball_predictions.run_model import RunModelFantasyBasketballPredictions
 from machine_learning.enums import DataSplitType
@@ -280,6 +281,118 @@ class TestBacktestEvaluatorRawPoints(unittest.TestCase):
             self.assertAlmostEqual(result.loc['TEST', 'mean_score_paid'], 360.0, places=5)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_per_contest_top10_pct_profit_9x_accuracy_and_dropped_salaried(self):
+        """Verify per-contest top10_pct, 9x payout, salary-tier biases, min_mae_sal, and dropped salaried count."""
+        d1 = datetime.date(2023, 1, 1)
+        # 60 real players on D1:
+        # - 1..8 selected starters (sal=25, MIN_pred=35, MIN_true=33, raw_FP=45, pred_FP=46) -> bias=+1.0
+        # - 9..30 sal=12 low-tier (MIN_pred=15, MIN_true=17, raw_FP=10, pred_FP=8) -> bias=-2.0
+        # - 31..60 sal=35 high-tier (MIN_pred=32, MIN_true=30, raw_FP=40, pred_FP=37) -> bias=-3.0
+        player_ids = list(range(1, 61))
+        positions = [1, 2, 3, 4, 5, 1, 3, 5] + [1] * 52
+        salaries = [25.0] * 8 + [12.0] * 22 + [35.0] * 30
+        preds_fp = [50.0] * 8 + [8.0] * 22 + [37.0] * 30  # lineup picks 1..8 (8*25=200), avg pred=50 -> bias=+5 on selected
+        raw_fp = [45.0] * 8 + [10.0] * 22 + [40.0] * 30
+        min_pred = [35.0] * 8 + [15.0] * 22 + [32.0] * 30
+        min_true = [33.0] * 8 + [17.0] * 22 + [30.0] * 30
+
+        predict_df = pd.DataFrame({
+            'DATE': [d1] * 60,
+            'PLAYER_ID': player_ids,
+            'YAHOO_POSITION': positions,
+            'YAHOO_SALARY': salaries,
+            'YAHOO_POINTS_pred': preds_fp,
+            'YAHOO_POINTS_true': raw_fp,
+            'MIN_pred': min_pred,
+            'MIN_true': min_true,
+            'NOT_IGNORE': [1] * 60,
+            'split_type': ['TEST'] * 60,
+        })
+        # Player stats has players 1..60 PLUS 1 dropped active $20 player (id=999, MIN=25, IS_OUT=False)
+        # AND 1 inactive OUT $25 player (id=998, MIN=0, IS_OUT=True -> must NOT be counted as dropped)
+        player_stats_df = pd.DataFrame({
+            'DATE': [d1] * 62,
+            'PLAYER_ID': player_ids + [999, 998],
+            'YAHOO_POINTS': raw_fp + [20.0, 0.0],
+            'YAHOO_SALARY': salaries + [20.0, 25.0],
+            'YAHOO_POSITION': positions + [1, 1],
+            'MIN': min_true + [25.0, 0.0],
+            'IS_OUT': [False] * 60 + [False, True],
+        })
+        # Two paid contests on D1 (lineup score = 8 * 45 = 360.0):
+        # - contest 2001: beats all 10 entries -> percentile=1.0 (Top-10% WIN: +8.0)
+        # - contest 2002: beats 7/10 entries -> percentile=0.7 (Top-10% LOSS: -1.0, 50/50 WIN: +0.8)
+        # Daily avg percentile = 0.85 (< 0.90), so per-contest top10_pct MUST be 0.5 (not 0.0)!
+        contests_df = pd.DataFrame({
+            'DATE': [d1] * 20,
+            'contestId': [2001] * 10 + [2002] * 10,
+            'entry_fee': [5.0] * 20,
+            'score': [300.0] * 10 + [300.0] * 7 + [380.0] * 3,
+        })
+
+        eval_res, details = RunModelFantasyBasketballPredictions.evaluate_predictions_df(
+            predict_results=predict_df,
+            contests_df=contests_df,
+            player_stats_df=player_stats_df,
+            return_details=True,
+        )
+
+        self.assertAlmostEqual(eval_res.loc['TEST', 'top10_pct_paid'], 0.5, places=5)
+        self.assertAlmostEqual(eval_res.loc['TEST', 'mean_profit_top10_9x_paid'], 3.5, places=5)  # (8 - 1) / 2
+        self.assertEqual(eval_res.loc['TEST', 'portfolio_value_top10_9x_paid'], [3.5])
+        self.assertEqual(eval_res.loc['TEST', 'n_contests_paid'], 2)
+        self.assertEqual(eval_res.loc['TEST', 'n_contest_dates_paid'], 1)
+        self.assertEqual(eval_res.loc['TEST', 'n_dropped_salaried_players'], 1)
+
+        # Tier biases & MIN MAE
+        self.assertAlmostEqual(eval_res.loc['TEST', 'fp_bias_sal_le_15'], -2.0, places=5)
+        self.assertAlmostEqual(eval_res.loc['TEST', 'fp_bias_sal_16_30'], 5.0, places=5)
+        self.assertAlmostEqual(eval_res.loc['TEST', 'fp_bias_sal_gt_30'], -3.0, places=5)
+        self.assertAlmostEqual(eval_res.loc['TEST', 'min_mae_sal'], 2.0, places=5)
+        expected_rmse = float(np.sqrt((8 * 25 + 22 * 4 + 30 * 9) / 60))
+        self.assertAlmostEqual(eval_res.loc['TEST', 'fp_rmse_raw'], expected_rmse, places=5)
+        self.assertEqual(len(details['percentile_per_contest']), 2)
+
+    def test_compare_models_average_prediction_dfs_bootstrap_and_mde(self):
+        """Verify physical seed prediction averaging, alignment checks, paired bootstrap, and MDE."""
+        d1 = datetime.date(2024, 1, 1)
+        df1 = pd.DataFrame({
+            'DATE': [d1, d1],
+            'PLAYER_ID': [10, 20],
+            'split_type': ['VALIDATION', 'VALIDATION'],
+            'YAHOO_POINTS_pred': [30.0, 20.0],
+            'MIN_pred': [32.0, 22.0],
+            'YAHOO_POINTS_true': [35.0, 18.0],
+        })
+        # Reverse row order to test deterministic sorting alignment
+        df2 = pd.DataFrame({
+            'DATE': [d1, d1],
+            'PLAYER_ID': [20, 10],
+            'split_type': ['VALIDATION', 'VALIDATION'],
+            'YAHOO_POINTS_pred': [24.0, 34.0],
+            'MIN_pred': [26.0, 36.0],
+            'YAHOO_POINTS_true': [18.0, 35.0],
+        })
+        avg_df = average_prediction_dfs([df1, df2])
+        self.assertEqual(list(avg_df['PLAYER_ID']), [10, 20])
+        self.assertAlmostEqual(float(avg_df.loc[0, 'YAHOO_POINTS_pred']), 32.0, places=5)
+        self.assertAlmostEqual(float(avg_df.loc[1, 'YAHOO_POINTS_pred']), 22.0, places=5)
+        self.assertAlmostEqual(float(avg_df.loc[0, 'MIN_pred']), 34.0, places=5)
+        self.assertEqual(list(avg_df['YAHOO_POINTS_true']), [35.0, 18.0])
+
+        df_bad = df2.copy()
+        df_bad.loc[0, 'PLAYER_ID'] = 999
+        with self.assertRaises(ValueError):
+            average_prediction_dfs([df1, df_bad])
+
+        a = [10.0] * 30
+        b = [12.0 if i % 2 == 0 else 11.0 for i in range(30)]
+        boot = paired_bootstrap_test(a, b, n_resamples=2000, seed=7)
+        self.assertEqual(boot['n'], 30)
+        self.assertAlmostEqual(boot['mean_diff'], 1.5, places=5)
+        self.assertLess(boot['p_value'], 0.01)
+        self.assertAlmostEqual(boot['mde_80'], compute_mde(boot['se']), places=5)
 
 
 if __name__ == '__main__':

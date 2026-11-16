@@ -125,7 +125,10 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
             if all_preds.size > 0:
                 all_preds = scaler.inverse_transform(all_preds)
             if all_trues.size > 0:
-                all_trues = np.where(all_trues != IGNORE, scaler.inverse_transform(all_trues), IGNORE)
+                should_unscale_true = all_trues != IGNORE
+                if all_masks.size > 0 and all_masks.shape[0] == all_trues.shape[0]:
+                    should_unscale_true = should_unscale_true & (all_masks > 0)
+                all_trues = np.where(should_unscale_true, scaler.inverse_transform(all_trues), all_trues)
 
         target_stats = self.params.features_params.feature_name_to_machine_learning_dataset_params[
             "true_label"

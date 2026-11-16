@@ -339,6 +339,15 @@ class CollectTruePredictedOutputs(AbstractCallback):
             raise FileNotFoundError(f"Expected scaler directory does not exist: {scaler_dir}")
 
         applied_any_scaler = False
+        keep_mask_cols = list((getattr(self.params, 'column_names', None) or {}).get('keep_mask', []))
+        if not keep_mask_cols and 'NOT_IGNORE' in results_df.columns:
+            keep_mask_cols = ['NOT_IGNORE']
+        present_mask_cols = [c for c in keep_mask_cols if c in results_df.columns]
+        keep_mask = (
+            (results_df[present_mask_cols].to_numpy() > 0).all(axis=1, keepdims=True)
+            if present_mask_cols
+            else None
+        )
         for tensor_name in self.params.all_tensor_names:
             scaler_path = os.path.join(scaler_dir, f'{tensor_name}.pkl')
             if os.path.isfile(scaler_path):
@@ -350,10 +359,14 @@ class CollectTruePredictedOutputs(AbstractCallback):
                     if num_in_df > 0:
                         if num_in_df < len(cols):
                             raise ValueError(f'not all scaler features are in results_df {tt}!')
+                        raw_vals = results_df[cols].values
+                        should_unscale = raw_vals != IGNORE
+                        if tt == 'true' and keep_mask is not None:
+                            should_unscale = should_unscale & keep_mask
                         results_df[cols] = np.where(
-                            results_df[cols] != IGNORE,
-                            scaler.inverse_transform(results_df[cols].values),
-                            IGNORE,
+                            should_unscale,
+                            scaler.inverse_transform(raw_vals),
+                            raw_vals,
                         )
                         applied_any_scaler = True
             elif self.params.scaler_dir is not None and tensor_name == 'true_label':

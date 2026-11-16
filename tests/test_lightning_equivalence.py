@@ -336,7 +336,8 @@ class TestLightningEquivalence(unittest.TestCase):
         runner.data_loaders = {DataSplitType.TRAIN: MagicMock(), DataSplitType.VALIDATION: MagicMock()}
         runner.train()
 
-        mock_seed_everything.assert_called_once_with(12345, workers=True)
+        self.assertEqual(mock_seed_everything.call_count, 2)
+        mock_seed_everything.assert_called_with(12345, workers=True)
 
     @patch("machine_learning.run_model.models_dir")
     @patch("machine_learning.run_model.get_next_model_id")

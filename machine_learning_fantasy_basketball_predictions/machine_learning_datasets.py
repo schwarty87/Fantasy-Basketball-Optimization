@@ -8,7 +8,7 @@ from typing import Dict, List, Sequence, Any
 from torch.utils.data import Sampler, Subset, DataLoader
 
 from constants import START_POSITIONS, UNKNOWN_PLAYER_ID, IGNORE_VAL, POSITION_TO_NUM
-from utils import get_current_date, get_current_time
+from utils import get_current_date, get_current_time, convert_date_col_to_date
 from machine_learning.constants import METADATA
 from machine_learning.enums import DataSplitType
 from machine_learning.machine_learning_datasets import (
@@ -99,7 +99,16 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
             df['SITE_POSITION'] = df['SITE_POSITION'].fillna(3.0).astype(np.float32)
             rounded_pos = df['SITE_POSITION'].round().clip(1, 5).astype(np.int32)
             df['SITE_POSITION_ROUNDED'] = rounded_pos
-            df['COURT_POSITION'] = rounded_pos
+            court_pos = rounded_pos.copy()
+            if 'START_POSITION' in df.columns:
+                mapped_start = df['START_POSITION'].map(POSITION_TO_NUM)
+                if 'STARTER' in df.columns:
+                    is_starter = df['STARTER'].fillna(0.0).astype(np.float32) > 0
+                    use_start = is_starter & mapped_start.notna()
+                else:
+                    use_start = mapped_start.notna()
+                court_pos = court_pos.where(~use_start, mapped_start).astype(np.int32)
+            df['COURT_POSITION'] = court_pos
 
         df = self._add_player_history_columns(df, self.params)
 
@@ -207,15 +216,16 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
         if len(sort_cols) >= 2:
             df = df.sort_values(sort_cols).reset_index(drop=True)
 
-        # 1. Mean ratios (e.g. PTS_mean_ratio = PTS / PTS_mean5)
+        # 1. Mean ratios (strictly causal: previous game base stat / PTS_mean5)
         for c in missing_ratios:
             base_name = c.replace('_mean_ratio', '')
             mean_name = base_name + '_mean5'
             if base_name in df.columns and mean_name in df.columns:
-                ratio = df[base_name] / df[mean_name]
-                ratio = ratio.clip(upper=10.0)
-                ratio.loc[(df[mean_name] == 0) & (df[base_name] == 0)] = 1.0
-                ratio.loc[(df[mean_name] == 0) & (df[base_name] != 0)] = 10.0
+                prior_val = df.groupby('PLAYER_ID')[base_name].shift(1) if 'PLAYER_ID' in df.columns else df[base_name]
+                ratio = (prior_val / df[mean_name]).clip(upper=10.0)
+                ratio = ratio.mask((df[mean_name] == 0) & (prior_val == 0), 1.0)
+                ratio = ratio.mask((df[mean_name] == 0) & (prior_val != 0), 10.0)
+                ratio = ratio.mask(prior_val.isna(), 1.0)
                 df[c] = ratio.fillna(1.0).astype(np.float32)
 
         # 2. Lagged features (e.g. *_t-{lag})
@@ -249,8 +259,24 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                     if c in df.columns
                 ]
                 if role_cols:
-                    role_means = stats_df.groupby([df[c] for c in role_cols]).transform('mean')
-                    lagged = lagged.fillna(role_means)
+                    valid_role_mask = pd.Series(True, index=df.index)
+                    if 'DATE' in df.columns:
+                        valid_role_mask &= convert_date_col_to_date(df['DATE']) < get_current_date()
+                    if 'EJECTED' in df.columns:
+                        valid_role_mask &= ~df['EJECTED'].fillna(False).astype(bool)
+                    if 'LEFT_MIDGAME' in df.columns:
+                        valid_role_mask &= ~df['LEFT_MIDGAME'].fillna(False).astype(bool)
+
+                    role_source = stats_df.loc[valid_role_mask]
+                    if not role_source.empty:
+                        key_cols = [f'__role_key_{i}' for i in range(len(role_cols))]
+                        role_keys = [df.loc[valid_role_mask, c].rename(k) for c, k in zip(role_cols, key_cols)]
+                        role_table = role_source.groupby(role_keys)[stats].mean().reset_index()
+                        left_keys = df[role_cols].copy()
+                        left_keys.columns = key_cols
+                        role_means_df = left_keys.merge(role_table, on=key_cols, how='left', sort=False)
+                        role_means_df.index = df.index
+                        lagged = lagged.fillna(role_means_df[stats])
                 lagged = lagged.fillna(0.0)
                 prev_lag_df = lagged.copy()
 
@@ -283,11 +309,18 @@ class MachineLearningDatasetCombinedFantasyBasketballPredictions(MachineLearning
                                       ) -> Dict[str, int | Sampler]:
         num_days_per_batch = self.training_params.num_days_per_batch
         if num_days_per_batch and num_days_per_batch > 0 and self._original_index_to_date is not None:
+            raw_seed = getattr(self.training_params, 'seed', None)
+            sampler_seed = (
+                int(raw_seed)
+                if isinstance(raw_seed, (int, np.integer)) and not isinstance(raw_seed, bool)
+                else 42
+            )
             # Use the custom ByDateBatchSampler
             return {'batch_sampler': ByDateBatchSampler(subset_dataset=machine_learning_datasets_stacked_subset,
                                                         original_index_to_date_map=self._original_index_to_date,
                                                         num_days_per_batch=num_days_per_batch,
-                                                        shuffle=shuffle
+                                                        shuffle=shuffle,
+                                                        seed=sampler_seed
                                                         )
                     }
         return super()._get_data_loader_batch_kwargs(batch_size=batch_size, shuffle=shuffle,

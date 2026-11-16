@@ -62,13 +62,14 @@ class TestPreGridFeaturesAndLags(unittest.TestCase):
         self.assertEqual(res.loc[res['GAME_ID'] == 3, 'MIN_t-2'].iloc[0], 25.0)
 
     def test_mean_ratio_calculation(self):
+        # Strictly causal: _mean_ratio at game t uses player's game t-1 stat / PTS_mean5 (debut -> 1.0)
         df = pd.DataFrame({
-            'DATE': [datetime.date(2023, 1, 1)] * 4,
-            'GAME_ID': [1] * 4,
-            'TEAM_ID': [1] * 4,
-            'PLAYER_ID': [1, 2, 3, 4],
-            'PTS': [20.0, 30.0, 0.0, 15.0],
-            'PTS_mean5': [10.0, 2.0, 0.0, 0.0],  # normal (2.0), clamped (>10), 0/0 (1.0), x/0 (10.0)
+            'DATE': [datetime.date(2023, 1, 1)] * 4 + [datetime.date(2023, 1, 3)] * 4,
+            'GAME_ID': [1] * 4 + [2] * 4,
+            'TEAM_ID': [1] * 8,
+            'PLAYER_ID': [1, 2, 3, 4] * 2,
+            'PTS': [20.0, 30.0, 0.0, 15.0, 99.0, 1.0, 0.0, 2.0],
+            'PTS_mean5': [10.0, 10.0, 10.0, 10.0, 10.0, 2.0, 0.0, 0.0],
         })
         params = FeaturesParamsFantasyBasketballPredictions(
             feature_name_to_machine_learning_dataset_params={
@@ -78,10 +79,52 @@ class TestPreGridFeaturesAndLags(unittest.TestCase):
         res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df, params)
 
         self.assertIn('PTS_mean_ratio', res.columns)
-        self.assertEqual(res.loc[res['PLAYER_ID'] == 1, 'PTS_mean_ratio'].iloc[0], 2.0)
-        self.assertEqual(res.loc[res['PLAYER_ID'] == 2, 'PTS_mean_ratio'].iloc[0], 10.0)  # clamped
-        self.assertEqual(res.loc[res['PLAYER_ID'] == 3, 'PTS_mean_ratio'].iloc[0], 1.0)   # 0 / 0 -> 1.0
-        self.assertEqual(res.loc[res['PLAYER_ID'] == 4, 'PTS_mean_ratio'].iloc[0], 10.0)  # x / 0 -> 10.0
+        # Game 1 debuts default cleanly to 1.0
+        g1 = res[res['GAME_ID'] == 1]
+        self.assertTrue((g1['PTS_mean_ratio'] == 1.0).all())
+        # Game 2 uses game 1 PTS (normal 20/10=2.0, clamped >10, 0/0->1.0, x/0->10.0)
+        g2 = res[res['GAME_ID'] == 2]
+        self.assertEqual(g2.loc[g2['PLAYER_ID'] == 1, 'PTS_mean_ratio'].iloc[0], 2.0)
+        self.assertEqual(g2.loc[g2['PLAYER_ID'] == 2, 'PTS_mean_ratio'].iloc[0], 10.0)
+        self.assertEqual(g2.loc[g2['PLAYER_ID'] == 3, 'PTS_mean_ratio'].iloc[0], 1.0)
+        self.assertEqual(g2.loc[g2['PLAYER_ID'] == 4, 'PTS_mean_ratio'].iloc[0], 10.0)
+
+        # Changing game 2's own PTS must have zero effect on game 2's PTS_mean_ratio
+        df_mut = df.copy()
+        df_mut.loc[df_mut['GAME_ID'] == 2, 'PTS'] = [5.0, 5.0, 50.0, 0.0]
+        res_mut = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df_mut, params)
+        pd.testing.assert_series_equal(res['PTS_mean_ratio'], res_mut['PTS_mean_ratio'])
+
+    def test_court_position_uses_starter_position_without_changing_site_position_rounded(self):
+        """Verify COURT_POSITION uses START_POSITION on starters while SITE_POSITION_ROUNDED stays unchanged."""
+        params = FeaturesParamsFantasyBasketballPredictions(
+            feature_name_to_machine_learning_dataset_params={
+                'positional_encoding_features': unittest.mock.MagicMock(feature_names=['HOME', 'COURT_POSITION']),
+            }
+        )
+        self.assertTrue({'SITE_POSITION', 'START_POSITION', 'STARTER'}.issubset(set(params.all_feature_names_list)))
+
+        raw_df = pd.DataFrame({
+            'STARTER': [True, False, True],
+            'START_POSITION': ['C', '', None],
+            'SITE_POSITION': [2.2, 4.1, 1.8],  # rounded: [2 (SG), 4 (PF), 2 (SG)]
+            'YAHOO_POSITION': ['SG', 'PF', 'SG'],
+        })
+        dummy_ds = unittest.mock.MagicMock(spec=MachineLearningDatasetCombinedFantasyBasketballPredictions)
+        dummy_ds.params = params
+        dummy_ds._add_player_history_columns = (
+            MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns
+        )
+        with unittest.mock.patch(
+            'machine_learning.machine_learning_datasets.MachineLearningDatasetCombined._load_features',
+            return_value=raw_df.copy(),
+        ):
+            out = MachineLearningDatasetCombinedFantasyBasketballPredictions._load_features(dummy_ds)
+
+        # SITE_POSITION_ROUNDED stays strictly rounded(SITE_POSITION)
+        self.assertEqual(list(out['SITE_POSITION_ROUNDED']), [2, 4, 2])
+        # Starter with valid START_POSITION='C' gets 5; bench and missing START_POSITION fall back to SITE_POSITION_ROUNDED
+        self.assertEqual(list(out['COURT_POSITION']), [5, 4, 2])
 
     def test_role_promotion_uses_strict_chronological_lag_and_preserves_role_change(self):
         """Verify spot-start promotion after bench game pulls t-1 from the bench game and preserves STARTER_t-1 == 0.0."""

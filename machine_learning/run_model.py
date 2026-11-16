@@ -2,6 +2,7 @@ import os
 import contextlib
 import copy
 import logging
+import random
 import torch
 import torch.nn as nn
 import numpy as np
@@ -43,11 +44,15 @@ OPTIMIZER_TYPE = Optional[torch.optim.Optimizer]
 
 class RunModel:
     def __init__(self, params: MachineLearningParams, project_name: str, description: Optional[str] = None,
-                 use_lightning: bool = False):
+                 use_lightning: Optional[bool] = None):
         self.params = params
         self.project_name = project_name
         self._description = description
-        self.use_lightning = use_lightning
+        if use_lightning is None:
+            tp = getattr(params, "training_params", None)
+            saved_flag = getattr(tp, "use_lightning", None)
+            use_lightning = saved_flag if isinstance(saved_flag, bool) else False
+        self.use_lightning = bool(use_lightning)
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -67,6 +72,7 @@ class RunModel:
         else:
             self._continue_model_dir = None
 
+        self._apply_seed()
         self.create_data_loaders()
         self.update_categorical_params()
         self._create_model()
@@ -156,18 +162,24 @@ class RunModel:
                 batch_size=self.params.training_params.batch_size,
                 num_workers=self.params.training_params.dataloader_num_workers)
 
-    def _find_checkpoint_path(self, model_dir: Optional[str]) -> Optional[str]:
+    def _find_checkpoint_path(self, model_dir: Optional[str], prefer_last: bool = False) -> Optional[str]:
         if not model_dir or not os.path.isdir(model_dir):
             return None
         last_ckpt = os.path.join(model_dir, "last.ckpt")
-        if os.path.isfile(last_ckpt):
+        if prefer_last and os.path.isfile(last_ckpt):
             return last_ckpt
-        ckpts = [os.path.join(model_dir, f) for f in os.listdir(model_dir) if f.endswith(".ckpt")]
+        ckpts = [
+            os.path.join(model_dir, f)
+            for f in os.listdir(model_dir)
+            if f.endswith(".ckpt") and f != "last.ckpt"
+        ]
         if ckpts:
             return sorted(ckpts)[-1]
         model_pt = os.path.join(model_dir, "model.pt")
         if os.path.isfile(model_pt):
             return model_pt
+        if os.path.isfile(last_ckpt):
+            return last_ckpt
         return None
 
     def _load_lightning_checkpoint_weights(self):
@@ -388,6 +400,13 @@ class RunModel:
             loss.backward()
 
             if self._should_update_optimizer(batch_num=batch_num):
+                grad_clip = getattr(getattr(self.params, "training_params", None), "gradient_clip_val", None)
+                if (
+                    isinstance(grad_clip, (int, float, np.integer, np.floating))
+                    and not isinstance(grad_clip, bool)
+                    and float(grad_clip) > 0
+                ):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(grad_clip))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -483,18 +502,23 @@ class RunModel:
                ((self.params.training_params.num_epochs is not None) and
                 (epoch_num >= (self.params.training_params.num_epochs - 1)))
 
+    def _apply_seed(self) -> None:
+        seed = getattr(getattr(self.params, "training_params", None), "seed", None)
+        if isinstance(seed, (int, np.integer)) and not isinstance(seed, bool):
+            seed_int = int(seed)
+            if self.use_lightning:
+                pl.seed_everything(seed_int, workers=True)
+            else:
+                random.seed(seed_int)
+                torch.manual_seed(seed_int)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_int)
+                np.random.seed(seed_int)
+
     def train(self, trainer_cls=None, torch_save=None, precision=None):
         # NOTE: model_id / _model_dir are initialized once in __init__. Re-deriving them here would make
         # get_next_model_id() see the dir __init__ just created and return model_id + 1.
-        seed = getattr(self.params.training_params, "seed", None)
-        if seed is not None and type(seed).__name__ != "MagicMock":
-            if self.use_lightning:
-                pl.seed_everything(seed, workers=True)
-            else:
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
-                np.random.seed(seed)
+        self._apply_seed()
 
         # Shared pre-training persistence of transformers and params
         if hasattr(self, "data_module") and hasattr(self.data_module, "save_transformers"):
@@ -502,6 +526,9 @@ class RunModel:
         elif hasattr(self, "data_loaders"):
             MachineLearningDatasetCombined.save_transformers(data_loader=self.data_loaders, save_dir=self._model_dir)
 
+        tp = getattr(self.params, "training_params", None)
+        if tp is not None and type(tp).__name__ != "MagicMock" and hasattr(tp, "use_lightning"):
+            tp.use_lightning = self.use_lightning
         self.params.save_to_json(os.path.join(self._model_dir, "params.json"))
 
         if self.use_lightning:
@@ -558,7 +585,7 @@ class RunModel:
 
             ckpt_path = None
             if self.params.continue_model_id is not None and getattr(self, "_continue_model_dir", None):
-                found_ckpt = self._find_checkpoint_path(self._continue_model_dir)
+                found_ckpt = self._find_checkpoint_path(self._continue_model_dir, prefer_last=True)
                 if found_ckpt and found_ckpt.endswith(".ckpt"):
                     ckpt_path = found_ckpt
 
@@ -619,6 +646,12 @@ class RunModel:
             except Exception as e:
                 logging.warning(f"Could not save legacy model.pt: {e}")
 
+            exp = getattr(logger, "_experiment", None)
+            if exp is not None and hasattr(exp, "close"):
+                exp.close()
+            if hasattr(logger, "finalize"):
+                logger.finalize("success")
+
             return
 
         optimizer = self._define_optimizer()
@@ -677,6 +710,8 @@ class RunModel:
             logging.exception(f'Error during model training for model {self.model_id}: {e}')
             raise
         finally:
+            summary_writer_train.close()
+            summary_writer_validation.close()
             model_checkpoint = [c for c in callbacks.callbacks if isinstance(c, ModelCheckpoint)]
             epochs = epoch_num if len(model_checkpoint) == 0 else model_checkpoint[0].best_epoch
             self._save_data_to_db(epochs=epochs)

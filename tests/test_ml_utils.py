@@ -12,7 +12,11 @@ from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 
+from torch.utils.data import Subset, TensorDataset
+
 from constants import IGNORE_VAL, Sites, START_POSITIONS, UNKNOWN_PLAYER_ID
+from machine_learning_fantasy_basketball_predictions.samplers import ByDateBatchSampler
+from utils import convert_date_col_to_date, get_current_date
 from machine_learning.callbacks import CollectTruePredictedOutputs, CollectTruePredictedOutputsParams
 from machine_learning.constants import IGNORE, METADATA
 from machine_learning.enums import Reduction, ModelMode, DataSplitType
@@ -49,7 +53,7 @@ from machine_learning.params.machine_learning_dataset_params import (
     MachineLearningDatasetTabularScalingParams,
 )
 from machine_learning.lightning_model import MachineLearningLightningModule
-from machine_learning.params.params import FeaturesParams, TrainingParams
+from machine_learning.params.params import FeaturesParams, MachineLearningParams, TrainingParams
 from machine_learning.run_model import RunModel
 from machine_learning.utils import CustomOrdinalEncoder, get_next_model_id
 from machine_learning_fantasy_basketball_predictions.layers import (
@@ -76,7 +80,6 @@ from machine_learning_fantasy_basketball_predictions.params.params import (
     FeaturesParamsFantasyBasketballPredictions,
 )
 from run_all import create_params
-from utils import convert_date_col_to_date
 
 
 class DummyLegacyModel(nn.Module):
@@ -500,6 +503,23 @@ class TestEmbeddingsLayerPaddingAndRetrofit(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             RunModel._load_lightning_checkpoint_weights(runner)
 
+    def test_find_checkpoint_path_prefers_best_over_last_for_inference(self):
+        """Verify _find_checkpoint_path uses best ckpt for inference (prefer_last=False) and last.ckpt for resume."""
+        best_ckpt = os.path.join(self.temp_dir, "model_epoch=06_val_loss=0.662.ckpt")
+        last_ckpt = os.path.join(self.temp_dir, "last.ckpt")
+        model_pt = os.path.join(self.temp_dir, "model.pt")
+        for p in (best_ckpt, last_ckpt, model_pt):
+            with open(p, "w") as f:
+                f.write("x")
+
+        runner = MagicMock(spec=RunModel)
+        self.assertEqual(RunModel._find_checkpoint_path(runner, self.temp_dir), best_ckpt)
+        self.assertEqual(RunModel._find_checkpoint_path(runner, self.temp_dir, prefer_last=True), last_ckpt)
+
+        os.remove(best_ckpt)
+        self.assertEqual(RunModel._find_checkpoint_path(runner, self.temp_dir), model_pt)
+        self.assertEqual(RunModel._find_checkpoint_path(runner, self.temp_dir, prefer_last=True), last_ckpt)
+
 
 class TestCalculateFantasyPointsUnscaling(unittest.TestCase):
     def test_unscaling_with_scaler_buffers(self):
@@ -905,12 +925,32 @@ class TestRegularizationAndWeightDecay(unittest.TestCase):
         """Verify TrainingParams default weight_decay=1e-2 and validation."""
         tp = TrainingParams(learning_rate=0.001)
         self.assertEqual(tp.weight_decay, 1e-2)
+        self.assertIsNone(tp.use_lightning)
 
-        tp_custom = TrainingParams(learning_rate=0.001, weight_decay=1e-3)
+        tp_custom = TrainingParams(learning_rate=0.001, weight_decay=1e-3, use_lightning=True)
         self.assertEqual(tp_custom.weight_decay, 1e-3)
+        self.assertTrue(tp_custom.use_lightning)
+        reloaded = TrainingParams.init_from_dict(tp_custom.to_dict())
+        self.assertTrue(reloaded.use_lightning)
 
         with self.assertRaises(ValueError):
             TrainingParams(learning_rate=0.001, weight_decay=-0.01)
+
+    def test_run_model_resolves_use_lightning_from_params_and_allows_override(self):
+        """Verify RunModel uses params.training_params.use_lightning when use_lightning is omitted, unless overridden."""
+        p_true = MachineLearningParams(training_params=TrainingParams(learning_rate=0.001, use_lightning=True))
+
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("machine_learning.run_model.models_dir", return_value=tmp_dir), \
+             patch("machine_learning.run_model.get_next_model_id", return_value=77), \
+             patch("machine_learning.run_model.RunModel.create_data_loaders"), \
+             patch("machine_learning.run_model.RunModel.update_categorical_params"), \
+             patch("machine_learning.run_model.RunModel._create_model"):
+            r_auto = RunModel(params=p_true, project_name="test_proj")
+            self.assertTrue(r_auto.use_lightning)
+
+            r_override = RunModel(params=p_true, project_name="test_proj", use_lightning=False)
+            self.assertFalse(r_override.use_lightning)
 
     def test_uniform_weight_decay_in_lightning_and_legacy_optimizers(self):
         """Verify both Lightning and legacy optimizers apply weight_decay=1e-2 uniformly across all parameters."""
@@ -1470,6 +1510,165 @@ class TestFPLossAlignment(unittest.TestCase):
                 self.assertTrue(torch.isfinite(preds_stat.grad).all())
                 # Masked dummy rows must receive exact zero gradient
                 self.assertTrue(torch.equal(preds_stat.grad[:, -2:, :], torch.zeros_like(preds_stat.grad[:, -2:, :])))
+
+
+class TestCL5SeedGradClipUnscaleAndDebutGuards(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @patch("machine_learning.run_model.models_dir")
+    @patch("machine_learning.run_model.get_next_model_id")
+    def test_run_model_seed_varies_initial_weights_and_by_date_sampler(
+        self, mock_get_next_model_id, mock_models_dir
+    ):
+        """Verify RunModel._apply_seed seeds initial model weights and ByDateBatchSampler respects seed."""
+        mock_models_dir.return_value = self.temp_dir
+        mock_get_next_model_id.side_effect = [1, 2, 3]
+
+        def _init_runner_with_seed(seed_val: int):
+            p = create_params()
+            p.training_params.seed = seed_val
+            for lp in p.architecture_params.layer_params_list:
+                if hasattr(lp, "embeddings_dims") and hasattr(lp, "num_embeddings"):
+                    lp.num_embeddings = [20] * len(lp.embeddings_dims)
+            with patch("machine_learning.run_model.RunModel.create_data_loaders"), \
+                 patch("machine_learning.run_model.RunModel.update_categorical_params"):
+                runner = RunModel(params=p, project_name="test_proj", use_lightning=True)
+            return [w.detach().clone() for w in runner.model.parameters()]
+
+        w_42_a = _init_runner_with_seed(42)
+        w_42_b = _init_runner_with_seed(42)
+        w_43 = _init_runner_with_seed(43)
+
+        for a, b in zip(w_42_a, w_42_b):
+            self.assertTrue(torch.equal(a, b))
+        self.assertTrue(any(not torch.equal(a, c) for a, c in zip(w_42_a, w_43)))
+
+        # ByDateBatchSampler respects seed while remaining deterministic for equal seeds
+        ds = TensorDataset(torch.arange(16))
+        subset = Subset(ds, list(range(16)))
+        date_map = np.arange(16)
+        s_42_a = list(ByDateBatchSampler(subset, date_map, num_days_per_batch=2, shuffle=True, seed=42))
+        s_42_b = list(ByDateBatchSampler(subset, date_map, num_days_per_batch=2, shuffle=True, seed=42))
+        s_43 = list(ByDateBatchSampler(subset, date_map, num_days_per_batch=2, shuffle=True, seed=43))
+        self.assertEqual(s_42_a, s_42_b)
+        self.assertNotEqual(s_42_a, s_43)
+
+    def test_legacy_run_batch_applies_gradient_clip_val(self):
+        """Verify legacy RunModel._run_batch clips gradients when gradient_clip_val is configured."""
+        runner = MagicMock(spec=RunModel)
+        runner.device = torch.device("cpu")
+        runner.use_lightning = False
+        runner._machine_learning_datasets_combined_class = RunModel._machine_learning_datasets_combined_class
+
+        params = create_params()
+        params.training_params.gradient_clip_val = 0.5
+        params.architecture_params.all_layer_input_tensor_names = ["x"]
+        runner.params = params
+        runner._all_tensor_names_for_losses_metrics_callbacks = ["x", "y"]
+        runner._should_update_optimizer.return_value = True
+
+        model = nn.Linear(4, 1)
+        with torch.no_grad():
+            model.weight.fill_(10.0)
+            model.bias.zero_()
+        runner.model = model
+        runner.model.train()
+
+        recorded_norms = []
+        orig_step = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        class RecordingOpt:
+            def step(self):
+                total_norm = torch.sqrt(sum((p.grad ** 2).sum() for p in model.parameters())).item()
+                recorded_norms.append(total_norm)
+                orig_step.step()
+
+            def zero_grad(self, set_to_none=True):
+                orig_step.zero_grad(set_to_none=set_to_none)
+
+        batch_data = {"x": torch.full((2, 4), 100.0), "y": torch.zeros((2, 1))}
+        loss_fn = lambda all_tensors: ((all_tensors["pred"] - all_tensors["y"]) ** 2).mean()
+        runner.model = lambda inp: {"pred": model(inp["x"])}
+        runner.model.training = True
+        runner.model.parameters = model.parameters
+
+        metrics = MagicMock()
+        callbacks = MagicMock()
+
+        RunModel._run_batch(
+            runner,
+            training_mode=ModelMode.TRAIN,
+            batch_num=0,
+            batch_data=batch_data,
+            callbacks=callbacks,
+            metrics=metrics,
+            loss_function=loss_fn,
+            optimizer=RecordingOpt(),
+        )
+        self.assertEqual(len(recorded_norms), 1)
+        self.assertLessEqual(recorded_norms[0], 0.5 + 1e-4)
+
+    def test_collect_true_predicted_outputs_skips_unscaling_midgame_exits_and_dummies(self):
+        """Verify CollectTruePredictedOutputs leaves midgame-exit MIN_true=8.0 and dummy -999 untouched."""
+        scalers_dir = os.path.join(self.temp_dir, "scalers")
+        os.makedirs(scalers_dir, exist_ok=True)
+        scaler = StandardScaler()
+        scaler.fit(pd.DataFrame({"MIN": [10.0, 30.0]}))  # mean=20, scale=10
+        with open(os.path.join(scalers_dir, "true_label.pkl"), "wb") as f:
+            pkl.dump(scaler, f)
+
+        cb_params = CollectTruePredictedOutputsParams(
+            scaler_dir=scalers_dir,
+            column_names={
+                "true_label": ["MIN_true"],
+                "outputs_pred": ["MIN_pred"],
+                "keep_mask": ["NOT_IGNORE"],
+            },
+        )
+        cb = CollectTruePredictedOutputs(params=cb_params, model_dir=self.temp_dir)
+        df = pd.DataFrame({
+            "MIN_true": [0.5, 8.0, float(IGNORE)],
+            "MIN_pred": [0.5, 1.0, -2.0],
+            "NOT_IGNORE": [1.0, 0.0, 0.0],
+        })
+        cb._unscale_results(df, scalers_dir)
+
+        self.assertAlmostEqual(float(df.loc[0, "MIN_pred"]), 25.0, places=4)
+        self.assertAlmostEqual(float(df.loc[1, "MIN_pred"]), 30.0, places=4)
+        self.assertAlmostEqual(float(df.loc[2, "MIN_pred"]), 0.0, places=4)
+        self.assertAlmostEqual(float(df.loc[0, "MIN_true"]), 25.0, places=4)
+        self.assertAlmostEqual(float(df.loc[1, "MIN_true"]), 8.0, places=4)
+        self.assertAlmostEqual(float(df.loc[2, "MIN_true"]), float(IGNORE), places=4)
+
+    def test_debut_lag_role_means_exclude_upcoming_today_and_midgame_exits(self):
+        """Verify debut role_means excludes today's 0-filled upcoming rows and EJECTED/LEFT_MIDGAME rows."""
+        today = get_current_date()
+        d_past = today - datetime.timedelta(days=5)
+        df = pd.DataFrame({
+            "PLAYER_ID": [101, 102, 103, 104],
+            "DATE": [d_past, d_past, d_past, today],
+            "GAME_ID": [1, 1, 1, 2],
+            "TEAM_ID": [10, 10, 10, 10],
+            "STARTER": [True, True, True, True],
+            "START_POSITION_CALCULATED": ["PG", "PG", "PG", "PG"],
+            "EJECTED": [False, True, False, False],
+            "LEFT_MIDGAME": [False, False, True, False],
+            "MIN": [36.0, 4.0, 6.0, 0.0],
+        })
+        params = FeaturesParamsFantasyBasketballPredictions(
+            feature_name_to_machine_learning_dataset_params={
+                "lagged": MagicMock(feature_names=["MIN_t-1"]),
+                "positional_encoding_features": MagicMock(feature_names=["HOME", "START_POSITION_CALCULATED"]),
+            }
+        )
+        res = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_player_history_columns(df, params)
+        # Only player 101 is a completed non-exit past game -> Starting PG role mean is 36.0 (not distorted by 4, 6, 0)
+        for idx in range(len(res)):
+            self.assertAlmostEqual(float(res.loc[idx, "MIN_t-1"]), 36.0, places=4)
 
 
 if __name__ == "__main__":

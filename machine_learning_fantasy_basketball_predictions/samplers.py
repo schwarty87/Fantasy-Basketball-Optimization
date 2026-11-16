@@ -19,12 +19,13 @@ class ByDateBatchSampler(Sampler[List[int]]):
                  subset_dataset: Subset,
                  original_index_to_date_map: np.ndarray,
                  num_days_per_batch: int,
-                 shuffle: bool = False):
+                 shuffle: bool = False,
+                 seed: int = 42):
         super().__init__()
 
         self.num_days_per_batch = num_days_per_batch
         self.shuffle = shuffle
-        self.rng = np.random.default_rng(seed=42)
+        self.rng = np.random.default_rng(seed=seed)
 
         # Build a map of {date -> list_of_SUBSET_indices}
         self.date_to_subset_indices = defaultdict(list)

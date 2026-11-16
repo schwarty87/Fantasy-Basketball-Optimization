@@ -7,7 +7,7 @@ from scipy.stats import spearmanr, pearsonr
 import lightning.pytorch as pl
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from typing import Type, Tuple
+from typing import Type, Tuple, Callable, Any, Dict
 
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
@@ -37,7 +37,7 @@ from machine_learning_fantasy_basketball_predictions.params.layers_params import
 
 class RunModelFantasyBasketballPredictions(RunModel):
     def __init__(self, params: MachineLearningParamsFantasyBasketballPredictions, project_name: str = PROJECT_NAME,
-                 description: str | None = None, use_lightning: bool = False):
+                 description: str | None = None, use_lightning: bool | None = None):
         super().__init__(params=params, project_name=project_name, description=description, use_lightning=use_lightning)
 
     def update_categorical_params(self):
@@ -83,18 +83,41 @@ class RunModelFantasyBasketballPredictions(RunModel):
             contests_df.drop(columns='DATE').merge(date_per_contest.reset_index(), on='contestId', how='left')
         return contests_df[['contestId', 'score', 'DATE', 'entry_fee']]
 
+    @staticmethod
+    def _normalize_predictions_df(predictions_df: pd.DataFrame) -> pd.DataFrame:
+        collect_cols = [c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]
+        if collect_cols:
+            normalized = predictions_df[collect_cols].copy()
+            normalized.rename(columns={c: '_'.join(c.split('_')[1:]) for c in normalized.columns}, inplace=True)
+        else:
+            normalized = predictions_df.copy()
+        try:
+            add_missing_points_columns_to_predictions(predictions_df=normalized)
+        except Exception:
+            pass
+        return normalized
+
+    @staticmethod
+    def _resolve_eval_split_key(eval_results: pd.DataFrame, raw_split: Any, eval_split_series: pd.Series | None = None) -> Any:
+        split_name = raw_split.name if hasattr(raw_split, 'name') else str(raw_split)
+        candidates = (split_name, split_name.lower(), split_name.upper())
+        if eval_split_series is not None and not eval_results.empty:
+            target_mask = eval_split_series.isin(candidates)
+            if target_mask.any():
+                return eval_results[target_mask].index[0]
+        for cand in candidates:
+            if cand in eval_results.index:
+                return cand
+        return split_name
+
     @classmethod
     def _process_predictions_df(
         cls,
         predictions_df: pd.DataFrame,
         contests_df: pd.DataFrame | None = None,
+        raw_player_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        collect_cols = [c for c in predictions_df.columns if c.startswith('CollectTruePredicted')]
-        if collect_cols:
-            predictions_df = predictions_df[collect_cols].copy()
-            predictions_df.rename(columns={c: '_'.join(c.split('_')[1:]) for c in predictions_df.columns}, inplace=True)
-        else:
-            predictions_df = predictions_df.copy()
+        predictions_df = cls._normalize_predictions_df(predictions_df)
 
         if 'NOT_IGNORE' in predictions_df.columns:
             predictions_df = predictions_df.drop(columns='NOT_IGNORE')
@@ -113,9 +136,11 @@ class RunModelFantasyBasketballPredictions(RunModel):
         needs_raw = 'YAHOO_POINTS_raw' not in predictions_df.columns
         missing_cols = [c for c in ('YAHOO_SALARY', 'YAHOO_POSITION') if c not in predictions_df.columns]
         if needs_raw or len(missing_cols) > 0:
-            player_stats = StatsLoaderPlayers().load_saved_data()
+            player_stats = raw_player_df if raw_player_df is not None else StatsLoaderPlayers().load_saved_data()
             cols_to_pull = ['PLAYER_ID', 'DATE']
-            if needs_raw and 'YAHOO_POINTS' in player_stats.columns:
+            if needs_raw:
+                if 'YAHOO_POINTS' not in player_stats.columns:
+                    raise ValueError("YAHOO_POINTS column missing from player stats!")
                 cols_to_pull.append('YAHOO_POINTS')
             cols_to_pull += missing_cols
 
@@ -155,15 +180,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
         if predict_results is None or predict_results.empty:
             return eval_results
 
-        preds = predict_results.copy()
-        collect_cols = [c for c in preds.columns if c.startswith('CollectTruePredicted')]
-        if collect_cols:
-            preds = preds[collect_cols].copy()
-            preds.rename(columns={c: '_'.join(c.split('_')[1:]) for c in preds.columns}, inplace=True)
-        try:
-            add_missing_points_columns_to_predictions(preds)
-        except Exception:
-            pass
+        preds = cls._normalize_predictions_df(predict_results)
 
         true_col = 'YAHOO_POINTS_true' if 'YAHOO_POINTS_true' in preds.columns else 'YAHOO_POINTS'
         if 'YAHOO_POINTS_pred' not in preds.columns or true_col not in preds.columns:
@@ -197,12 +214,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
                             daily_spearmans.append(d_corr)
 
             daily_spearman_mean = float(np.mean(daily_spearmans)) if daily_spearmans else float('nan')
-
-            if eval_split_series is not None and not eval_results.empty:
-                target_mask = eval_split_series.isin(valid_splits)
-                idx = eval_results[target_mask].index[0] if target_mask.any() else split_name
-            else:
-                idx = split_name
+            idx = cls._resolve_eval_split_key(eval_results, split_type, eval_split_series)
 
             eval_results.loc[idx, 'pearson_corr'] = p_corr
             eval_results.loc[idx, 'spearman_corr'] = s_corr
@@ -215,26 +227,168 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
         return eval_results
 
-    def _add_extra_metrics_to_eval_results(self, eval_results: pd.DataFrame, predict_results: pd.DataFrame
-                                           ) -> pd.DataFrame:
-        eval_results = self._calculate_prediction_correlations(
-            eval_results=eval_results, predict_results=predict_results)
-
-        try:
-            contests_df = self._load_contests_df()
-        except FileNotFoundError as e:
-            logging.warning(f"Could not load DFS contest results: {e}. Skipping extra DFS contest metrics.")
+    @classmethod
+    def _calculate_prediction_accuracy_metrics(
+        cls,
+        eval_results: pd.DataFrame,
+        predict_results: pd.DataFrame,
+        player_stats_df: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Compute physical accuracy, salary-tier biases, and dropped-player coverage per split."""
+        if predict_results is None or predict_results.empty:
             return eval_results
 
-        predict_results = self._process_predictions_df(predictions_df=predict_results)
+        preds = cls._normalize_predictions_df(predict_results)
+        if 'YAHOO_POINTS_pred' not in preds.columns or 'split_type' not in preds.columns:
+            return eval_results
 
-        find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(points_col='YAHOO_POINTS_pred',
-                                                                  num_teams_in_set=1,
-                                                                  verbose=False)
+        if 'DATE' in preds.columns:
+            preds['DATE'] = convert_date_col_to_date(preds['DATE'])
+
+        real_mask = pd.Series(True, index=preds.index)
+        if 'PLAYER_ID' in preds.columns:
+            real_mask &= preds['PLAYER_ID'].fillna(0).astype(int) != 0
+        if 'MIN_true' in preds.columns:
+            real_mask &= preds['MIN_true'] != IGNORE
+        preds_real = preds.loc[real_mask].copy()
+
+        has_player_stats_raw = (
+            player_stats_df is not None
+            and {'PLAYER_ID', 'DATE', 'YAHOO_POINTS'}.issubset(player_stats_df.columns)
+        )
+        if 'YAHOO_POINTS_raw' not in preds_real.columns and has_player_stats_raw and {'PLAYER_ID', 'DATE'}.issubset(preds_real.columns):
+            raw_pts = player_stats_df[['PLAYER_ID', 'DATE', 'YAHOO_POINTS']].copy()
+            raw_pts['DATE'] = convert_date_col_to_date(raw_pts['DATE'])
+            raw_pts['PLAYER_ID'] = raw_pts['PLAYER_ID'].astype(int)
+            raw_pts = raw_pts.drop_duplicates(['PLAYER_ID', 'DATE']).rename(columns={'YAHOO_POINTS': 'YAHOO_POINTS_raw'})
+            preds_real['PLAYER_ID'] = preds_real['PLAYER_ID'].astype(int)
+            preds_real = preds_real.merge(raw_pts, on=['PLAYER_ID', 'DATE'], how='left')
+
+        true_fp_col = next(
+            (c for c in ('YAHOO_POINTS_raw', 'YAHOO_POINTS_true', 'YAHOO_POINTS') if c in preds_real.columns),
+            None,
+        )
+        if true_fp_col is None:
+            return eval_results
+
+        ps_active = None
+        if player_stats_df is not None and {'PLAYER_ID', 'DATE', 'YAHOO_SALARY'}.issubset(player_stats_df.columns):
+            ps_mask = player_stats_df['YAHOO_SALARY'].notna() & (player_stats_df['YAHOO_SALARY'] >= 15)
+            if 'IS_OUT' in player_stats_df.columns:
+                ps_mask &= ~player_stats_df['IS_OUT'].fillna(False).astype(bool)
+            if 'MIN' in player_stats_df.columns:
+                ps_mask &= player_stats_df['MIN'].fillna(0) > 0
+            ps_active = player_stats_df.loc[ps_mask, ['PLAYER_ID', 'DATE']].copy()
+            ps_active['DATE'] = convert_date_col_to_date(ps_active['DATE'])
+            ps_active['PLAYER_ID'] = ps_active['PLAYER_ID'].astype(int)
+
+        split_series = preds_real['split_type'].astype(str)
+        eval_split_series = eval_results['split_type'].astype(str) if 'split_type' in eval_results.columns else None
+
+        for split_type in DataSplitType.all_not_none_split_types():
+            valid_splits = {split_type.name, str(split_type.value), split_type.name.lower(), split_type.name.upper()}
+            split_real = preds_real.loc[split_series.isin(valid_splits)]
+            if split_real.empty:
+                continue
+
+            idx = cls._resolve_eval_split_key(eval_results, split_type, eval_split_series)
+
+            kept = split_real
+            if 'NOT_IGNORE' in kept.columns:
+                kept = kept.loc[kept['NOT_IGNORE'].astype(bool)]
+            valid = kept.loc[kept['YAHOO_POINTS_pred'].notna() & kept[true_fp_col].notna()]
+            if not valid.empty:
+                err = valid['YAHOO_POINTS_pred'].astype(float) - valid[true_fp_col].astype(float)
+                eval_results.loc[idx, 'fp_rmse_raw'] = float(np.sqrt(np.mean(err ** 2)))
+                eval_results.loc[idx, 'fp_bias_raw'] = float(np.mean(err))
+
+                if 'YAHOO_SALARY' in valid.columns:
+                    sal = valid['YAHOO_SALARY'].astype(float)
+                    tiers = {
+                        'fp_bias_sal_le_15': (sal > 0) & (sal <= 15),
+                        'fp_bias_sal_16_30': (sal > 15) & (sal <= 30),
+                        'fp_bias_sal_gt_30': sal > 30,
+                    }
+                    for col_name, tier_mask in tiers.items():
+                        if tier_mask.any():
+                            eval_results.loc[idx, col_name] = float(err.loc[tier_mask].mean())
+
+                    if {'MIN_pred', 'MIN_true'}.issubset(valid.columns):
+                        sal_min_mask = (
+                            (sal > 0)
+                            & valid['MIN_pred'].notna()
+                            & valid['MIN_true'].notna()
+                            & (valid['MIN_true'] != IGNORE)
+                        )
+                        if sal_min_mask.any():
+                            min_err = (
+                                valid.loc[sal_min_mask, 'MIN_pred'].astype(float)
+                                - valid.loc[sal_min_mask, 'MIN_true'].astype(float)
+                            ).abs()
+                            eval_results.loc[idx, 'min_mae_sal'] = float(min_err.mean())
+
+            if ps_active is not None and {'PLAYER_ID', 'DATE'}.issubset(split_real.columns):
+                split_dates = set(split_real['DATE'].dropna().unique())
+                ps_split = ps_active.loc[ps_active['DATE'].isin(split_dates)]
+                ps_keys = set(zip(ps_split['PLAYER_ID'], ps_split['DATE']))
+                pred_keys = set(zip(split_real['PLAYER_ID'].astype(int), split_real['DATE']))
+                eval_results.loc[idx, 'n_dropped_salaried_players'] = int(len(ps_keys - pred_keys))
+
+        return eval_results
+
+    @classmethod
+    def evaluate_predictions_df(
+        cls,
+        predict_results: pd.DataFrame,
+        eval_results: pd.DataFrame | None = None,
+        contests_df: pd.DataFrame | None = None,
+        player_stats_df: pd.DataFrame | None = None,
+        process_predictions_fn: Callable[..., pd.DataFrame] | None = None,
+        return_details: bool = False,
+    ) -> pd.DataFrame | Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+        if eval_results is None:
+            eval_results = pd.DataFrame(index=[s.name for s in DataSplitType.all_not_none_split_types()])
+        else:
+            eval_results = eval_results.copy()
+
+        if contests_df is None:
+            contests_df = cls._load_contests_df()
+
+        normalized_preds = cls._normalize_predictions_df(predict_results)
+        raw_df = player_stats_df
+        if (
+            raw_df is None
+            and 'YAHOO_POINTS_raw' not in normalized_preds.columns
+            and {'PLAYER_ID', 'DATE'}.issubset(normalized_preds.columns)
+        ):
+            raw_df = StatsLoaderPlayers().load_saved_data()
+
+        eval_results = cls._calculate_prediction_correlations(
+            eval_results=eval_results,
+            predict_results=normalized_preds,
+        )
+        eval_results = cls._calculate_prediction_accuracy_metrics(
+            eval_results=eval_results,
+            predict_results=normalized_preds,
+            player_stats_df=raw_df,
+        )
+
+        process_fn = process_predictions_fn or cls._process_predictions_df
+        process_kwargs: Dict[str, Any] = {'predictions_df': predict_results}
+        is_default_process = getattr(process_fn, '__func__', None) is cls._process_predictions_df.__func__
+        if raw_df is not None and is_default_process:
+            process_kwargs['raw_player_df'] = raw_df
+        processed_predictions = process_fn(**process_kwargs)
+
+        find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(
+            points_col='YAHOO_POINTS_pred',
+            num_teams_in_set=1,
+            verbose=False,
+        )
 
         true_points_col = 'YAHOO_POINTS_raw'
         score_per_day = dict()
-        for curr_date, day_df in tqdm(predict_results.groupby('DATE'), desc='finding best predicted team per day'):
+        for curr_date, day_df in tqdm(processed_predictions.groupby('DATE'), desc='finding best predicted team per day'):
             if day_df.shape[0] < 50:
                 continue
             player_to_true_points = day_df.set_index('PLAYER_ID')[true_points_col].to_dict()
@@ -247,57 +401,118 @@ class RunModelFantasyBasketballPredictions(RunModel):
             has_true_points = np.array([v in player_to_true_points.keys() for v in chosen_players.values])
             if not all(has_true_points):
                 players_without_true_points = chosen_players.values[~has_true_points]
-                raise ValueError(f"There are players that we don't have true points for on date {curr_date}: "
-                                 f"{players_without_true_points}")
+                raise ValueError(
+                    f"There are players that we don't have true points for on date {curr_date}: "
+                    f"{players_without_true_points}"
+                )
             score_per_day[curr_date] = chosen_players.map(player_to_true_points).sum()
-        score_per_day = pd.Series(score_per_day, dtype=float).to_frame().reset_index().rename(
-            columns={'index': 'DATE', 0: 'predicted_score'})
+        score_per_day = (
+            pd.Series(score_per_day, dtype=float)
+            .to_frame()
+            .reset_index()
+            .rename(columns={'index': 'DATE', 0: 'predicted_score'})
+        )
 
-        if 'split_type' in predict_results.columns and not score_per_day.empty:
+        eval_split_series = eval_results['split_type'].astype(str) if 'split_type' in eval_results.columns else None
+        all_dates_scores = pd.DataFrame(columns=['DATE', 'predicted_score', 'split_type'])
+        if 'split_type' in processed_predictions.columns and not score_per_day.empty:
             all_dates_scores = score_per_day.merge(
-                predict_results[['DATE', 'split_type']].drop_duplicates(),
+                processed_predictions[['DATE', 'split_type']].drop_duplicates(),
                 on='DATE',
                 how='left',
             )
             for raw_split, grp in all_dates_scores.groupby('split_type', sort=False):
-                split_key = raw_split.name if hasattr(raw_split, 'name') else str(raw_split)
-                if split_key not in eval_results.index and split_key.upper() in eval_results.index:
-                    split_key = split_key.upper()
+                split_key = cls._resolve_eval_split_key(eval_results, raw_split, eval_split_series)
                 eval_results.loc[split_key, 'mean_lineup_score_all_dates'] = grp['predicted_score'].mean()
                 eval_results.loc[split_key, 'n_lineup_dates'] = len(grp)
 
         dfs_contests_df = contests_df.merge(score_per_day, on='DATE', how='inner')
         dfs_contests_df['predicted_is_better'] = dfs_contests_df['predicted_score'] > dfs_contests_df['score']
         percentile_per_contest = dfs_contests_df.groupby('contestId', as_index=False).agg(
-            {'predicted_is_better': 'mean', 'predicted_score': 'first'})
-        percentile_per_contest = percentile_per_contest.merge(dfs_contests_df[['contestId', 'DATE', 'entry_fee']].drop_duplicates(),
-                                                              on='contestId', how='left')
+            {'predicted_is_better': 'mean', 'predicted_score': 'first'}
+        )
+        percentile_per_contest = percentile_per_contest.merge(
+            dfs_contests_df[['contestId', 'DATE', 'entry_fee']].drop_duplicates(),
+            on='contestId',
+            how='left',
+        )
         percentile_per_contest.rename(columns={'predicted_is_better': 'percentile'}, inplace=True)
         percentile_per_contest = percentile_per_contest.merge(
-            predict_results[['DATE', 'split_type']].drop_duplicates(), on='DATE', how='left')
-        percentile_per_contest['profit_5050'] = np.where(percentile_per_contest['percentile'] > 0.5, 0.8, -1)
-        percentile_per_contest['profit_top10'] = np.where(percentile_per_contest['percentile'] > 0.9, 2, -1)
+            processed_predictions[['DATE', 'split_type']].drop_duplicates(),
+            on='DATE',
+            how='left',
+        )
+        percentile_per_contest['is_top10'] = (percentile_per_contest['percentile'] > 0.9).astype(float)
+        percentile_per_contest['profit_5050'] = np.where(percentile_per_contest['percentile'] > 0.5, 0.8, -1.0)
+        percentile_per_contest['profit_top10'] = np.where(percentile_per_contest['percentile'] > 0.9, 2.0, -1.0)
+        percentile_per_contest['profit_top10_9x'] = np.where(percentile_per_contest['percentile'] > 0.9, 8.0, -1.0)
 
-        for ppc, df_name in zip([percentile_per_contest, percentile_per_contest.query('entry_fee.notnull() & (entry_fee > 0)')], ['all', 'paid']):
-            eval_results[f'portfolio_value_5050_{df_name}'] = [list()] * eval_results.shape[0]
-            eval_results[f'portfolio_value_top10_{df_name}'] = [list()] * eval_results.shape[0]
+        paid_mask = percentile_per_contest['entry_fee'].notnull() & (percentile_per_contest['entry_fee'] > 0)
+        for ppc, df_name in zip([percentile_per_contest, percentile_per_contest.loc[paid_mask]], ['all', 'paid']):
+            for portfolio_col in (
+                f'portfolio_value_5050_{df_name}',
+                f'portfolio_value_top10_{df_name}',
+                f'portfolio_value_top10_9x_{df_name}',
+            ):
+                eval_results[portfolio_col] = [list()] * eval_results.shape[0]
             for raw_split, group_df in ppc.groupby('split_type', sort=False):
-                split_key = raw_split.name if hasattr(raw_split, 'name') else str(raw_split)
-                if split_key not in eval_results.index and split_key.upper() in eval_results.index:
-                    split_key = split_key.upper()
-                one_per_date = group_df.groupby('DATE').agg({'profit_5050': 'mean', 'profit_top10': 'mean',
-                                                             'percentile': 'mean', 'predicted_score': 'mean'})
-                one_per_date[f'portfolio_value_5050'] = one_per_date['profit_5050'].cumsum()
+                split_key = cls._resolve_eval_split_key(eval_results, raw_split, eval_split_series)
+                one_per_date = group_df.groupby('DATE').agg(
+                    {
+                        'profit_5050': 'mean',
+                        'profit_top10': 'mean',
+                        'profit_top10_9x': 'mean',
+                        'is_top10': 'mean',
+                        'percentile': 'mean',
+                        'predicted_score': 'mean',
+                    }
+                )
+                one_per_date['portfolio_value_5050'] = one_per_date['profit_5050'].cumsum()
                 one_per_date['portfolio_value_top10'] = one_per_date['profit_top10'].cumsum()
+                one_per_date['portfolio_value_top10_9x'] = one_per_date['profit_top10_9x'].cumsum()
+
                 eval_results.at[split_key, f'portfolio_value_5050_{df_name}'] = one_per_date['portfolio_value_5050'].values.tolist()
                 eval_results.at[split_key, f'portfolio_value_top10_{df_name}'] = one_per_date['portfolio_value_top10'].values.tolist()
-                eval_results.loc[split_key, f'mean_percentile_{df_name}'] = one_per_date['percentile'].mean()
-                eval_results.loc[split_key, f'mean_score_{df_name}'] = one_per_date['predicted_score'].mean()
-                eval_results.loc[split_key, f'top10_pct_{df_name}'] = (one_per_date['percentile'] >= 0.9).mean()
+                eval_results.at[split_key, f'portfolio_value_top10_9x_{df_name}'] = one_per_date['portfolio_value_top10_9x'].values.tolist()
+
+                eval_results.loc[split_key, f'mean_percentile_{df_name}'] = float(one_per_date['percentile'].mean())
+                eval_results.loc[split_key, f'mean_score_{df_name}'] = float(one_per_date['predicted_score'].mean())
+                eval_results.loc[split_key, f'top10_pct_{df_name}'] = float(one_per_date['is_top10'].mean())
+                eval_results.loc[split_key, f'mean_profit_5050_{df_name}'] = float(one_per_date['profit_5050'].mean())
+                eval_results.loc[split_key, f'mean_profit_top10_{df_name}'] = float(one_per_date['profit_top10'].mean())
+                eval_results.loc[split_key, f'mean_profit_top10_9x_{df_name}'] = float(one_per_date['profit_top10_9x'].mean())
                 eval_results.loc[split_key, f'sharpe_5050_{df_name}'] = sharpe(one_per_date['profit_5050'])
                 eval_results.loc[split_key, f'sharpe_top10_{df_name}'] = sharpe(one_per_date['profit_top10'])
+                eval_results.loc[split_key, f'sharpe_top10_9x_{df_name}'] = sharpe(one_per_date['profit_top10_9x'])
+                eval_results.loc[split_key, f'mean_percentile_contests_{df_name}'] = float(group_df['percentile'].mean())
+                eval_results.loc[split_key, f'top10_pct_contests_{df_name}'] = float(group_df['is_top10'].mean())
+                eval_results.loc[split_key, f'n_contests_{df_name}'] = int(len(group_df))
+                eval_results.loc[split_key, f'n_contest_dates_{df_name}'] = int(len(one_per_date))
 
+        if return_details:
+            return eval_results, {
+                'all_dates_scores': all_dates_scores,
+                'percentile_per_contest': percentile_per_contest,
+            }
         return eval_results
+
+    def _add_extra_metrics_to_eval_results(self, eval_results: pd.DataFrame, predict_results: pd.DataFrame
+                                           ) -> pd.DataFrame:
+        try:
+            contests_df = self._load_contests_df()
+        except FileNotFoundError as e:
+            logging.warning(f"Could not load DFS contest results: {e}. Skipping extra DFS contest metrics.")
+            return self._calculate_prediction_correlations(
+                eval_results=eval_results, predict_results=predict_results
+            )
+
+        return self.evaluate_predictions_df(
+            predict_results=predict_results,
+            eval_results=eval_results,
+            contests_df=contests_df,
+            process_predictions_fn=self._process_predictions_df,
+            return_details=False,
+        )
 
     def run_full_training_session(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         eval_results, predict_results = super().run_full_training_session()
@@ -313,20 +528,35 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 for suffix in ['all', 'paid']:
                     col_5050 = f'portfolio_value_5050_{suffix}'
                     col_top10 = f'portfolio_value_top10_{suffix}'
+                    col_top10_9x = f'portfolio_value_top10_9x_{suffix}'
                     if col_5050 in eval_results.columns and col_top10 in eval_results.columns:
                         portfolio_value_5050 = eval_results.loc[split_key, col_5050]
                         portfolio_value_top10 = eval_results.loc[split_key, col_top10]
+                        portfolio_value_top10_9x = (
+                            eval_results.loc[split_key, col_top10_9x]
+                            if col_top10_9x in eval_results.columns
+                            else []
+                        )
                         if hasattr(portfolio_value_5050, '__iter__') and hasattr(portfolio_value_top10, '__iter__'):
                             for step, (curr_5050, curr_top10) in enumerate(zip(portfolio_value_5050, portfolio_value_top10)):
                                 writer.add_scalar(tag=f'DFS_Profit/portfolio_5050_{suffix}',
                                                   scalar_value=float(curr_5050), global_step=step)
                                 writer.add_scalar(tag=f'DFS_Profit/portfolio_top10_{suffix}',
                                                   scalar_value=float(curr_top10), global_step=step)
+                        if hasattr(portfolio_value_top10_9x, '__iter__'):
+                            for step, curr_top10_9x in enumerate(portfolio_value_top10_9x):
+                                writer.add_scalar(tag=f'DFS_Profit/portfolio_top10_9x_{suffix}',
+                                                  scalar_value=float(curr_top10_9x), global_step=step)
 
-                for m in ['mean_percentile', 'mean_score', 'top10_pct', 'sharpe_5050', 'sharpe_top10']:
+                scalar_prefixes = (
+                    'mean_percentile', 'mean_score', 'mean_lineup_score', 'top10_pct',
+                    'sharpe_5050', 'sharpe_top10', 'mean_profit_', 'n_contest', 'n_lineup_dates',
+                    'fp_rmse_raw', 'fp_bias_', 'min_mae_sal', 'n_dropped_salaried_players',
+                )
+                for m in scalar_prefixes:
                     for c in [cc for cc in eval_results.columns if cc.startswith(m)]:
                         val = eval_results.loc[split_key, c]
-                        if pd.notna(val):
+                        if isinstance(val, (int, float, np.integer, np.floating)) and pd.notna(val):
                             writer.add_scalar(tag=f'DFS_Contests/{c}',
                                               scalar_value=float(val),
                                               global_step=0)

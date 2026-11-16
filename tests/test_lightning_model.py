@@ -243,6 +243,40 @@ class TestFantasyBasketballLightningModule(unittest.TestCase):
         finally:
             shutil.rmtree(empty_scaler_dir, ignore_errors=True)
 
+    def test_format_predictions_preserves_midgame_exit_and_dummy_true_stats(self):
+        """Verify format_predictions skips unscaling *_true on NOT_IGNORE=0 exits and -999 dummies while unscaling all preds."""
+        mock_params = MagicMock()
+        mock_params.features_params.feature_name_to_machine_learning_dataset_params = {
+            "true_label": MachineLearningDatasetTabularScalingParams(feature_names=["MIN"]),
+            METADATA: MagicMock(feature_names=["DATE", "PLAYER_ID"]),
+        }
+        mock_scaler = MagicMock(spec=StandardScaler)
+        mock_scaler.inverse_transform.side_effect = lambda x: x * 10.0 + 20.0
+
+        module = MagicMock(spec=FantasyBasketballLightningModule)
+        module.params = mock_params
+        module.scaler_dir = None
+        module._load_target_scaler = MagicMock(return_value=mock_scaler)
+        module._stack_batch_tensor = FantasyBasketballLightningModule._stack_batch_tensor
+
+        # Row 0: kept real player (NOT_IGNORE=1, true z=0.5 -> unscaled 25.0)
+        # Row 1: midgame exit (NOT_IGNORE=0, raw MIN=8.0 unscaled by _scale_features -> must remain 8.0)
+        # Row 2: dummy slot (NOT_IGNORE=0, true=-999 -> must remain -999)
+        batch = {
+            "outputs_pred": torch.tensor([[0.5], [1.0], [-2.0]], dtype=torch.float32),
+            "true_label": torch.tensor([[0.5], [8.0], [-999.0]], dtype=torch.float32),
+            METADATA: torch.tensor([[20000.0, 101.0], [20000.0, 102.0], [20000.0, 0.0]], dtype=torch.float32),
+            "keep_mask": torch.tensor([[1.0], [0.0], [0.0]], dtype=torch.float32),
+        }
+
+        df = FantasyBasketballLightningModule.format_predictions(module, predict_batches=[batch])
+        self.assertAlmostEqual(float(df.loc[0, "MIN_pred"]), 25.0, places=4)
+        self.assertAlmostEqual(float(df.loc[1, "MIN_pred"]), 30.0, places=4)
+        self.assertAlmostEqual(float(df.loc[2, "MIN_pred"]), 0.0, places=4)
+        self.assertAlmostEqual(float(df.loc[0, "MIN_true"]), 25.0, places=4)
+        self.assertAlmostEqual(float(df.loc[1, "MIN_true"]), 8.0, places=4)
+        self.assertAlmostEqual(float(df.loc[2, "MIN_true"]), -999.0, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()
