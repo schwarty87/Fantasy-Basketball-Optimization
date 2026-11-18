@@ -33,6 +33,8 @@ class FeaturesParamsFantasyBasketballPredictions(FeaturesParams):
             extra_cols.extend(['START_POSITION', 'STARTER'])
         if {'MIN_SHARE', 'PLAYS_SHARE', 'STAGE1_NOT_IGNORE'} & set(self.all_feature_names_list):
             extra_cols.extend(['MIN', 'FGA', 'FTA', 'TOV'])
+        if 'COMPLETED_REAL_PLAYER' in self.all_feature_names_list:
+            extra_cols.append('MIN')
         for c in list(self.all_feature_names_list):
             if c.endswith('_mean_ratio'):
                 base_name = c.replace('_mean_ratio', '')
@@ -72,11 +74,17 @@ class ArchitectureParamsFantasyBasketballPredictions(ArchitectureParams):
 @dataclass
 class TrainingParamsFantasyBasketballPredictions(TrainingParams):
     num_days_per_batch: int | None = None
+    alpha_cash: float = 0.35
+    alpha_gpp: float = 0.85
 
     def __post_init__(self):
         super().__post_init__()
         if self.batch_size and self.num_days_per_batch:
             raise ValueError('only one of batch_size and num_days_per_batch can be non-None!')
+        if not (0.0 <= float(self.alpha_cash) <= 1.0):
+            raise ValueError(f'alpha_cash must be in [0, 1], got {self.alpha_cash}')
+        if not (0.0 <= float(self.alpha_gpp) <= 1.0):
+            raise ValueError(f'alpha_gpp must be in [0, 1], got {self.alpha_gpp}')
 
 
 @params_registry.register

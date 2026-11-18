@@ -72,16 +72,17 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
         result = {
             "outputs_pred": all_tensors["outputs_pred"].detach().cpu(),
         }
-        if "stage1_alloc" in all_tensors:
-            result["stage1_alloc"] = all_tensors["stage1_alloc"].detach().cpu()
-        if "stage1_label" in all_tensors:
-            result["stage1_label"] = all_tensors["stage1_label"].detach().cpu()
-        if "true_label" in all_tensors:
-            result["true_label"] = all_tensors["true_label"].detach().cpu()
-        if METADATA in all_tensors:
-            result[METADATA] = all_tensors[METADATA].detach().cpu()
-        if "keep_mask" in all_tensors:
-            result["keep_mask"] = all_tensors["keep_mask"].detach().cpu()
+        for opt_key in (
+            "stage1_alloc",
+            "stage1_label",
+            "true_label",
+            "fp_q20_pred",
+            "fp_q80_pred",
+            METADATA,
+            "keep_mask",
+        ):
+            if opt_key in all_tensors:
+                result[opt_key] = all_tensors[opt_key].detach().cpu()
         return result
 
     @staticmethod
@@ -108,6 +109,8 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
         all_masks = self._stack_batch_tensor(predict_batches, "keep_mask")
         all_stage1_preds = self._stack_batch_tensor(predict_batches, "stage1_alloc")
         all_stage1_trues = self._stack_batch_tensor(predict_batches, "stage1_label")
+        all_q20_preds = self._stack_batch_tensor(predict_batches, "fp_q20_pred")
+        all_q80_preds = self._stack_batch_tensor(predict_batches, "fp_q80_pred")
 
         # Unscale targets if fitted scaler is available
         scaler = self._load_target_scaler()
@@ -146,6 +149,10 @@ class FantasyBasketballLightningModule(MachineLearningLightningModule):
             dfs.append(pd.DataFrame(all_stage1_preds, columns=["MIN_ALLOC_pred", "PLAYS_ALLOC_pred"]))
         if all_stage1_trues.size > 0:
             dfs.append(pd.DataFrame(all_stage1_trues, columns=["MIN_SHARE_true", "PLAYS_SHARE_true"]))
+        if all_q20_preds.size > 0:
+            dfs.append(pd.DataFrame(all_q20_preds, columns=["YAHOO_POINTS_q20_pred"]))
+        if all_q80_preds.size > 0:
+            dfs.append(pd.DataFrame(all_q80_preds, columns=["YAHOO_POINTS_q80_pred"]))
         if all_metas.size > 0:
             dfs.append(pd.DataFrame(all_metas, columns=meta_cols))
         if all_masks.size > 0:

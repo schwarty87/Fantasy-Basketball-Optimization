@@ -151,3 +151,11 @@ class RateScaleHeadParams(LayerParams):
             self.scaler_mean = updated_params['scaler_mean']
         if 'scaler_scale' in updated_params:
             self.scaler_scale = updated_params['scaler_scale']
+
+
+@params_registry.register
+@dataclass(kw_only=True)
+class NonCrossingQuantilesParams(LayerParams):
+    """Configuration for `NonCrossingQuantiles` detached (q20, q80) fantasy-point head."""
+    hidden_dim: int = 64
+    dropout_rate: float = 0.0

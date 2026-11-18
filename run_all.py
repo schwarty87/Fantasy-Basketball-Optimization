@@ -32,7 +32,7 @@ from machine_learning_fantasy_basketball_predictions.constants import PROJECT_NA
 from machine_learning_fantasy_basketball_predictions.run_model import RunModelFantasyBasketballPredictions
 from machine_learning_fantasy_basketball_predictions.params.layers_params import \
     CalculateFantasyPointsParams, ReshapeToSamplePerDayParams, OptimizeTeamParams, TeamAllocationParams, \
-    RateScaleHeadParams
+    RateScaleHeadParams, NonCrossingQuantilesParams
 from machine_learning_fantasy_basketball_predictions.params.machine_learning_dataset_params import \
     MachineLearningDatasetSampleWeightsTabularFantasyBasketballPredictionsParams, \
     MachineLearningDatasetTabularCategoricalEncodingFantasyBasketballPredictionsParams
@@ -102,6 +102,7 @@ def create_features_params(
     two_stage: bool = False,
     use_histogram_weights: bool = True,
     fp_loss_weight: float = 0.0,
+    fp_quantiles: bool = False,
 ) -> FeaturesParamsFantasyBasketballPredictions:
     if fp_loss_weight < 0.0:
         raise ValueError(f"fp_loss_weight must be >= 0.0, got {fp_loss_weight}")
@@ -202,11 +203,19 @@ def create_features_params(
             dtype=features_dtype,
         )
 
-    if fp_loss_weight > 0.0:
+    if fp_loss_weight > 0.0 or fp_quantiles:
         feature_name_to_machine_learning_dataset_params['yahoo_points_label'] = MachineLearningDatasetTabularParams(
             feature_names=['YAHOO_POINTS'],
             relevant_keep_mask_dataset_name=None,
             dtype=features_dtype,
+        )
+
+    if fp_quantiles:
+        feature_name_to_machine_learning_dataset_params['completed_real_mask'] = (
+            MachineLearningDatasetKeepMaskTabularParams(
+                feature_names=['COMPLETED_REAL_PLAYER'],
+                dtype=features_dtype,
+            )
         )
 
     return FeaturesParamsFantasyBasketballPredictions(
@@ -230,6 +239,8 @@ def create_architecture_params(
     stage2_head: Literal['additive', 'multiplicative'] = 'additive',
     detach_z_min: bool = False,
     fp_loss_weight: float = 0.0,
+    fp_quantiles: bool = False,
+    quantile_dropout: float = 0.0,
 ) -> ArchitectureParamsFantasyBasketballPredictions:
     if stage1_layout not in ('split1_global1_global1', 'split2_global1'):
         raise ValueError(f"Unsupported stage1_layout: {stage1_layout}")
@@ -241,6 +252,8 @@ def create_architecture_params(
         raise ValueError("detach_z_min=True requires two_stage=True")
     if fp_loss_weight < 0.0:
         raise ValueError(f"fp_loss_weight must be >= 0.0, got {fp_loss_weight}")
+    if not (0.0 <= float(quantile_dropout) < 1.0):
+        raise ValueError(f"quantile_dropout must be in [0, 1), got {quantile_dropout}")
     output_feature_names = features_params.feature_name_to_machine_learning_dataset_params['true_label'].feature_names
     num_outputs = len(output_feature_names)
 
@@ -449,6 +462,7 @@ def create_architecture_params(
     metadata_feature_names = features_params.feature_name_to_machine_learning_dataset_params[METADATA].feature_names
     num_players_per_game = (5 + features_params.num_bench_players) * 2
     date_ind = metadata_feature_names.index('DATE')
+    need_fp_3d = fp_loss_weight > 0.0 or fp_quantiles
     fp_3d_extra_layers = (
         [
             ReshapeLayerParams(
@@ -457,7 +471,23 @@ def create_architecture_params(
                 shape=(num_players_per_game, 1),
             )
         ]
-        if fp_loss_weight > 0.0
+        if need_fp_3d
+        else []
+    )
+    quantile_extra_layers = (
+        [
+            NonCrossingQuantilesParams(
+                input_tensor_name={
+                    'features': head_input_tensor_name,
+                    'stats': 'outputs_pred',
+                    'fp': 'fantasy_points_3d',
+                },
+                output_tensor_name=['fp_q20_pred', 'fp_q80_pred'],
+                hidden_dim=64,
+                dropout_rate=float(quantile_dropout),
+            )
+        ]
+        if fp_quantiles
         else []
     )
 
@@ -513,7 +543,7 @@ def create_architecture_params(
         layer_params_list.append(post_transformer_features)
     layer_params_list += [
         output_dense, *stage2_head_extra_layers, calculate_fantasy_points_params,
-        *fp_3d_extra_layers,
+        *fp_3d_extra_layers, *quantile_extra_layers,
         fp_pred_reshape, fp_true_reshape, salary_reshape, position_reshape,
         date_reshape, keep_mask_reshape, true_fp_and_salary_combined,
         optimize_teams_params,
@@ -522,7 +552,8 @@ def create_architecture_params(
     output_tensor_names = (
         ['outputs_pred']
         + (['stage1_log_share', 'stage1_alloc'] if two_stage else [])
-        + (['fantasy_points_3d'] if fp_loss_weight > 0.0 else [])
+        + (['fantasy_points_3d'] if need_fp_3d else [])
+        + (['fp_q20_pred', 'fp_q80_pred'] if fp_quantiles else [])
     )
 
     return ArchitectureParamsFantasyBasketballPredictions(
@@ -538,9 +569,15 @@ def create_training_params(
     stage1_loss_weight: float = 10.0,
     use_histogram_weights: bool = True,
     fp_loss_weight: float = 0.0,
+    fp_quantiles: bool = False,
+    alpha_cash: float = 0.35,
+    alpha_gpp: float = 0.85,
+    quantile_loss_weight: float = 0.1,
 ) -> TrainingParamsFantasyBasketballPredictions:
     if fp_loss_weight < 0.0:
         raise ValueError(f"fp_loss_weight must be >= 0.0, got {fp_loss_weight}")
+    if quantile_loss_weight < 0.0:
+        raise ValueError(f"quantile_loss_weight must be >= 0.0, got {quantile_loss_weight}")
     model_id = get_next_model_id(PROJECT_NAME)
     datasets = features_params.feature_name_to_machine_learning_dataset_params
     true_label_dataset = datasets['true_label']
@@ -581,6 +618,23 @@ def create_training_params(
                 weight=fp_loss_weight,
             )
         )
+    if fp_quantiles:
+        for log_name, pred_name, q_val in (
+            ('fp_q20', 'fp_q20_pred', 0.20),
+            ('fp_q80', 'fp_q80_pred', 0.80),
+        ):
+            all_loss_params.append(
+                QuantileRegressionLossParams(
+                    name_for_logs=log_name,
+                    column_names=['YAHOO_POINTS'],
+                    tensor_names_pred=pred_name,
+                    tensor_names_true='yahoo_points_label',
+                    tensor_names_keep_mask='completed_real_mask',
+                    tensor_names_sample_weights=None,
+                    quantile=q_val,
+                    weight=quantile_loss_weight,
+                )
+            )
 
     optimize_teams_loss_params = OptimizeTeamsLossParams(
         tensor_names_true='fantasy_points_true_sample_per_day',
@@ -589,7 +643,7 @@ def create_training_params(
         name_for_logs='optimize_teams_loss',
     )
 
-    tracked_metric = 'eval_mse' if two_stage else 'eval_loss'
+    tracked_metric = 'eval_mse' if (two_stage or fp_quantiles) else 'eval_loss'
     collect_column_names = {
         'true_label': [f'{c}_true' for c in true_label_names],
         'outputs_pred': [f'{c}_pred' for c in true_label_names],
@@ -599,6 +653,9 @@ def create_training_params(
     if two_stage:
         collect_column_names['stage1_alloc'] = ['MIN_ALLOC_pred', 'PLAYS_ALLOC_pred']
         collect_column_names['stage1_label'] = ['MIN_SHARE_true', 'PLAYS_SHARE_true']
+    if fp_quantiles:
+        collect_column_names['fp_q20_pred'] = ['YAHOO_POINTS_q20_pred']
+        collect_column_names['fp_q80_pred'] = ['YAHOO_POINTS_q80_pred']
 
     callbacks_params = (
         ModelCheckpointParams(value_to_track=tracked_metric),
@@ -631,6 +688,8 @@ def create_training_params(
         training_dtype=torch.float32,
         dataloader_num_workers=0,
         gradient_clip_val=1.0,
+        alpha_cash=float(alpha_cash),
+        alpha_gpp=float(alpha_gpp),
         loss_params=tuple(all_loss_params),
         callbacks_params=callbacks_params,
         metrics_params=metrics_params,
@@ -653,6 +712,10 @@ def create_params(
     detach_z_min: bool = False,
     use_histogram_weights: bool = True,
     fp_loss_weight: float = 0.0,
+    fp_quantiles: bool = False,
+    quantile_dropout: float = 0.0,
+    alpha_cash: float = 0.35,
+    alpha_gpp: float = 0.85,
 ) -> MachineLearningParamsFantasyBasketballPredictions:
     num_days_per_batch = 4
     features_params = create_features_params(
@@ -665,6 +728,7 @@ def create_params(
         two_stage=two_stage,
         use_histogram_weights=use_histogram_weights,
         fp_loss_weight=fp_loss_weight,
+        fp_quantiles=fp_quantiles,
     )
     architecture_params = create_architecture_params(
         features_params,
@@ -676,6 +740,8 @@ def create_params(
         stage2_head=stage2_head,
         detach_z_min=detach_z_min,
         fp_loss_weight=fp_loss_weight,
+        fp_quantiles=fp_quantiles,
+        quantile_dropout=quantile_dropout,
     )
     training_params = create_training_params(
         features_params,
@@ -684,6 +750,9 @@ def create_params(
         stage1_loss_weight=stage1_loss_weight,
         use_histogram_weights=use_histogram_weights,
         fp_loss_weight=fp_loss_weight,
+        fp_quantiles=fp_quantiles,
+        alpha_cash=alpha_cash,
+        alpha_gpp=alpha_gpp,
     )
     return MachineLearningParamsFantasyBasketballPredictions(
         features_params=features_params,
@@ -922,6 +991,37 @@ if __name__ == '__main__':
         dest="fp_loss_weight",
         help="Weight for auxiliary MSE loss on predicted Yahoo fantasy points (default: 0.0).",
     )
+    parser.add_argument(
+        "--fp-quantiles",
+        "--fp_quantiles",
+        action="store_true",
+        dest="fp_quantiles",
+        help="Enable detached NonCrossingQuantiles (q20, q80) fantasy-point head and Cash/GPP routing.",
+    )
+    parser.add_argument(
+        "--quantile-dropout",
+        "--quantile_dropout",
+        type=float,
+        default=0.0,
+        dest="quantile_dropout",
+        help="Dropout rate inside NonCrossingQuantiles MLP (default: 0.0).",
+    )
+    parser.add_argument(
+        "--alpha-cash",
+        "--alpha_cash",
+        type=float,
+        default=0.35,
+        dest="alpha_cash",
+        help="Cash blend weight toward q20: (1-alpha)*mean + alpha*q20 (default: 0.35).",
+    )
+    parser.add_argument(
+        "--alpha-gpp",
+        "--alpha_gpp",
+        type=float,
+        default=0.85,
+        dest="alpha_gpp",
+        help="GPP blend weight toward q80: (1-alpha)*mean + alpha*q80 (default: 0.85).",
+    )
     args = parser.parse_args()
 
     use_lightning = args.use_lightning
@@ -943,6 +1043,10 @@ if __name__ == '__main__':
         detach_z_min=args.detach_z_min,
         use_histogram_weights=args.use_histogram_weights,
         fp_loss_weight=args.fp_loss_weight,
+        fp_quantiles=args.fp_quantiles,
+        quantile_dropout=args.quantile_dropout,
+        alpha_cash=args.alpha_cash,
+        alpha_gpp=args.alpha_gpp,
     )
     if args.fast_dev_run:
         params.training_params.fast_dev_run = True

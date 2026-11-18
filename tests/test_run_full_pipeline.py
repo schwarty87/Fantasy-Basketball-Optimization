@@ -8,11 +8,14 @@ import pandas as pd
 import numpy as np
 import pytz
 
-from run_full_pipeline import RunFullPipeline, _next_8am_et
+from run_full_pipeline import RunFullPipeline, _next_8am_et, _build_arg_parser
 from constants import DATA_DIR, NY_TZ
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
 from machine_learning_fantasy_basketball_predictions.machine_learning_datasets import (
     MachineLearningDatasetCombinedFantasyBasketballPredictions,
+)
+from machine_learning_fantasy_basketball_predictions.params.params import (
+    MachineLearningParamsFantasyBasketballPredictions,
 )
 from utils import get_current_date, get_current_season
 
@@ -202,7 +205,10 @@ class TestRunFullPipeline(unittest.TestCase):
             f.write("encoder")
         mock_run_model_cls.return_value = mock_runner
 
-        with patch.object(pipeline, "_todays_model_already_trained", return_value=False):
+        models_base = os.path.join(self.temp_dir, "machine_learning_fantasy_basketball_predictions", "models")
+        os.makedirs(os.path.join(models_base, "1"), exist_ok=True)
+        with patch("run_full_pipeline.DATA_DIR", self.temp_dir), \
+             patch.object(pipeline, "_todays_model_already_trained", return_value=False):
             pipeline.run_once_per_day()
 
         # Assert correct flow
@@ -358,7 +364,7 @@ class TestRunFullPipeline(unittest.TestCase):
 
         mock_fallback_runner = MagicMock()
 
-        def runner_side_effect(params, description=None):
+        def runner_side_effect(params, description=None, **kwargs):
             if params.continue_model_id == "model_2026_11_07":
                 return mock_fallback_runner
             return mock_failing_runner
@@ -657,6 +663,250 @@ class TestRunFullPipeline(unittest.TestCase):
 
         res = pipeline._get_todays_predictions(teams_template=mock_template)
         self.assertEqual(res.loc[0, "YAHOO_POSITION"], -999)
+
+    @patch("run_full_pipeline.update_todays_schedule_from_scoreboard")
+    @patch("run_full_pipeline.scrape_season_schedules")
+    @patch("run_full_pipeline.load_and_cache_players_list")
+    @patch("run_full_pipeline.update_all_stats")
+    @patch("run_full_pipeline.RunModelFantasyBasketballPredictions")
+    @patch("run_full_pipeline.MachineLearningParamsFantasyBasketballPredictions.load_params")
+    def test_run_once_per_day_forwards_use_lightning_flag(
+        self,
+        mock_load_params,
+        mock_run_model_cls,
+        mock_update_stats,
+        mock_load_players,
+        mock_scrape_schedules,
+        mock_update_scoreboard,
+    ):
+        """Verify use_lightning=True is forwarded to RunModelFantasyBasketballPredictions during training and reload."""
+        models_base = os.path.join(self.temp_dir, "machine_learning_fantasy_basketball_predictions", "models")
+        os.makedirs(os.path.join(models_base, "19"), exist_ok=True)
+        with open(os.path.join(models_base, "19", "params.json"), "w") as f:
+            f.write("{}")
+
+        run_date = datetime.date(2026, 11, 16)
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=19,
+            run_date=run_date,
+            run_immediately=True,
+            initialize_daily_job=False,
+            use_lightning=True,
+        )
+        pipeline._get_game_times_by_day_dict = MagicMock(return_value={run_date: [datetime.datetime.now(NY_TZ)]})
+
+        mock_params = MagicMock()
+        mock_params.features_params = MagicMock()
+        mock_params.training_params = MagicMock()
+        mock_load_params.return_value = mock_params
+
+        temp_dir = os.path.join(models_base, "22")
+
+        def make_runner(*args, **kwargs):
+            r = MagicMock()
+            r._model_dir = temp_dir
+
+            def fake_train():
+                os.makedirs(os.path.join(temp_dir, "scalers"), exist_ok=True)
+                os.makedirs(os.path.join(temp_dir, "categorical_encoder"), exist_ok=True)
+                with open(os.path.join(temp_dir, "params.json"), "w") as f:
+                    f.write("{}")
+                with open(os.path.join(temp_dir, "model.pt"), "w") as f:
+                    f.write("w")
+                with open(os.path.join(temp_dir, "scalers", "true_label.pkl"), "w") as f:
+                    f.write("s")
+                with open(os.path.join(temp_dir, "categorical_encoder", "embedding_features.pkl"), "w") as f:
+                    f.write("e")
+
+            r.train.side_effect = fake_train
+            return r
+
+        mock_run_model_cls.side_effect = make_runner
+
+        with patch("run_full_pipeline.DATA_DIR", self.temp_dir):
+            pipeline.run_once_per_day()
+
+        self.assertEqual(mock_run_model_cls.call_count, 2)
+        for call in mock_run_model_cls.call_args_list:
+            self.assertTrue(call.kwargs.get("use_lightning"))
+
+    def test_resolve_use_lightning_precedence_and_ckpt_fallback(self):
+        """Verify _resolve_use_lightning precedence: explicit override -> params.training_params.use_lightning -> *.ckpt files."""
+        ckpt_dir = os.path.join(self.temp_dir, "ckpt_model")
+        legacy_dir = os.path.join(self.temp_dir, "legacy_model")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(legacy_dir, exist_ok=True)
+        with open(os.path.join(ckpt_dir, "model_epoch=05.ckpt"), "w") as f:
+            f.write("ckpt")
+        with open(os.path.join(legacy_dir, "model.pt"), "w") as f:
+            f.write("pt")
+
+        params_none = MachineLearningParamsFantasyBasketballPredictions()
+        params_true = MachineLearningParamsFantasyBasketballPredictions()
+        params_true.training_params.use_lightning = True
+        params_false = MachineLearningParamsFantasyBasketballPredictions()
+        params_false.training_params.use_lightning = False
+
+        auto_pipeline = RunFullPipeline(load_params_from_model_id=1, initialize_daily_job=False)
+        self.assertIsNone(auto_pipeline.use_lightning)
+        self.assertTrue(auto_pipeline._resolve_use_lightning(params_none, ckpt_dir))
+        self.assertFalse(auto_pipeline._resolve_use_lightning(params_none, legacy_dir))
+        self.assertTrue(auto_pipeline._resolve_use_lightning(params_true, legacy_dir))
+        self.assertFalse(auto_pipeline._resolve_use_lightning(params_false, ckpt_dir))
+
+        forced_false = RunFullPipeline(load_params_from_model_id=1, initialize_daily_job=False, use_lightning=False)
+        self.assertFalse(forced_false._resolve_use_lightning(params_true, ckpt_dir))
+
+        forced_true = RunFullPipeline(load_params_from_model_id=1, initialize_daily_job=False, use_lightning=True)
+        self.assertTrue(forced_true._resolve_use_lightning(params_false, legacy_dir))
+
+    @patch("run_full_pipeline.update_todays_schedule_from_scoreboard")
+    @patch("run_full_pipeline.scrape_season_schedules")
+    @patch("run_full_pipeline.load_and_cache_players_list")
+    @patch("run_full_pipeline.update_all_stats")
+    @patch("run_full_pipeline.RunModelFantasyBasketballPredictions")
+    @patch("run_full_pipeline.MachineLearningParamsFantasyBasketballPredictions.load_params")
+    def test_run_once_per_day_autodetects_use_lightning_per_model_and_fallback(
+        self,
+        mock_load_params,
+        mock_run_model_cls,
+        mock_update_stats,
+        mock_load_players,
+        mock_scrape_schedules,
+        mock_update_scoreboard,
+    ):
+        """Verify run_once_per_day auto-detects use_lightning from model params/checkpoints and updates on fallback."""
+        models_base = os.path.join(self.temp_dir, "machine_learning_fantasy_basketball_predictions", "models")
+        source_19_dir = os.path.join(models_base, "19")
+        legacy_fallback_dir = os.path.join(models_base, "model_2026_11_08")
+        for d in (source_19_dir, os.path.join(legacy_fallback_dir, "scalers"), os.path.join(legacy_fallback_dir, "categorical_encoder")):
+            os.makedirs(d, exist_ok=True)
+        with open(os.path.join(source_19_dir, "params.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(source_19_dir, "last.ckpt"), "w") as f:
+            f.write("ckpt")
+        with open(os.path.join(legacy_fallback_dir, "params.json"), "w") as f:
+            f.write("{}")
+        with open(os.path.join(legacy_fallback_dir, "model.pt"), "w") as f:
+            f.write("pt")
+        with open(os.path.join(legacy_fallback_dir, "scalers", "true_label.pkl"), "w") as f:
+            f.write("s")
+        with open(os.path.join(legacy_fallback_dir, "categorical_encoder", "embedding_features.pkl"), "w") as f:
+            f.write("e")
+
+        def load_params_side_effect(path):
+            p = MachineLearningParamsFantasyBasketballPredictions()
+            # Legacy fallback explicitly false or None without ckpt
+            return p
+
+        mock_load_params.side_effect = load_params_side_effect
+
+        run_date = datetime.date(2026, 11, 16)
+        pipeline = RunFullPipeline(
+            load_params_from_model_id=19,
+            run_date=run_date,
+            run_immediately=True,
+            initialize_daily_job=False,
+        )
+        pipeline._get_game_times_by_day_dict = MagicMock(return_value={run_date: [datetime.datetime.now(NY_TZ)]})
+
+        failed_temp = os.path.join(models_base, "22")
+        os.makedirs(failed_temp, exist_ok=True)
+        failing_runner = MagicMock()
+        failing_runner._model_dir = failed_temp
+        failing_runner.train.side_effect = RuntimeError("fail")
+        fallback_runner = MagicMock()
+        mock_run_model_cls.side_effect = [failing_runner, fallback_runner]
+
+        with patch("run_full_pipeline.DATA_DIR", self.temp_dir):
+            pipeline.run_once_per_day()
+
+        # First instantiation (model 19 with .ckpt) resolves use_lightning=True and records it on params
+        self.assertTrue(mock_run_model_cls.call_args_list[0].kwargs["use_lightning"])
+        self.assertTrue(mock_run_model_cls.call_args_list[0].kwargs["params"].training_params.use_lightning)
+        # Fallback instantiation (model_2026_11_08 with model.pt only) resolves use_lightning=False
+        self.assertFalse(mock_run_model_cls.call_args_list[1].kwargs["use_lightning"])
+
+    def test_build_arg_parser_use_lightning_tri_state(self):
+        """Verify CLI parser defaults use_lightning to None and supports --use-lightning / --no-lightning."""
+        parser = _build_arg_parser()
+        self.assertIsNone(parser.parse_args([]).use_lightning)
+        self.assertTrue(parser.parse_args(["--use-lightning"]).use_lightning)
+        self.assertTrue(parser.parse_args(["--use_lightning"]).use_lightning)
+        self.assertFalse(parser.parse_args(["--no-lightning"]).use_lightning)
+        self.assertFalse(parser.parse_args(["--no_lightning"]).use_lightning)
+
+    @patch("run_full_pipeline.SubmitDFSTeamYahooByCSV")
+    @patch("run_full_pipeline.update_todays_schedule_from_scoreboard")
+    @patch("run_full_pipeline.update_all_stats")
+    def test_run_full_pipeline_cash_vs_gpp_quantile_lineup_divergence(
+        self,
+        mock_update_stats,
+        mock_update_scoreboard,
+        mock_submit_cls,
+    ):
+        """Verify run_full_pipeline diverges Cash (high-floor q20) and single-entry GPP (high-ceiling q80) lineups."""
+        pipeline = RunFullPipeline(load_params_from_model_id=1, run_immediately=True, initialize_daily_job=False)
+        pipeline._run_date = datetime.date(2026, 11, 10)
+        pipeline.update_daily_dfs_stats = MagicMock()
+
+        player_ids = list(range(1, 11))
+        pipeline.players_list = pd.DataFrame({
+            "NAME": [f"Player {pid}" for pid in player_ids],
+            "TO_YEAR": [2026] * len(player_ids),
+        })
+
+        mock_submit_inst = MagicMock()
+        mock_submit_inst.get_teams_template.return_value = pd.DataFrame()
+        # One Cash entry (3001) + one single-entry GPP entry (4001)
+        locked_cols = ["Pos", "NAME", "YAHOO_SALARY", "YAHOO_POSITION"]
+        mock_submit_inst.get_locked_dfs.return_value = {
+            3001: pd.DataFrame(columns=locked_cols),
+            4001: pd.DataFrame(columns=locked_cols),
+        }
+        mock_submit_inst.entry_ids = [3001, 4001]
+        mock_submit_inst.contest_ids = [101, 102]
+        mock_submit_inst.get_entry_titles.return_value = {
+            3001: "NBA 50/50 $5 Double Up",
+            4001: "NBA $10 Baller (GPP)",
+        }
+        mock_submit_cls.return_value = mock_submit_inst
+
+        # 10 players covering all Yahoo slots:
+        # Players 2..8 fill SG, SF, PF, C, G, F, UTIL deterministically with higher floor & ceiling than Player 1.
+        # Only one PG slot remains contested between:
+        #   - Player 1 (PG, $25): Safe high-floor -> mean=41, q20=40, q80=43
+        #   - Player 9 (PG, $25): Volatile high-ceiling -> mean=39, q20=10, q80=75
+        name_to_id = {f"Player {pid}": pid for pid in player_ids}
+        pipeline.stats_loaders_players = MagicMock()
+        pipeline.stats_loaders_players.get_player_name_to_id.return_value = name_to_id
+        pipeline.train_nn = MagicMock()
+        pipeline.train_nn.params.training_params.alpha_cash = 0.35
+        pipeline.train_nn.params.training_params.alpha_gpp = 0.85
+
+        preds = pd.DataFrame({
+            "PLAYER_ID": player_ids,
+            "YAHOO_POSITION": [1, 2, 3, 4, 5, 1, 3, 5, 1, 1],
+            "YAHOO_SALARY": [25.0] * 10,
+            "YAHOO_POINTS_pred": [41.0] + [42.0] * 7 + [39.0, 5.0],
+            "YAHOO_POINTS_q20_pred": [40.0] + [41.0] * 7 + [10.0, 2.0],
+            "YAHOO_POINTS_q80_pred": [43.0] + [44.0] * 7 + [75.0, 6.0],
+        })
+        pipeline._get_todays_predictions = MagicMock(return_value=preds)
+
+        pipeline.run_full_pipeline()
+
+        mock_submit_inst.submit_best_set.assert_called_once()
+        submitted_df = mock_submit_inst.submit_best_set.call_args[0][0]
+        self.assertEqual(list(submitted_df["entry_id"]), [3001, 4001])
+
+        slots = ["PG", "SG", "G", "SF", "PF", "F", "C", "UTIL"]
+        cash_players = set(submitted_df.loc[submitted_df["entry_id"] == 3001, slots].iloc[0].values)
+        gpp_players = set(submitted_df.loc[submitted_df["entry_id"] == 4001, slots].iloc[0].values)
+        self.assertIn("Player 1", cash_players)
+        self.assertNotIn("Player 9", cash_players)
+        self.assertIn("Player 9", gpp_players)
+        self.assertNotIn("Player 1", gpp_players)
 
 
 if __name__ == "__main__":

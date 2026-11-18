@@ -140,6 +140,7 @@ class TrainingParams(AbstractParams):
     compile_model: bool = False
     seed: Optional[int] = 42
     track_grad_norm: Optional[Union[int, float, str]] = None
+    use_lightning: Optional[bool] = None
 
     def __post_init__(self):
         if isinstance(self.loss_params, AbstractLossParams):

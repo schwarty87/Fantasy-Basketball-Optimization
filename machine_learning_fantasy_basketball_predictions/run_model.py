@@ -7,7 +7,7 @@ from scipy.stats import spearmanr, pearsonr
 import lightning.pytorch as pl
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from typing import Type, Tuple, Callable, Any, Dict
+from typing import Type, Tuple, Any, Dict
 
 from data_collectors.stats_loaders import StatsLoaderPlayers
 from find_best_team_linear_programming import FindBestSetOfTeamsLinearProgrammingYahoo
@@ -33,6 +33,66 @@ from machine_learning_fantasy_basketball_predictions.lightning_model import (
 from machine_learning_fantasy_basketball_predictions.params.layers_params import (
     update_calculate_fantasy_points_params,
 )
+
+
+def resolve_quantile_alphas(
+    training_params: Any,
+    default_cash: float = 0.35,
+    default_gpp: float = 0.85,
+) -> Tuple[float, float]:
+    """Safely extract numeric ``(alpha_cash, alpha_gpp)`` from ``training_params`` (handles Mock objects)."""
+    raw_cash = getattr(training_params, 'alpha_cash', default_cash)
+    raw_gpp = getattr(training_params, 'alpha_gpp', default_gpp)
+    alpha_cash = (
+        float(raw_cash)
+        if isinstance(raw_cash, (int, float, np.integer, np.floating)) and not isinstance(raw_cash, bool)
+        else default_cash
+    )
+    alpha_gpp = (
+        float(raw_gpp)
+        if isinstance(raw_gpp, (int, float, np.integer, np.floating)) and not isinstance(raw_gpp, bool)
+        else default_gpp
+    )
+    return alpha_cash, alpha_gpp
+
+
+def add_blended_quantile_point_columns(
+    predictions_df: pd.DataFrame,
+    alpha_cash: float = 0.35,
+    alpha_gpp: float = 0.85,
+) -> Tuple[str, str]:
+    """Add ``YAHOO_POINTS_cash_pred`` / ``YAHOO_POINTS_gpp_pred`` when quantile predictions exist.
+
+    Returns ``(cash_points_col, gpp_points_col)``, falling back to ``'YAHOO_POINTS_pred'``
+    for any contest type whose corresponding quantile column is absent.
+    """
+    for name, val in (('alpha_cash', alpha_cash), ('alpha_gpp', alpha_gpp)):
+        if not (0.0 <= float(val) <= 1.0):
+            raise ValueError(f"{name} must be in [0.0, 1.0], got {val}")
+
+    cash_col = 'YAHOO_POINTS_pred'
+    gpp_col = 'YAHOO_POINTS_pred'
+    if 'YAHOO_POINTS_pred' not in predictions_df.columns:
+        return cash_col, gpp_col
+
+    fp_pred = predictions_df['YAHOO_POINTS_pred'].astype(float)
+    if 'YAHOO_POINTS_q20_pred' in predictions_df.columns:
+        q20_pred = predictions_df['YAHOO_POINTS_q20_pred'].astype(float)
+        predictions_df['YAHOO_POINTS_cash_pred'] = np.where(
+            q20_pred.notna(),
+            (1.0 - float(alpha_cash)) * fp_pred + float(alpha_cash) * q20_pred,
+            fp_pred,
+        )
+        cash_col = 'YAHOO_POINTS_cash_pred'
+    if 'YAHOO_POINTS_q80_pred' in predictions_df.columns:
+        q80_pred = predictions_df['YAHOO_POINTS_q80_pred'].astype(float)
+        predictions_df['YAHOO_POINTS_gpp_pred'] = np.where(
+            q80_pred.notna(),
+            (1.0 - float(alpha_gpp)) * fp_pred + float(alpha_gpp) * q80_pred,
+            fp_pred,
+        )
+        gpp_col = 'YAHOO_POINTS_gpp_pred'
+    return cash_col, gpp_col
 
 
 class RunModelFantasyBasketballPredictions(RunModel):
@@ -187,7 +247,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
             return eval_results
 
         if 'NOT_IGNORE' in preds.columns:
-            preds = preds.loc[preds['NOT_IGNORE'].astype(bool)]
+            preds = preds.loc[preds['NOT_IGNORE'] > 0]
 
         split_series = preds['split_type'].astype(str) if 'split_type' in preds.columns else pd.Series([], dtype=str)
         eval_split_series = eval_results['split_type'].astype(str) if 'split_type' in eval_results.columns else None
@@ -295,7 +355,7 @@ class RunModelFantasyBasketballPredictions(RunModel):
 
             kept = split_real
             if 'NOT_IGNORE' in kept.columns:
-                kept = kept.loc[kept['NOT_IGNORE'].astype(bool)]
+                kept = kept.loc[kept['NOT_IGNORE'] > 0]
             valid = kept.loc[kept['YAHOO_POINTS_pred'].notna() & kept[true_fp_col].notna()]
             if not valid.empty:
                 err = valid['YAHOO_POINTS_pred'].astype(float) - valid[true_fp_col].astype(float)
@@ -332,9 +392,80 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 ps_split = ps_active.loc[ps_active['DATE'].isin(split_dates)]
                 ps_keys = set(zip(ps_split['PLAYER_ID'], ps_split['DATE']))
                 pred_keys = set(zip(split_real['PLAYER_ID'].astype(int), split_real['DATE']))
+                eval_results.loc[idx, 'n_salaried_players'] = int(len(ps_keys))
                 eval_results.loc[idx, 'n_dropped_salaried_players'] = int(len(ps_keys - pred_keys))
 
+            # Evaluate quantile calibration against per-48 YAHOO_POINTS_true on split_real (retaining midgame exits).
+            q_true_col = next(
+                (c for c in ('YAHOO_POINTS_true', 'YAHOO_POINTS', 'YAHOO_POINTS_raw') if c in split_real.columns),
+                None,
+            )
+            if q_true_col is not None and {'YAHOO_POINTS_q20_pred', 'YAHOO_POINTS_q80_pred'}.issubset(split_real.columns):
+                valid_q = split_real.loc[
+                    split_real['YAHOO_POINTS_q20_pred'].notna()
+                    & split_real['YAHOO_POINTS_q80_pred'].notna()
+                    & split_real[q_true_col].notna()
+                    & (split_real[q_true_col].astype(float) != IGNORE)
+                ]
+                if not valid_q.empty:
+                    y_q = valid_q[q_true_col].astype(float)
+                    q20 = valid_q['YAHOO_POINTS_q20_pred'].astype(float)
+                    q80 = valid_q['YAHOO_POINTS_q80_pred'].astype(float)
+                    eval_results.loc[idx, 'q20_coverage'] = float(np.mean(y_q <= q20))
+                    eval_results.loc[idx, 'q80_coverage'] = float(np.mean(y_q <= q80))
+                    eval_results.loc[idx, 'quantile_crossing_rate'] = float(np.mean(q20 > q80))
+                    if 'YAHOO_SALARY' in valid_q.columns:
+                        sal_q = valid_q['YAHOO_SALARY'].astype(float)
+                        sal_le_12 = (sal_q > 0) & (sal_q <= 12)
+                        if sal_le_12.any():
+                            eval_results.loc[idx, 'q20_coverage_sal_le_12'] = float(
+                                np.mean(y_q.loc[sal_le_12] <= q20.loc[sal_le_12])
+                            )
+                            eval_results.loc[idx, 'q80_coverage_sal_le_12'] = float(
+                                np.mean(y_q.loc[sal_le_12] <= q80.loc[sal_le_12])
+                            )
+
         return eval_results
+
+    @staticmethod
+    def _solve_best_lineups_per_day(
+        processed_predictions: pd.DataFrame,
+        points_col: str,
+        true_points_col: str = 'YAHOO_POINTS_raw',
+    ) -> pd.DataFrame:
+        find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(
+            points_col=points_col,
+            num_teams_in_set=1,
+            verbose=False,
+        )
+        score_per_day = dict()
+        for curr_date, day_df in tqdm(
+            processed_predictions.groupby('DATE'),
+            desc=f'finding best predicted team per day ({points_col})',
+        ):
+            if day_df.shape[0] < 50:
+                continue
+            player_to_true_points = day_df.set_index('PLAYER_ID')[true_points_col].to_dict()
+            try:
+                predicted_best_team = find_best_team.run(df=day_df).iloc[0]
+            except ValueError:
+                continue
+            chosen_players = predicted_best_team[find_best_team.positions()]
+
+            has_true_points = np.array([v in player_to_true_points.keys() for v in chosen_players.values])
+            if not all(has_true_points):
+                players_without_true_points = chosen_players.values[~has_true_points]
+                raise ValueError(
+                    f"There are players that we don't have true points for on date {curr_date}: "
+                    f"{players_without_true_points}"
+                )
+            score_per_day[curr_date] = chosen_players.map(player_to_true_points).sum()
+        return (
+            pd.Series(score_per_day, dtype=float)
+            .to_frame()
+            .reset_index()
+            .rename(columns={'index': 'DATE', 0: 'predicted_score'})
+        )
 
     @classmethod
     def evaluate_predictions_df(
@@ -343,8 +474,9 @@ class RunModelFantasyBasketballPredictions(RunModel):
         eval_results: pd.DataFrame | None = None,
         contests_df: pd.DataFrame | None = None,
         player_stats_df: pd.DataFrame | None = None,
-        process_predictions_fn: Callable[..., pd.DataFrame] | None = None,
         return_details: bool = False,
+        alpha_cash: float = 0.35,
+        alpha_gpp: float = 0.85,
     ) -> pd.DataFrame | Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
         if eval_results is None:
             eval_results = pd.DataFrame(index=[s.name for s in DataSplitType.all_not_none_split_types()])
@@ -373,45 +505,32 @@ class RunModelFantasyBasketballPredictions(RunModel):
             player_stats_df=raw_df,
         )
 
-        process_fn = process_predictions_fn or cls._process_predictions_df
-        process_kwargs: Dict[str, Any] = {'predictions_df': predict_results}
-        is_default_process = getattr(process_fn, '__func__', None) is cls._process_predictions_df.__func__
-        if raw_df is not None and is_default_process:
-            process_kwargs['raw_player_df'] = raw_df
-        processed_predictions = process_fn(**process_kwargs)
-
-        find_best_team = FindBestSetOfTeamsLinearProgrammingYahoo(
-            points_col='YAHOO_POINTS_pred',
-            num_teams_in_set=1,
-            verbose=False,
+        processed_predictions = cls._process_predictions_df(
+            predictions_df=predict_results,
+            raw_player_df=raw_df,
         )
 
-        true_points_col = 'YAHOO_POINTS_raw'
-        score_per_day = dict()
-        for curr_date, day_df in tqdm(processed_predictions.groupby('DATE'), desc='finding best predicted team per day'):
-            if day_df.shape[0] < 50:
-                continue
-            player_to_true_points = day_df.set_index('PLAYER_ID')[true_points_col].to_dict()
-            try:
-                predicted_best_team = find_best_team.run(df=day_df).iloc[0]
-            except ValueError:
-                continue
-            chosen_players = predicted_best_team[find_best_team.positions()]
-
-            has_true_points = np.array([v in player_to_true_points.keys() for v in chosen_players.values])
-            if not all(has_true_points):
-                players_without_true_points = chosen_players.values[~has_true_points]
-                raise ValueError(
-                    f"There are players that we don't have true points for on date {curr_date}: "
-                    f"{players_without_true_points}"
-                )
-            score_per_day[curr_date] = chosen_players.map(player_to_true_points).sum()
-        score_per_day = (
-            pd.Series(score_per_day, dtype=float)
-            .to_frame()
-            .reset_index()
-            .rename(columns={'index': 'DATE', 0: 'predicted_score'})
+        cash_col, gpp_col = add_blended_quantile_point_columns(
+            processed_predictions, alpha_cash=alpha_cash, alpha_gpp=alpha_gpp
         )
+        lineups_by_col: Dict[str, pd.DataFrame] = {
+            'YAHOO_POINTS_pred': cls._solve_best_lineups_per_day(processed_predictions, 'YAHOO_POINTS_pred'),
+        }
+
+        def _get_or_solve(col: str) -> pd.DataFrame:
+            if col in lineups_by_col:
+                return lineups_by_col[col]
+            base_vals = processed_predictions['YAHOO_POINTS_pred'].to_numpy(dtype=np.float64, na_value=np.nan)
+            col_vals = processed_predictions[col].to_numpy(dtype=np.float64, na_value=np.nan)
+            if np.array_equal(base_vals, col_vals, equal_nan=True):
+                lineups_by_col[col] = lineups_by_col['YAHOO_POINTS_pred']
+            else:
+                lineups_by_col[col] = cls._solve_best_lineups_per_day(processed_predictions, col)
+            return lineups_by_col[col]
+
+        score_per_day = lineups_by_col['YAHOO_POINTS_pred']
+        score_per_day_cash = _get_or_solve(cash_col)
+        score_per_day_gpp = _get_or_solve(gpp_col)
 
         eval_split_series = eval_results['split_type'].astype(str) if 'split_type' in eval_results.columns else None
         all_dates_scores = pd.DataFrame(columns=['DATE', 'predicted_score', 'split_type'])
@@ -421,31 +540,81 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 on='DATE',
                 how='left',
             )
+            if cash_col != 'YAHOO_POINTS_pred' and not score_per_day_cash.empty:
+                all_dates_scores = all_dates_scores.merge(
+                    score_per_day_cash.rename(columns={'predicted_score': 'predicted_score_cash'}),
+                    on='DATE',
+                    how='left',
+                )
+            if gpp_col != 'YAHOO_POINTS_pred' and not score_per_day_gpp.empty:
+                all_dates_scores = all_dates_scores.merge(
+                    score_per_day_gpp.rename(columns={'predicted_score': 'predicted_score_gpp'}),
+                    on='DATE',
+                    how='left',
+                )
             for raw_split, grp in all_dates_scores.groupby('split_type', sort=False):
                 split_key = cls._resolve_eval_split_key(eval_results, raw_split, eval_split_series)
                 eval_results.loc[split_key, 'mean_lineup_score_all_dates'] = grp['predicted_score'].mean()
                 eval_results.loc[split_key, 'n_lineup_dates'] = len(grp)
+                if 'predicted_score_cash' in grp.columns:
+                    eval_results.loc[split_key, 'mean_lineup_score_cash_all_dates'] = grp['predicted_score_cash'].mean()
+                if 'predicted_score_gpp' in grp.columns:
+                    eval_results.loc[split_key, 'mean_lineup_score_gpp_all_dates'] = grp['predicted_score_gpp'].mean()
 
         dfs_contests_df = contests_df.merge(score_per_day, on='DATE', how='inner')
         dfs_contests_df['predicted_is_better'] = dfs_contests_df['predicted_score'] > dfs_contests_df['score']
-        percentile_per_contest = dfs_contests_df.groupby('contestId', as_index=False).agg(
-            {'predicted_is_better': 'mean', 'predicted_score': 'first'}
-        )
+        if cash_col != 'YAHOO_POINTS_pred':
+            dfs_contests_df = dfs_contests_df.merge(
+                score_per_day_cash.rename(columns={'predicted_score': 'predicted_score_cash'}),
+                on='DATE',
+                how='left',
+            )
+            dfs_contests_df['predicted_is_better_cash'] = (
+                dfs_contests_df['predicted_score_cash'] > dfs_contests_df['score']
+            )
+        if gpp_col != 'YAHOO_POINTS_pred':
+            dfs_contests_df = dfs_contests_df.merge(
+                score_per_day_gpp.rename(columns={'predicted_score': 'predicted_score_gpp'}),
+                on='DATE',
+                how='left',
+            )
+            dfs_contests_df['predicted_is_better_gpp'] = (
+                dfs_contests_df['predicted_score_gpp'] > dfs_contests_df['score']
+            )
+
+        agg_spec: Dict[str, str] = {'predicted_is_better': 'mean', 'predicted_score': 'first'}
+        if 'predicted_is_better_cash' in dfs_contests_df.columns:
+            agg_spec['predicted_is_better_cash'] = 'mean'
+            agg_spec['predicted_score_cash'] = 'first'
+        if 'predicted_is_better_gpp' in dfs_contests_df.columns:
+            agg_spec['predicted_is_better_gpp'] = 'mean'
+            agg_spec['predicted_score_gpp'] = 'first'
+
+        percentile_per_contest = dfs_contests_df.groupby('contestId', as_index=False).agg(agg_spec)
         percentile_per_contest = percentile_per_contest.merge(
             dfs_contests_df[['contestId', 'DATE', 'entry_fee']].drop_duplicates(),
             on='contestId',
             how='left',
         )
-        percentile_per_contest.rename(columns={'predicted_is_better': 'percentile'}, inplace=True)
+        percentile_per_contest.rename(
+            columns={
+                'predicted_is_better': 'percentile',
+                'predicted_is_better_cash': 'percentile_cash',
+                'predicted_is_better_gpp': 'percentile_gpp',
+            },
+            inplace=True,
+        )
         percentile_per_contest = percentile_per_contest.merge(
             processed_predictions[['DATE', 'split_type']].drop_duplicates(),
             on='DATE',
             how='left',
         )
-        percentile_per_contest['is_top10'] = (percentile_per_contest['percentile'] > 0.9).astype(float)
-        percentile_per_contest['profit_5050'] = np.where(percentile_per_contest['percentile'] > 0.5, 0.8, -1.0)
-        percentile_per_contest['profit_top10'] = np.where(percentile_per_contest['percentile'] > 0.9, 2.0, -1.0)
-        percentile_per_contest['profit_top10_9x'] = np.where(percentile_per_contest['percentile'] > 0.9, 8.0, -1.0)
+        cash_pct_col = 'percentile_cash' if 'percentile_cash' in percentile_per_contest.columns else 'percentile'
+        gpp_pct_col = 'percentile_gpp' if 'percentile_gpp' in percentile_per_contest.columns else 'percentile'
+        percentile_per_contest['is_top10'] = (percentile_per_contest[gpp_pct_col] > 0.9).astype(float)
+        percentile_per_contest['profit_5050'] = np.where(percentile_per_contest[cash_pct_col] > 0.5, 0.8, -1.0)
+        percentile_per_contest['profit_top10'] = np.where(percentile_per_contest[gpp_pct_col] > 0.9, 2.0, -1.0)
+        percentile_per_contest['profit_top10_9x'] = np.where(percentile_per_contest[gpp_pct_col] > 0.9, 8.0, -1.0)
 
         paid_mask = percentile_per_contest['entry_fee'].notnull() & (percentile_per_contest['entry_fee'] > 0)
         for ppc, df_name in zip([percentile_per_contest, percentile_per_contest.loc[paid_mask]], ['all', 'paid']):
@@ -457,16 +626,18 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 eval_results[portfolio_col] = [list()] * eval_results.shape[0]
             for raw_split, group_df in ppc.groupby('split_type', sort=False):
                 split_key = cls._resolve_eval_split_key(eval_results, raw_split, eval_split_series)
-                one_per_date = group_df.groupby('DATE').agg(
-                    {
-                        'profit_5050': 'mean',
-                        'profit_top10': 'mean',
-                        'profit_top10_9x': 'mean',
-                        'is_top10': 'mean',
-                        'percentile': 'mean',
-                        'predicted_score': 'mean',
-                    }
-                )
+                date_agg: Dict[str, str] = {
+                    'profit_5050': 'mean',
+                    'profit_top10': 'mean',
+                    'profit_top10_9x': 'mean',
+                    'is_top10': 'mean',
+                    'percentile': 'mean',
+                    'predicted_score': 'mean',
+                }
+                for opt_col in ('percentile_cash', 'percentile_gpp', 'predicted_score_cash', 'predicted_score_gpp'):
+                    if opt_col in group_df.columns:
+                        date_agg[opt_col] = 'mean'
+                one_per_date = group_df.groupby('DATE').agg(date_agg)
                 one_per_date['portfolio_value_5050'] = one_per_date['profit_5050'].cumsum()
                 one_per_date['portfolio_value_top10'] = one_per_date['profit_top10'].cumsum()
                 one_per_date['portfolio_value_top10_9x'] = one_per_date['profit_top10_9x'].cumsum()
@@ -488,6 +659,20 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 eval_results.loc[split_key, f'top10_pct_contests_{df_name}'] = float(group_df['is_top10'].mean())
                 eval_results.loc[split_key, f'n_contests_{df_name}'] = int(len(group_df))
                 eval_results.loc[split_key, f'n_contest_dates_{df_name}'] = int(len(one_per_date))
+                if 'percentile_cash' in one_per_date.columns:
+                    eval_results.loc[split_key, f'mean_percentile_cash_{df_name}'] = float(
+                        one_per_date['percentile_cash'].mean()
+                    )
+                    eval_results.loc[split_key, f'mean_score_cash_{df_name}'] = float(
+                        one_per_date['predicted_score_cash'].mean()
+                    )
+                if 'percentile_gpp' in one_per_date.columns:
+                    eval_results.loc[split_key, f'mean_percentile_gpp_{df_name}'] = float(
+                        one_per_date['percentile_gpp'].mean()
+                    )
+                    eval_results.loc[split_key, f'mean_score_gpp_{df_name}'] = float(
+                        one_per_date['predicted_score_gpp'].mean()
+                    )
 
         if return_details:
             return eval_results, {
@@ -506,12 +691,16 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 eval_results=eval_results, predict_results=predict_results
             )
 
+        tp = getattr(getattr(self, 'params', None), 'training_params', None)
+        alpha_cash, alpha_gpp = resolve_quantile_alphas(tp)
+
         return self.evaluate_predictions_df(
             predict_results=predict_results,
             eval_results=eval_results,
             contests_df=contests_df,
-            process_predictions_fn=self._process_predictions_df,
             return_details=False,
+            alpha_cash=alpha_cash,
+            alpha_gpp=alpha_gpp,
         )
 
     def run_full_training_session(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -551,7 +740,8 @@ class RunModelFantasyBasketballPredictions(RunModel):
                 scalar_prefixes = (
                     'mean_percentile', 'mean_score', 'mean_lineup_score', 'top10_pct',
                     'sharpe_5050', 'sharpe_top10', 'mean_profit_', 'n_contest', 'n_lineup_dates',
-                    'fp_rmse_raw', 'fp_bias_', 'min_mae_sal', 'n_dropped_salaried_players',
+                    'fp_rmse_raw', 'fp_bias_', 'min_mae_sal', 'n_salaried_players', 'n_dropped_salaried_players',
+                    'q20_coverage', 'q80_coverage', 'quantile_crossing_rate',
                 )
                 for m in scalar_prefixes:
                     for c in [cc for cc in eval_results.columns if cc.startswith(m)]:

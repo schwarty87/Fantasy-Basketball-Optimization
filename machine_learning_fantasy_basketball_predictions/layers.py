@@ -3,6 +3,7 @@ from functools import partial
 from joblib import Parallel, delayed
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from constants import SCORING, Sites, NUM_TO_POSITION, START_POSITIONS
 from typing import Tuple, Dict, Any, Callable, List
@@ -12,6 +13,7 @@ from machine_learning.registries import layers_registry
 from machine_learning.layers.abstract_layer import AbstractLayer, LayersInputOutputShape
 from machine_learning_fantasy_basketball_predictions.params.layers_params import (
     CalculateFantasyPointsParams,
+    NonCrossingQuantilesParams,
     OptimizeTeamParams,
     ReshapeToSamplePerDayParams,
     TeamAllocationParams,
@@ -421,4 +423,40 @@ class RateScaleHead(AbstractLayer):
 
     def output_shape(self) -> Tuple[int, ...]:
         return self.input_shape['raw']
+
+
+@layers_registry.register
+class NonCrossingQuantiles(AbstractLayer):
+    """Detached non-crossing (q20, q80) quantile offsets around detached `fantasy_points_3d`."""
+
+    def __init__(self, params: NonCrossingQuantilesParams, input_shape: Dict[str, Tuple[int, ...]]):
+        super().__init__(params=params, input_shape=input_shape)
+        in_dim = input_shape['features'][-1] + (input_shape['stats'][-1] if 'stats' in input_shape else 0)
+        mlp_layers: List[nn.Module] = [
+            nn.Linear(in_dim, params.hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(params.hidden_dim),
+        ]
+        if params.dropout_rate and params.dropout_rate > 0.0:
+            mlp_layers.append(nn.Dropout(params.dropout_rate))
+        mlp_layers.append(nn.Linear(params.hidden_dim, 2))
+        self.mlp = nn.Sequential(*mlp_layers)
+
+    def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        fp = x['fp'].detach()
+        feat_parts = [x['features'].detach()]
+        if 'stats' in x:
+            feat_parts.append(x['stats'].detach())
+        mlp_in = torch.cat(feat_parts, dim=-1) if len(feat_parts) > 1 else feat_parts[0]
+        d_lo, d_hi = self.mlp(mlp_in).float().unbind(-1)
+        q20_name, q80_name = self.params.output_tensor_name
+        lo_offset = F.softplus(d_lo).unsqueeze(-1).to(dtype=fp.dtype)
+        hi_offset = F.softplus(d_hi).unsqueeze(-1).to(dtype=fp.dtype)
+        return {
+            q20_name: fp - lo_offset,
+            q80_name: fp + hi_offset,
+        }
+
+    def output_shape(self) -> List[Tuple[int, ...]]:
+        return [self.input_shape['fp'], self.input_shape['fp']]
 

@@ -181,13 +181,15 @@ def paired_bootstrap_test(
 
 
 def _aggregate_daily_contest_series(ppc: pd.DataFrame, paid_only: bool) -> pd.DataFrame:
+    base_cols = ['percentile', 'profit_5050', 'profit_top10_9x']
     if ppc.empty:
-        return pd.DataFrame(columns=['DATE', 'percentile', 'profit_5050', 'profit_top10_9x'])
+        return pd.DataFrame(columns=['DATE'] + base_cols)
     subset = ppc.loc[ppc['entry_fee'].notnull() & (ppc['entry_fee'] > 0)] if paid_only else ppc
     if subset.empty:
-        return pd.DataFrame(columns=['DATE', 'percentile', 'profit_5050', 'profit_top10_9x'])
+        return pd.DataFrame(columns=['DATE'] + base_cols)
+    agg_cols = base_cols + [c for c in ('percentile_cash', 'percentile_gpp') if c in subset.columns]
     return (
-        subset.groupby('DATE', as_index=False)[['percentile', 'profit_5050', 'profit_top10_9x']]
+        subset.groupby('DATE', as_index=False)[agg_cols]
         .mean()
     )
 
@@ -223,6 +225,8 @@ def evaluate_model_group(
     contests_df: pd.DataFrame | None = None,
     player_stats_df: pd.DataFrame | None = None,
     project_name: str = PROJECT_NAME,
+    alpha_cash: float = 0.35,
+    alpha_gpp: float = 0.85,
 ) -> Dict[str, Any]:
     """Re-evaluate saved model predictions via the canonical DFS evaluator and aggregate across seeds."""
     split_upper = split.strip().upper()
@@ -243,6 +247,8 @@ def evaluate_model_group(
             contests_df=contests_df,
             player_stats_df=player_stats_df,
             return_details=True,
+            alpha_cash=alpha_cash,
+            alpha_gpp=alpha_gpp,
         )
         seed_evals.append(ev)
         seed_details.append(det)
@@ -267,6 +273,8 @@ def evaluate_model_group(
             contests_df=contests_df,
             player_stats_df=player_stats_df,
             return_details=True,
+            alpha_cash=alpha_cash,
+            alpha_gpp=alpha_gpp,
         )
 
     return {
@@ -285,17 +293,35 @@ def _average_seed_details(seed_details: Sequence[Dict[str, pd.DataFrame]]) -> Di
     if len(seed_details) == 1:
         return seed_details[0]
 
-    all_scores = pd.concat([d['all_dates_scores'][['DATE', 'predicted_score']] for d in seed_details], ignore_index=True)
-    mean_scores = all_scores.groupby('DATE', as_index=False)['predicted_score'].mean()
-
-    ppc_concat = pd.concat(
-        [d['percentile_per_contest'][['contestId', 'DATE', 'entry_fee', 'percentile', 'profit_5050', 'profit_top10_9x']] for d in seed_details],
+    score_cols = ['predicted_score'] + [
+        c for c in ('predicted_score_cash', 'predicted_score_gpp')
+        if all(c in d['all_dates_scores'].columns for d in seed_details)
+    ]
+    all_scores = pd.concat(
+        [d['all_dates_scores'][['DATE'] + score_cols] for d in seed_details],
         ignore_index=True,
     )
-    mean_ppc = ppc_concat.groupby(['contestId', 'DATE'], as_index=False).agg(
-        {'entry_fee': 'first', 'percentile': 'mean', 'profit_5050': 'mean', 'profit_top10_9x': 'mean'}
+    mean_scores = all_scores.groupby('DATE', as_index=False)[score_cols].mean()
+
+    opt_ppc_cols = [
+        c for c in ('percentile_cash', 'percentile_gpp', 'predicted_score_cash', 'predicted_score_gpp')
+        if all(c in d['percentile_per_contest'].columns for d in seed_details)
+    ]
+    ppc_mean_cols = ['percentile', 'profit_5050', 'profit_top10_9x'] + opt_ppc_cols
+    ppc_cols = ['contestId', 'DATE', 'entry_fee'] + ppc_mean_cols
+    ppc_concat = pd.concat(
+        [d['percentile_per_contest'][ppc_cols] for d in seed_details],
+        ignore_index=True,
     )
+    ppc_agg: Dict[str, str] = {'entry_fee': 'first'}
+    ppc_agg.update({c: 'mean' for c in ppc_mean_cols})
+    mean_ppc = ppc_concat.groupby(['contestId', 'DATE'], as_index=False).agg(ppc_agg)
     return {'all_dates_scores': mean_scores, 'percentile_per_contest': mean_ppc}
+
+
+def _select_bootstrap_col(df: pd.DataFrame, preferred_col: str, fallback_col: str) -> pd.DataFrame:
+    col = preferred_col if preferred_col in df.columns else fallback_col
+    return df.rename(columns={col: '_boot_val'}) if col != '_boot_val' else df
 
 
 def compare_model_groups(
@@ -306,6 +332,8 @@ def compare_model_groups(
     n_resamples: int = 5000,
     seed: int = 42,
     project_name: str = PROJECT_NAME,
+    alpha_cash: float = 0.35,
+    alpha_gpp: float = 0.85,
 ) -> Dict[str, Any]:
     """Evaluate and statistically compare two sets of models (e.g. A vs. B)."""
     contests_df = RunModelFantasyBasketballPredictions._load_contests_df()
@@ -314,10 +342,12 @@ def compare_model_groups(
     res_a = evaluate_model_group(
         models_a, split=split, include_ensemble=include_ensemble,
         contests_df=contests_df, player_stats_df=player_stats_df, project_name=project_name,
+        alpha_cash=alpha_cash, alpha_gpp=alpha_gpp,
     )
     res_b = evaluate_model_group(
         models_b, split=split, include_ensemble=include_ensemble,
         contests_df=contests_df, player_stats_df=player_stats_df, project_name=project_name,
+        alpha_cash=alpha_cash, alpha_gpp=alpha_gpp,
     )
 
     det_a = (
@@ -333,8 +363,6 @@ def compare_model_groups(
 
     ppc_a = det_a['percentile_per_contest']
     ppc_b = det_b['percentile_per_contest']
-    paid_ppc_a = ppc_a.loc[ppc_a['entry_fee'].notnull() & (ppc_a['entry_fee'] > 0)]
-    paid_ppc_b = ppc_b.loc[ppc_b['entry_fee'].notnull() & (ppc_b['entry_fee'] > 0)]
 
     daily_all_a = _aggregate_daily_contest_series(ppc_a, paid_only=False)
     daily_all_b = _aggregate_daily_contest_series(ppc_b, paid_only=False)
@@ -345,11 +373,11 @@ def compare_model_groups(
         'daily_lineup_score': _pair_and_bootstrap(
             det_a['all_dates_scores'], det_b['all_dates_scores'], 'DATE', 'predicted_score', n_resamples, seed
         ),
-        'contest_percentile_all': _pair_and_bootstrap(
-            ppc_a, ppc_b, 'contestId', 'percentile', n_resamples, seed
+        'daily_percentile_all': _pair_and_bootstrap(
+            daily_all_a, daily_all_b, 'DATE', 'percentile', n_resamples, seed
         ),
-        'contest_percentile_paid': _pair_and_bootstrap(
-            paid_ppc_a, paid_ppc_b, 'contestId', 'percentile', n_resamples, seed
+        'daily_percentile_paid': _pair_and_bootstrap(
+            daily_paid_a, daily_paid_b, 'DATE', 'percentile', n_resamples, seed
         ),
         'daily_profit_5050_all': _pair_and_bootstrap(
             daily_all_a, daily_all_b, 'DATE', 'profit_5050', n_resamples, seed
@@ -365,6 +393,41 @@ def compare_model_groups(
         ),
     }
 
+    if 'predicted_score_cash' in det_a['all_dates_scores'].columns or 'predicted_score_cash' in det_b['all_dates_scores'].columns:
+        tests['daily_lineup_score_cash'] = _pair_and_bootstrap(
+            _select_bootstrap_col(det_a['all_dates_scores'], 'predicted_score_cash', 'predicted_score'),
+            _select_bootstrap_col(det_b['all_dates_scores'], 'predicted_score_cash', 'predicted_score'),
+            'DATE', '_boot_val', n_resamples, seed,
+        )
+    if 'predicted_score_gpp' in det_a['all_dates_scores'].columns or 'predicted_score_gpp' in det_b['all_dates_scores'].columns:
+        tests['daily_lineup_score_gpp'] = _pair_and_bootstrap(
+            _select_bootstrap_col(det_a['all_dates_scores'], 'predicted_score_gpp', 'predicted_score'),
+            _select_bootstrap_col(det_b['all_dates_scores'], 'predicted_score_gpp', 'predicted_score'),
+            'DATE', '_boot_val', n_resamples, seed,
+        )
+    if 'percentile_cash' in daily_all_a.columns or 'percentile_cash' in daily_all_b.columns:
+        tests['daily_percentile_cash_all'] = _pair_and_bootstrap(
+            _select_bootstrap_col(daily_all_a, 'percentile_cash', 'percentile'),
+            _select_bootstrap_col(daily_all_b, 'percentile_cash', 'percentile'),
+            'DATE', '_boot_val', n_resamples, seed,
+        )
+        tests['daily_percentile_cash_paid'] = _pair_and_bootstrap(
+            _select_bootstrap_col(daily_paid_a, 'percentile_cash', 'percentile'),
+            _select_bootstrap_col(daily_paid_b, 'percentile_cash', 'percentile'),
+            'DATE', '_boot_val', n_resamples, seed,
+        )
+    if 'percentile_gpp' in daily_all_a.columns or 'percentile_gpp' in daily_all_b.columns:
+        tests['daily_percentile_gpp_all'] = _pair_and_bootstrap(
+            _select_bootstrap_col(daily_all_a, 'percentile_gpp', 'percentile'),
+            _select_bootstrap_col(daily_all_b, 'percentile_gpp', 'percentile'),
+            'DATE', '_boot_val', n_resamples, seed,
+        )
+        tests['daily_percentile_gpp_paid'] = _pair_and_bootstrap(
+            _select_bootstrap_col(daily_paid_a, 'percentile_gpp', 'percentile'),
+            _select_bootstrap_col(daily_paid_b, 'percentile_gpp', 'percentile'),
+            'DATE', '_boot_val', n_resamples, seed,
+        )
+
     return {'group_a': res_a, 'group_b': res_b, 'bootstrap_tests': tests}
 
 
@@ -379,11 +442,14 @@ def _format_comparison_report(comparison: Dict[str, Any]) -> str:
     key_metrics = [
         'pearson_corr', 'spearman_corr', 'daily_spearman_corr',
         'fp_rmse_raw', 'fp_bias_raw', 'fp_bias_sal_le_15', 'fp_bias_sal_16_30', 'fp_bias_sal_gt_30',
-        'min_mae_sal', 'n_dropped_salaried_players',
-        'mean_lineup_score_all_dates',
-        'mean_percentile_all', 'top10_pct_all', 'mean_profit_5050_all', 'sharpe_5050_all',
+        'q20_coverage', 'q80_coverage', 'q20_coverage_sal_le_12', 'q80_coverage_sal_le_12', 'quantile_crossing_rate',
+        'min_mae_sal', 'n_salaried_players', 'n_dropped_salaried_players',
+        'mean_lineup_score_all_dates', 'mean_lineup_score_cash_all_dates', 'mean_lineup_score_gpp_all_dates',
+        'mean_percentile_all', 'mean_percentile_cash_all', 'mean_percentile_gpp_all',
+        'top10_pct_all', 'mean_profit_5050_all', 'sharpe_5050_all',
         'mean_profit_top10_9x_all', 'sharpe_top10_9x_all',
-        'mean_percentile_paid', 'top10_pct_paid', 'mean_profit_5050_paid', 'sharpe_5050_paid',
+        'mean_percentile_paid', 'mean_percentile_cash_paid', 'mean_percentile_gpp_paid',
+        'top10_pct_paid', 'mean_profit_5050_paid', 'sharpe_5050_paid',
         'mean_profit_top10_9x_paid', 'sharpe_top10_9x_paid',
     ]
 
@@ -444,6 +510,8 @@ if __name__ == '__main__':
     parser.add_argument('--ensemble', action='store_true', help="Also average physical predictions within each multi-seed group")
     parser.add_argument('--bootstrap-resamples', type=int, default=5000, help="Bootstrap resample count (default: 5000)")
     parser.add_argument('--seed', type=int, default=42, help="Bootstrap RNG seed (default: 42)")
+    parser.add_argument('--alpha-cash', type=float, default=0.35, help="Blend weight on q20 for Cash contests (default: 0.35)")
+    parser.add_argument('--alpha-gpp', type=float, default=0.85, help="Blend weight on q80 for GPP contests (default: 0.85)")
     args = parser.parse_args()
 
     result = compare_model_groups(
@@ -453,5 +521,7 @@ if __name__ == '__main__':
         include_ensemble=args.ensemble,
         n_resamples=args.bootstrap_resamples,
         seed=args.seed,
+        alpha_cash=args.alpha_cash,
+        alpha_gpp=args.alpha_gpp,
     )
     print(_format_comparison_report(result))

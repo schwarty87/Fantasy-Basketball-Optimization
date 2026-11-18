@@ -27,6 +27,7 @@ from run_all import (
 from machine_learning.architecture import ModelArchitecture
 from machine_learning.constants import METADATA
 from machine_learning.metrics.combined_metrics import LossesCombined
+from machine_learning.params.metrics_params import QuantileRegressionLossParams
 from machine_learning.params.callbacks_params import (
     ModelCheckpointParams,
     EarlyStoppingParams,
@@ -42,6 +43,7 @@ from machine_learning_fantasy_basketball_predictions.lightning_model import (
 )
 from machine_learning_fantasy_basketball_predictions.params.layers_params import (
     CalculateFantasyPointsParams,
+    NonCrossingQuantilesParams,
     RateScaleHeadParams,
     TeamAllocationParams,
     update_calculate_fantasy_points_params,
@@ -649,6 +651,9 @@ class TestRunAll(unittest.TestCase):
             mean_ = np.arange(1.0, len(stat_names) + 1.0, dtype=np.float64)
             scale_ = np.linspace(0.5, 5.5, len(stat_names), dtype=np.float64)
 
+            def inverse_transform(self, x):
+                return np.asarray(x, dtype=np.float64) * self.scale_ + self.mean_
+
         combined = type("Combined", (), {
             "machine_learning_datasets_stacked": type("Stacked", (), {
                 "datasets": {"true_label": type("DS", (), {"scaler": DummyScaler()})()}
@@ -764,6 +769,9 @@ class TestRunAll(unittest.TestCase):
             mean_ = np.arange(1.0, len(stat_names) + 1.0, dtype=np.float64)
             scale_ = np.linspace(0.5, 5.5, len(stat_names), dtype=np.float64)
 
+            def inverse_transform(self, x):
+                return np.asarray(x, dtype=np.float64) * self.scale_ + self.mean_
+
         combined = type("Combined", (), {
             "machine_learning_datasets_stacked": type("Stacked", (), {
                 "datasets": {"true_label": type("DS", (), {"scaler": DummyScaler()})()}
@@ -805,6 +813,120 @@ class TestRunAll(unittest.TestCase):
             float(logs['mse']) + 10.0 * float(logs['stage1_kl']) + 0.005 * float(logs['fp_mse']),
             places=5,
         )
+
+    def test_fp_quantiles_wiring_gradient_isolation_and_lightning_export(self):
+        """Verify --fp-quantiles parameter wiring, gradient isolation, single/two-stage support, and Lightning export."""
+        p_single_q = create_params(fp_quantiles=True, two_stage=False)
+        test_params(p_single_q)
+        self.assertIn('yahoo_points_label', p_single_q.features_params.feature_name_to_machine_learning_dataset_params)
+        self.assertIn('completed_real_mask', p_single_q.features_params.feature_name_to_machine_learning_dataset_params)
+        self.assertIn('MIN', p_single_q.features_params.all_feature_names_list)
+        self.assertEqual(p_single_q.training_params.alpha_cash, 0.35)
+        self.assertEqual(p_single_q.training_params.alpha_gpp, 0.85)
+        for cb in p_single_q.training_params.callbacks_params:
+            if isinstance(cb, (ModelCheckpointParams, EarlyStoppingParams, ReduceLearningRateOnPlateauParams)):
+                self.assertEqual(cb.value_to_track, 'eval_mse')
+
+        q_layers_single = [lp for lp in p_single_q.architecture_params.layer_params_list if isinstance(lp, NonCrossingQuantilesParams)]
+        self.assertEqual(len(q_layers_single), 1)
+        self.assertEqual(
+            q_layers_single[0].input_tensor_name,
+            {'features': 'transformer_output', 'stats': 'outputs_pred', 'fp': 'fantasy_points_3d'},
+        )
+
+        p_two_q = create_params(fp_quantiles=True, two_stage=True, stage2_head='multiplicative')
+        test_params(p_two_q)
+        q_layers = [lp for lp in p_two_q.architecture_params.layer_params_list if isinstance(lp, NonCrossingQuantilesParams)]
+        self.assertEqual(len(q_layers), 1)
+        self.assertEqual(
+            q_layers[0].input_tensor_name,
+            {'features': 'post_transformer_combined', 'stats': 'outputs_pred', 'fp': 'fantasy_points_3d'},
+        )
+        self.assertEqual(list(q_layers[0].output_tensor_name), ['fp_q20_pred', 'fp_q80_pred'])
+
+        q_losses = [lp for lp in p_two_q.training_params.loss_params if isinstance(lp, QuantileRegressionLossParams)]
+        self.assertEqual([(ql.name_for_logs, ql.quantile, ql.tensor_names_keep_mask, ql.weight) for ql in q_losses], [
+            ('fp_q20', 0.20, 'completed_real_mask', 0.1),
+            ('fp_q80', 0.80, 'completed_real_mask', 0.1),
+        ])
+
+        for lp in p_two_q.architecture_params.layer_params_list:
+            if hasattr(lp, 'embeddings_dims') and hasattr(lp, 'num_embeddings'):
+                lp.update_after_loading_data({'num_embeddings': [50] * len(lp.embeddings_dims)})
+
+        stat_names = p_two_q.features_params.feature_name_to_machine_learning_dataset_params['true_label'].feature_names
+        class DummyScaler:
+            feature_names_in_ = np.array(stat_names)
+            mean_ = np.arange(1.0, len(stat_names) + 1.0, dtype=np.float64)
+            scale_ = np.linspace(0.5, 5.5, len(stat_names), dtype=np.float64)
+
+            def inverse_transform(self, x):
+                return np.asarray(x, dtype=np.float64) * self.scale_ + self.mean_
+
+        combined = type("Combined", (), {
+            "machine_learning_datasets_stacked": type("Stacked", (), {
+                "datasets": {"true_label": type("DS", (), {"scaler": DummyScaler()})()}
+            })()
+        })()
+        update_calculate_fantasy_points_params(params=p_two_q, dataset_combined=combined)
+
+        model = ModelArchitecture(
+            params=p_two_q.architecture_params,
+            feature_type_to_input_shape=p_two_q.features_params.feature_type_to_input_shape,
+        ).eval()
+
+        torch.manual_seed(23)
+        batch = {}
+        for name, shape in p_two_q.features_params.feature_type_to_input_shape.items():
+            if name in ('embedding_features', 'positional_encoding_features'):
+                batch[name] = torch.randint(0, 5, (2, *shape))
+            elif name in ('real_player_mask', 'keep_mask', 'stage1_keep_mask', 'completed_real_mask'):
+                batch[name] = torch.ones((2, *shape), dtype=torch.float32)
+            elif name == 'stage1_label':
+                batch[name] = torch.full((2, *shape), 1.0 / 11.0, dtype=torch.float32)
+            else:
+                batch[name] = torch.randn((2, *shape), dtype=torch.float32)
+
+        outputs = model(batch)
+        self.assertEqual(outputs['fp_q20_pred'].shape, (2, 22, 1))
+        self.assertEqual(outputs['fp_q80_pred'].shape, (2, 22, 1))
+        self.assertTrue(torch.all(outputs['fp_q20_pred'] < outputs['fantasy_points_3d']))
+        self.assertTrue(torch.all(outputs['fantasy_points_3d'] < outputs['fp_q80_pred']))
+
+        # Pinball-only backward must leave trunk / Stage-1 / Stage-2 gradients untouched (None).
+        pinball_only = LossesCombined(q_losses, device=torch.device('cpu'), name='pinball_only')
+        model.zero_grad()
+        loss_q = pinball_only.forward({**batch, **outputs})
+        loss_q.backward()
+        q_layer_idx = p_two_q.architecture_params.layer_params_list.index(q_layers[0])
+        for idx, sublayer in enumerate(model.layers):
+            if idx == q_layer_idx:
+                self.assertTrue(any(p.grad is not None and torch.any(p.grad != 0) for p in sublayer.parameters()))
+            else:
+                for p in sublayer.parameters():
+                    self.assertIsNone(p.grad)
+
+        # Lightning export propagates unscaled YAHOO_POINTS_q20_pred & YAHOO_POINTS_q80_pred
+        lm = FantasyBasketballLightningModule(
+            params=p_two_q,
+            model=model,
+        ).eval()
+        lm._target_scaler = DummyScaler()
+        pred_batch = {**batch}
+        pred_batch['metadata'] = torch.zeros(
+            (2, *p_two_q.features_params.feature_type_to_input_shape['metadata']),
+            dtype=torch.float32,
+        )
+        pred_batch['metadata'][:, :, 0] = 20000.0
+        pred_batch['metadata'][:, :, 1] = torch.arange(1, 23).unsqueeze(0).expand(2, 22).float()
+        pred_out = lm.predict_step(pred_batch, 0)
+        self.assertIn('fp_q20_pred', pred_out)
+        self.assertIn('fp_q80_pred', pred_out)
+        pred_df = lm.format_predictions([pred_out])
+        self.assertIn('YAHOO_POINTS_q20_pred', pred_df.columns)
+        self.assertIn('YAHOO_POINTS_q80_pred', pred_df.columns)
+        self.assertTrue((pred_df['YAHOO_POINTS_q20_pred'] < pred_df['YAHOO_POINTS_pred']).all())
+        self.assertTrue((pred_df['YAHOO_POINTS_pred'] < pred_df['YAHOO_POINTS_q80_pred']).all())
 
 
 if __name__ == "__main__":

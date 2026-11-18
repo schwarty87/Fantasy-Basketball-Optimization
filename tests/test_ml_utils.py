@@ -39,7 +39,11 @@ from machine_learning.metrics.abstract_metrics import AbstractMetric
 from machine_learning.metrics.combined_metrics import LossesCombined
 from machine_learning.metrics.metrics import KLDivergenceLoss, MSELoss
 from machine_learning.params.abstract_params import AbstractMetricParams
-from machine_learning.params.metrics_params import KLDivergenceLossParams, MSELossParams
+from machine_learning.params.metrics_params import (
+    KLDivergenceLossParams,
+    MSELossParams,
+    QuantileRegressionLossParams,
+)
 from machine_learning.params.layers_params import (
     EmbeddingsLayerParams,
     ReshapeLayerParams,
@@ -63,6 +67,7 @@ from machine_learning_fantasy_basketball_predictions.layers import (
     OptimizeTeamFn,
     TeamAllocation,
     RateScaleHead,
+    NonCrossingQuantiles,
 )
 from machine_learning_fantasy_basketball_predictions.machine_learning_datasets import (
     MachineLearningDatasetCombinedFantasyBasketballPredictions,
@@ -73,6 +78,7 @@ from machine_learning_fantasy_basketball_predictions.params.layers_params import
     OptimizeTeamParams,
     TeamAllocationParams,
     RateScaleHeadParams,
+    NonCrossingQuantilesParams,
     update_calculate_fantasy_points_params,
 )
 from machine_learning_fantasy_basketball_predictions.params.metrics_params import OptimizeTeamsLossParams
@@ -1557,6 +1563,45 @@ class TestCL5SeedGradClipUnscaleAndDebutGuards(unittest.TestCase):
         self.assertEqual(s_42_a, s_42_b)
         self.assertNotEqual(s_42_a, s_43)
 
+    @patch("machine_learning.run_model.models_dir")
+    @patch("machine_learning.run_model.get_next_model_id")
+    def test_get_data_loader_batch_kwargs_seed_and_legacy_init_seed(
+        self, mock_get_next_model_id, mock_models_dir
+    ):
+        """Verify _get_data_loader_batch_kwargs forwards training_params.seed and legacy RunModel seeds init."""
+        mock_models_dir.return_value = self.temp_dir
+        mock_get_next_model_id.side_effect = [10, 11]
+
+        def _legacy_weights(seed_val: int):
+            p = create_params()
+            p.training_params.seed = seed_val
+            for lp in p.architecture_params.layer_params_list:
+                if hasattr(lp, "embeddings_dims") and hasattr(lp, "num_embeddings"):
+                    lp.num_embeddings = [20] * len(lp.embeddings_dims)
+            with patch("machine_learning.run_model.RunModel.create_data_loaders"), \
+                 patch("machine_learning.run_model.RunModel.update_categorical_params"):
+                runner = RunModel(params=p, project_name="test_proj", use_lightning=False)
+            return [w.detach().clone() for w in runner.model.parameters()]
+
+        w_legacy_42 = _legacy_weights(42)
+        w_legacy_43 = _legacy_weights(43)
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(w_legacy_42, w_legacy_43)))
+
+        ds = TensorDataset(torch.arange(16))
+        subset = Subset(ds, list(range(16)))
+        date_map = np.arange(16, dtype=np.float64)
+
+        def _batches_for_seed(seed_val: int):
+            ds_combined = MagicMock(spec=MachineLearningDatasetCombinedFantasyBasketballPredictions)
+            ds_combined._original_index_to_date = date_map
+            ds_combined.training_params = MagicMock(num_days_per_batch=2, seed=seed_val)
+            kwargs = MachineLearningDatasetCombinedFantasyBasketballPredictions._get_data_loader_batch_kwargs(
+                ds_combined, shuffle=True, machine_learning_datasets_stacked_subset=subset
+            )
+            return list(kwargs["batch_sampler"])
+
+        self.assertNotEqual(_batches_for_seed(42), _batches_for_seed(43))
+
     def test_legacy_run_batch_applies_gradient_clip_val(self):
         """Verify legacy RunModel._run_batch clips gradients when gradient_clip_val is configured."""
         runner = MagicMock(spec=RunModel)
@@ -1669,6 +1714,102 @@ class TestCL5SeedGradClipUnscaleAndDebutGuards(unittest.TestCase):
         # Only player 101 is a completed non-exit past game -> Starting PG role mean is 36.0 (not distorted by 4, 6, 0)
         for idx in range(len(res)):
             self.assertAlmostEqual(float(res.loc[idx, "MIN_t-1"]), 36.0, places=4)
+
+
+class TestCompletedRealPlayerAndQuantiles(unittest.TestCase):
+    def test_completed_real_player_mask_retains_early_exits_and_ignores_dummies(self):
+        """Verify COMPLETED_REAL_PLAYER keeps EJECTED/LEFT_MIDGAME rows, drops dummies (-999 MIN), and skips team_min == 0."""
+        # Game 1 completed: 2 real players (1 normal, 1 EJECTED) + 1 dummy (-999 MIN must not corrupt team_min).
+        # Game 2 unplayed (team_min == 0): e.g., date-filtered single-day upcoming roster.
+        df = pd.DataFrame({
+            "DATE": [datetime.date(2024, 1, 1)] * 3 + [datetime.date(2024, 1, 2)] * 2,
+            "GAME_ID": [1001, 1001, 1001, 1002, 1002],
+            "HOME": [1, 1, 1, 0, 0],
+            "PLAYER_ID": [10, 20, UNKNOWN_PLAYER_ID, 30, UNKNOWN_PLAYER_ID],
+            "MIN": [32.0, 5.0, float(IGNORE_VAL), 0.0, float(IGNORE_VAL)],
+            "EJECTED": [False, True, False, False, False],
+            "LEFT_MIDGAME": [False, False, False, False, False],
+            "SEASON_YEAR": [2024] * 5,
+            "split_type": [DataSplitType.VALIDATION] * 5,
+        })
+        ds_params = {
+            "completed_real_mask": MagicMock(feature_names=["COMPLETED_REAL_PLAYER"]),
+            "keep_mask": MagicMock(feature_names=["NOT_IGNORE"]),
+            "real_player_mask": MagicMock(feature_names=["IS_REAL_PLAYER"]),
+        }
+        params = MagicMock(
+            all_feature_names_list=["COMPLETED_REAL_PLAYER", "NOT_IGNORE", "IS_REAL_PLAYER", "PLAYER_SEASON"],
+            feature_name_to_machine_learning_dataset_params=ds_params,
+            last_month_in_train=False,
+            convert_to_binary_column_names_to_threshold=None,
+            binary_closing_opening_kernel_size=None,
+        )
+        out = MachineLearningDatasetCombinedFantasyBasketballPredictions._add_additional_columns(df.copy(), params)
+        # Normal real player (id=10): both kept
+        self.assertEqual(int(out.loc[0, "NOT_IGNORE"]), 1)
+        self.assertEqual(int(out.loc[0, "COMPLETED_REAL_PLAYER"]), 1)
+        # Early-exit real player (id=20): dropped from NOT_IGNORE, retained in COMPLETED_REAL_PLAYER
+        self.assertEqual(int(out.loc[1, "NOT_IGNORE"]), IGNORE_VAL)
+        self.assertEqual(int(out.loc[1, "COMPLETED_REAL_PLAYER"]), 1)
+        # Dummy row on completed game (id=0, MIN=-999): dropped from both
+        self.assertEqual(int(out.loc[2, "IS_REAL_PLAYER"]), IGNORE_VAL)
+        self.assertEqual(int(out.loc[2, "COMPLETED_REAL_PLAYER"]), IGNORE_VAL)
+        # Unplayed game (team_min == 0): COMPLETED_REAL_PLAYER == IGNORE_VAL even for real player id=30
+        self.assertEqual(int(out.loc[3, "COMPLETED_REAL_PLAYER"]), IGNORE_VAL)
+        self.assertEqual(int(out.loc[4, "COMPLETED_REAL_PLAYER"]), IGNORE_VAL)
+
+    def test_non_crossing_quantiles_monotonic_and_detached(self):
+        """Verify NonCrossingQuantiles guarantees q20 < fp < q80, zero input grad leak, and train/eval parity."""
+        torch.manual_seed(0)
+        head_params = NonCrossingQuantilesParams(
+            input_tensor_name={"features": "h", "stats": "s", "fp": "fp"},
+            output_tensor_name=("q20", "q80"),
+            hidden_dim=32,
+            dropout_rate=0.0,
+        )
+        layer = NonCrossingQuantiles(
+            params=head_params,
+            input_shape={"features": (22, 16), "stats": (22, 13), "fp": (22, 1)},
+        )
+        h = torch.randn((3, 22, 16), requires_grad=True)
+        s = torch.randn((3, 22, 13), requires_grad=True)
+        fp = (torch.randn((3, 22, 1)) * 15.0 + 25.0).detach().requires_grad_(True)
+
+        layer.train()
+        out_train = layer({"features": h, "stats": s, "fp": fp})
+        self.assertTrue(torch.all(out_train["q20"] < fp))
+        self.assertTrue(torch.all(fp < out_train["q80"]))
+
+        layer.eval()
+        out_eval = layer({"features": h, "stats": s, "fp": fp})
+        self.assertTrue(torch.allclose(out_train["q20"], out_eval["q20"]))
+        self.assertTrue(torch.allclose(out_train["q80"], out_eval["q80"]))
+
+        # Pinball loss backward must update only NonCrossingQuantiles weights, leaving trunk/stats/fp grads untouched.
+        y = torch.randn((3, 22, 1)) * 10.0 + 25.0
+        keep = torch.ones((3, 22, 1))
+        losses = LossesCombined(
+            [
+                QuantileRegressionLossParams(
+                    name_for_logs="fp_q20", column_names=["YAHOO_POINTS"],
+                    tensor_names_pred="q20", tensor_names_true="y", tensor_names_keep_mask="k",
+                    quantile=0.20, weight=0.1,
+                ),
+                QuantileRegressionLossParams(
+                    name_for_logs="fp_q80", column_names=["YAHOO_POINTS"],
+                    tensor_names_pred="q80", tensor_names_true="y", tensor_names_keep_mask="k",
+                    quantile=0.80, weight=0.1,
+                ),
+            ],
+            device=torch.device("cpu"),
+            name="q_loss",
+        )
+        total = losses.forward({"y": y, "k": keep, **out_train})
+        total.backward()
+        self.assertIsNone(h.grad)
+        self.assertIsNone(s.grad)
+        self.assertIsNone(fp.grad)
+        self.assertTrue(any(p.grad is not None and torch.any(p.grad != 0) for p in layer.parameters()))
 
 
 if __name__ == "__main__":

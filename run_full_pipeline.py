@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import logging
 import os
@@ -20,7 +21,11 @@ from constants import NY_TZ, DFS_POSITIONS, BROWSER, Sites, POSITION_TO_NUM, IGN
 from enums import Browsers
 from machine_learning_fantasy_basketball_predictions.params.params import \
     MachineLearningParamsFantasyBasketballPredictions
-from machine_learning_fantasy_basketball_predictions.run_model import RunModelFantasyBasketballPredictions
+from machine_learning_fantasy_basketball_predictions.run_model import (
+    RunModelFantasyBasketballPredictions,
+    add_blended_quantile_point_columns,
+    resolve_quantile_alphas,
+)
 from machine_learning.enums import DataSplitType
 from machine_learning.machine_learning_datasets import MachineLearningDatasetCombined
 
@@ -44,7 +49,8 @@ class RunFullPipeline:
                  run_date: datetime.date | str = get_current_date(),
                  headless: bool = True, minutes_before_game_to_run: int = 10,
                  run_immediately: bool = False,
-                 initialize_daily_job: bool = True, force_retrain: bool = False):
+                 initialize_daily_job: bool = True, force_retrain: bool = False,
+                 use_lightning: bool | None = None):
         """
         Run everything we need to continuously update stats, train new models, predict/create teams and submit them
         continuously
@@ -56,6 +62,7 @@ class RunFullPipeline:
         :param run_immediately: if True, don't wait for the game times to run. Should only be true when debugging
         :param initialize_daily_job: if True, initialize today's schedule and daily run via _reset()
         :param force_retrain: if True, retrain today's model even if already trained
+        :param use_lightning: explicit override for PyTorch Lightning (None auto-detects from loaded model params/checkpoints)
         """
         define_logger(format='%(asctime)s [%(levelname)s] - %(message)s', level=logging.INFO,
                       filename=os.path.join(DATA_DIR, 'logs', f"logs_{get_current_date()}.txt"), print_to_console=True, filemode='a')
@@ -65,6 +72,7 @@ class RunFullPipeline:
         self.minutes_before_game_to_run = minutes_before_game_to_run
         self._run_immediately = run_immediately
         self.force_retrain = force_retrain
+        self.use_lightning = use_lightning
 
         models_base = os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models')
         if not os.path.isdir(os.path.join(models_base, str(load_params_from_model_id))):
@@ -297,6 +305,22 @@ class RunFullPipeline:
             return str(self._load_params_from_model_id)
         return None
 
+    def _resolve_use_lightning(self, params: Any, model_dir: str | None = None) -> bool:
+        """Resolve whether to use PyTorch Lightning: explicit override -> params.json -> *.ckpt artifacts."""
+        if self.use_lightning is not None:
+            return bool(self.use_lightning)
+        tp = getattr(params, 'training_params', None)
+        saved_flag = getattr(tp, 'use_lightning', None)
+        if isinstance(saved_flag, bool):
+            return saved_flag
+        if model_dir and os.path.isdir(model_dir):
+            try:
+                if any(f.endswith('.ckpt') for f in os.listdir(model_dir)):
+                    return True
+            except OSError:
+                pass
+        return False
+
     def run_once_per_day(self):
         scrape_season_schedules(self.season, save_dir=update_dir_name('season_schedules'))
         update_todays_schedule_from_scoreboard(date=self._run_date, season=self.season)
@@ -326,10 +350,14 @@ class RunFullPipeline:
         # train a brand new model incorporating the latest data (and extra weights on today's active players).
         # TODO: Future investigation: evaluate fine-tuning an existing checkpoint vs. full daily retrain.
         models_base = os.path.join(DATA_DIR, 'machine_learning_fantasy_basketball_predictions', 'models')
-        params_path = os.path.join(models_base, str(self._load_params_from_model_id), 'params.json')
+        source_dir = os.path.join(models_base, str(self._load_params_from_model_id))
+        params_path = os.path.join(source_dir, 'params.json')
         params = MachineLearningParamsFantasyBasketballPredictions.load_params(params_path)
         params.training_params.fast_dev_run = False
         params.features_params.last_month_in_train = True
+        train_use_lightning = self._resolve_use_lightning(params, source_dir)
+        if type(params.training_params).__name__ != 'MagicMock' and hasattr(params.training_params, 'use_lightning'):
+            params.training_params.use_lightning = train_use_lightning
         todays_model_name = 'model_' + str(self._run_date).replace('-', '_')
         already_trained = self._todays_model_already_trained()
 
@@ -337,10 +365,12 @@ class RunFullPipeline:
         active_model_name = todays_model_name
 
         if (not already_trained or self.force_retrain) and self._has_games_today():
-            logging.info(f"Training fresh model for today ({todays_model_name})...")
+            logging.info(f"Training fresh model for today ({todays_model_name}) with use_lightning={train_use_lightning}...")
             temp_model_dir = None
             try:
-                self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
+                self.train_nn = RunModelFantasyBasketballPredictions(
+                    params=params, description=None, use_lightning=train_use_lightning
+                )
                 temp_model_dir = self.train_nn._model_dir
                 self.train_nn.train()
                 if not self._is_valid_trained_model_dir(temp_model_dir):
@@ -373,13 +403,17 @@ class RunFullPipeline:
                 if fallback_name is not None:
                     active_model_name = fallback_name
 
-        active_params_path = os.path.join(models_base, str(active_model_name), 'params.json')
+        active_dir = os.path.join(models_base, str(active_model_name))
+        active_params_path = os.path.join(active_dir, 'params.json')
         if os.path.isfile(active_params_path):
             params = MachineLearningParamsFantasyBasketballPredictions.load_params(active_params_path)
             params.training_params.fast_dev_run = False
             params.features_params.last_month_in_train = True
+        active_use_lightning = self._resolve_use_lightning(params, active_dir)
         params.continue_model_id = active_model_name
-        self.train_nn = RunModelFantasyBasketballPredictions(params=params, description=None)
+        self.train_nn = RunModelFantasyBasketballPredictions(
+            params=params, description=None, use_lightning=active_use_lightning
+        )
 
     @staticmethod
     def _browser_profile_path(browser: Browsers = BROWSER) -> str | None:
@@ -440,12 +474,18 @@ class RunFullPipeline:
             else:
                 gpp_eids.append(eid)
 
+        tp = getattr(getattr(self.train_nn, 'params', None), 'training_params', None)
+        alpha_cash, alpha_gpp = resolve_quantile_alphas(tp)
+        cash_points_col, gpp_points_col = add_blended_quantile_point_columns(
+            predictions, alpha_cash=alpha_cash, alpha_gpp=alpha_gpp
+        )
+
         sets_to_combine = []
 
         # 1. Solve Cash entries independently (single-entry optimal, no forced artificial cross-entry diversity)
         for eid in cash_eids:
             cash_solver = FindBestSetOfTeamsLinearProgrammingYahoo(
-                points_col='YAHOO_POINTS_pred',
+                points_col=cash_points_col,
                 num_teams_in_set=1,
                 avoid_single_player_in_all_sets=False,
                 max_shared_players_in_teams_pairs=None,
@@ -455,7 +495,7 @@ class RunFullPipeline:
         # 2. Solve GPP entries jointly with diversity constraints
         if len(gpp_eids) > 0:
             gpp_solver = FindBestSetOfTeamsLinearProgrammingYahoo(
-                points_col='YAHOO_POINTS_pred',
+                points_col=gpp_points_col,
                 num_teams_in_set=len(gpp_eids),
                 avoid_single_player_in_all_sets=len(gpp_eids) >= 3,
                 max_shared_players_in_teams_pairs=4,
@@ -525,8 +565,7 @@ class RunFullPipeline:
         return game_times_by_day
 
 
-if __name__ == '__main__':
-    import argparse
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="NBA Fantasy Pipeline")
     parser.add_argument('--train-only', action='store_true',
                         help="Only run morning training job (run_once_per_day) and exit")
@@ -542,7 +581,19 @@ if __name__ == '__main__':
                         help="Run the pipeline once immediately to generate predictions, optimize lineups, and submit to Yahoo, then exit")
     parser.add_argument('--no-headless', action='store_true',
                         help="Run the browser in visible mode (default: headless)")
-    args = parser.parse_args()
+    lightning_group = parser.add_mutually_exclusive_group()
+    lightning_group.add_argument('--use-lightning', '--use_lightning', action='store_true', dest='use_lightning',
+                                 default=argparse.SUPPRESS,
+                                 help="Force training and running the model with PyTorch Lightning")
+    lightning_group.add_argument('--no-lightning', '--no_lightning', action='store_false', dest='use_lightning',
+                                 default=argparse.SUPPRESS,
+                                 help="Force legacy non-Lightning PyTorch training and inference")
+    parser.set_defaults(use_lightning=None)
+    return parser
+
+
+if __name__ == '__main__':
+    args = _build_arg_parser().parse_args()
 
     ropd = RunFullPipeline(
         run_date=args.date,
@@ -552,6 +603,7 @@ if __name__ == '__main__':
         load_params_from_model_id=args.model_id,
         initialize_daily_job=not args.train_only,
         force_retrain=args.force_retrain,
+        use_lightning=args.use_lightning,
     )
     if args.train_only:
         ropd.run_once_per_day()
