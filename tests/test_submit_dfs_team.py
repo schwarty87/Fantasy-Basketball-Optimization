@@ -254,6 +254,45 @@ class TestSubmitDFSTeamYahooByCSV(unittest.TestCase):
         self.assertIn(('span', 'text', 'We have detected 2 lineups'), marker_calls)
         upload_btn.click.assert_called_once()
 
+    def test_finalize_pending_lineup_edits_clicks_save_changes(self):
+        inst = MagicMock(spec=SubmitDFSTeamYahooByCSV)
+        inst._is_valid_contest_id = SubmitDFSTeamYahooByCSV._is_valid_contest_id
+        inst.template = pd.DataFrame({
+            'Contest ID': [15958966],
+            'Entry ID': [238922974],
+        })
+        mock_driver = MagicMock()
+        mock_save_btn = MagicMock()
+        mock_save_btn.text = "Save Changes"
+        mock_save_btn.is_displayed.return_value = True
+        mock_driver.find_elements.return_value = [mock_save_btn]
+        inst.driver = mock_driver
+
+        SubmitDFSTeamYahooByCSV._finalize_pending_lineup_edits(inst)
+
+        mock_driver.get.assert_called_once_with(
+            "https://sports.yahoo.com/dailyfantasy/contest/15958966/edit/238922974"
+        )
+        mock_driver.execute_script.assert_called_once_with("arguments[0].click();", mock_save_btn)
+
+    def test_finalize_pending_lineup_edits_handles_no_save_button(self):
+        inst = MagicMock(spec=SubmitDFSTeamYahooByCSV)
+        inst._is_valid_contest_id = SubmitDFSTeamYahooByCSV._is_valid_contest_id
+        inst.template = pd.DataFrame({
+            'Contest ID': [15958966],
+            'Entry ID': [238922974],
+        })
+        mock_driver = MagicMock()
+        mock_driver.find_elements.return_value = []
+        inst.driver = mock_driver
+
+        SubmitDFSTeamYahooByCSV._finalize_pending_lineup_edits(inst)
+
+        mock_driver.get.assert_called_once_with(
+            "https://sports.yahoo.com/dailyfantasy/contest/15958966/edit/238922974"
+        )
+        mock_driver.execute_script.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -503,6 +503,9 @@ class SubmitDFSTeamYahooByCSV:
             except TimeoutException:
                 logging.error("Success confirmation message element was not detected within 15s timeout.")
                 submitted_team = False
+
+            if submitted_team:
+                self._finalize_pending_lineup_edits()
         except Exception as e:
             logging.exception('there was an exception in submit_best_set:')
             submitted_team = False
@@ -520,6 +523,35 @@ class SubmitDFSTeamYahooByCSV:
             template_str = remove_accents(template_str)
             logging.info(template_str)
             logging.info('<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
+
+    def _finalize_pending_lineup_edits(self):
+        """
+        Yahoo CSV upload populates player slots, but for newly reserved or free entries,
+        Yahoo may leave the entry in a pending state with a 'Save Changes' button.
+        Check each entry's edit page and commit any pending changes.
+        """
+        for _, row in self.template.iterrows():
+            cid = row.get('Contest ID')
+            eid = row.get('Entry ID')
+            if not self._is_valid_contest_id(cid) or pd.isna(eid):
+                continue
+            edit_url = f"https://sports.yahoo.com/dailyfantasy/contest/{int(cid)}/edit/{int(eid)}"
+            try:
+                self.driver.get(edit_url)
+                time.sleep(1.5)
+                save_buttons = [
+                    b for b in self.driver.find_elements(By.TAG_NAME, "button")
+                    if isinstance(getattr(b, "text", None), str)
+                    and "save changes" in b.text.lower()
+                    and getattr(b, "is_displayed", lambda: True)()
+                ]
+                if save_buttons:
+                    logging.info(f"Found pending 'Save Changes' button for entry {int(eid)} in contest {int(cid)}. Committing...")
+                    self.driver.execute_script("arguments[0].click();", save_buttons[0])
+                    time.sleep(2)
+                    logging.info(f"Successfully finalized lineup for entry {int(eid)} via Save Changes.")
+            except Exception as e:
+                logging.warning(f"Could not check/finalize lineup for entry {int(eid)}: {e}")
 
     @classmethod
     def interactive_login(cls, browser: Browsers = BROWSER, profile_path: Optional[str] = None):

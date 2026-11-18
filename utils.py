@@ -194,11 +194,28 @@ def load_and_cache_players_list(print_usage: bool = True, season: int | None = N
 
 
 def get_header(player_or_team: bool = True, url: str | None = None):
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0"
+    browser_profiles = [
+        {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+        },
+        {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"macOS"',
+        },
+        {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            'Sec-Ch-Ua': '"Chromium";v="123", "Not:A-Brand";v="8", "Google Chrome";v="123"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+        },
+        {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+        },
     ]
     referrers = ['https://www.nba.com/']
     if player_or_team:
@@ -206,8 +223,9 @@ def get_header(player_or_team: bool = True, url: str | None = None):
     else:
         referrers.append('https://www.nba.com/stats/teams/traditional')
 
+    profile = random.choice(browser_profiles)
     headers = {
-        'User-Agent': random.choice(user_agents),
+        'User-Agent': profile['User-Agent'],
         'Referer': random.choice(referrers),
         'Origin': 'https://www.nba.com',
         'Host': 'stats.nba.com',
@@ -217,13 +235,13 @@ def get_header(player_or_team: bool = True, url: str | None = None):
         'Connection': 'keep-alive',
         'x-nba-stats-origin': 'stats',
         'x-nba-stats-token': 'true',
-        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
         'Sec-Fetch-Site': 'same-site',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Dest': 'empty',
     }
+    for key in ('Sec-Ch-Ua', 'Sec-Ch-Ua-Mobile', 'Sec-Ch-Ua-Platform'):
+        if key in profile:
+            headers[key] = profile[key]
 
     if url and 'cdn.nba.com' in url:
         headers = {k: v for k, v in headers.items() if k not in (
@@ -234,14 +252,14 @@ def get_header(player_or_team: bool = True, url: str | None = None):
     return headers
 
 
-@retry(exceptions=(requests.exceptions.ReadTimeout, UnableToLoadWebsiteException, requests.exceptions.ConnectionError, KeyError, requests.exceptions.HTTPError), max_retries=3, delay_seconds=2)
+@retry(exceptions=(requests.exceptions.ReadTimeout, UnableToLoadWebsiteException, requests.exceptions.ConnectionError, KeyError, requests.exceptions.HTTPError), max_retries=3, delay_seconds=3)
 def load_nbacom_data(url: str, use_key: str = 'resultSets', player_or_team: bool = True,
-                     use_header: bool = True) -> pd.DataFrame | dict | None:
+                     use_header: bool = True, timeout: int = 25) -> pd.DataFrame | dict | None:
     headers = None
     if use_header:
         headers = get_header(player_or_team=player_or_team, url=url)
     try:
-        response = requests.get(url, headers=headers, timeout=60)
+        response = requests.get(url, headers=headers, timeout=timeout)
         response.raise_for_status()  # Raises HTTPError if status is 4xx or 5xx
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 403:

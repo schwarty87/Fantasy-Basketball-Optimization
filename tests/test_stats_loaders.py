@@ -702,6 +702,54 @@ class TestStatsLoaders(unittest.TestCase):
         with patch.object(loader, "_get_team_boxscores_df", return_value=matching_team_df):
             loader.assert_valid_df(player_df, is_incremental=True)
 
+    @patch("data_collectors.stats_loaders.load_schedule")
+    def test_stats_loader_players_assert_valid_df_skips_unplayed_upcoming_placeholders_pre_scrape(self, mock_schedule):
+        """Pre-scrape saved data with unplayed MIN==0 upcoming rows must pass while historical & incremental checks remain strict."""
+        mock_schedule.return_value = pd.DataFrame()
+        loader = StatsLoaderPlayers(season=2026)
+
+        player_df = pd.DataFrame({
+            "GAME_ID": [22600189, 22600196],
+            "TEAM_ID": [1610612738, 1610612741],
+            "PLAYER_ID": [101, 102],
+            "NAME": ["Player One", "Player Two"],
+            "DATE": [datetime.date(2026, 11, 7), datetime.date(2026, 11, 8)],
+            "SEASON_YEAR": [2026, 2026],
+            "MIN": [20.0, 0.0],
+            "PTS": [50.0, 0.0],
+            "FGM": [20.0, 0.0],
+            "FGA": [30.0, 0.0],
+            "3PM": [5.0, 0.0],
+            "3PA": [10.0, 0.0],
+            "FTM": [5.0, 0.0],
+            "FTA": [6.0, 0.0],
+            "OREB": [2.0, 0.0],
+            "DREB": [3.0, 0.0],
+            "REB": [5.0, 0.0],
+            "AST": [10.0, 0.0],
+        })
+        team_df = pd.DataFrame({
+            "GAME_ID": [22600189, 22600196],
+            "TEAM_ID": [1610612738, 1610612741],
+            "PTS": [50.0, 121.0],
+            "FGM": [20.0, 46.0],
+            "AST": [10.0, 30.0],
+        })
+
+        with patch.object(loader, "_get_team_boxscores_df", return_value=team_df):
+            # Pre-scrape (updates_df empty, is_incremental=False) skips stale unplayed placeholder on 11-08
+            loader.assert_valid_df(player_df, is_incremental=False)
+
+            # Incremental check on scraped updates must still fail if a scraped game has 0 vs 121
+            with self.assertRaises(AssertionError):
+                loader.assert_valid_df(player_df, is_incremental=True)
+
+            # Historical zeroed game strictly before latest_played must also still fail
+            historical_bad = player_df.copy()
+            historical_bad["DATE"] = [datetime.date(2026, 11, 7), datetime.date(2026, 11, 6)]
+            with self.assertRaises(AssertionError):
+                loader.assert_valid_df(historical_bad, is_incremental=False)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 import datetime
 import os
 from typing import Union
+from urllib.parse import quote
 import pytz
 
 from machine_learning.constants import DATA_DIR
@@ -26,9 +27,9 @@ SECONDS_PER_DAY = 60 * 60 * 24
 
 class URLS:
     TRANSACTIONS_NBACOM = 'https://stats.nba.com/js/data/playermovement/NBA_Player_Movement.json'
-    BOXSCORES_NBACOM = 'https://stats.nba.com/stats/{player_or_team}gamelogs?DateFrom=&DateTo=&GameSegment=&LastNGames=0&LeagueID=00&Location=&MeasureType={measure_type}&Month=0&OpponentTeamID=0&Outcome=&PORound=0&PaceAdjust=N&PerMode=Totals&Period=0&PlusMinus=N&Rank=N&Season={season}&SeasonSegment=&SeasonType={season_type}&ShotClockRange=&VsConference=&VsDivision='
-    BOXSCORES_NBACOM2 = 'https://stats.nba.com/stats/leaguegamelog?Counter=1000&DateFrom=&DateTo=&Direction=DESC&ISTRound=&LeagueID=00&PlayerOrTeam={player_or_team}&Season={season_str}&SeasonType={season_type}&Sorter=DATE'
-    BOXSCORES_NBACOM_TEAM = 'https://stats.nba.com/stats/teamgamelogs?DateFrom=&DateTo=&GameSegment=&ISTRound=&LastNGames=0&LeagueID=00&Location=&MeasureType={measure_type}&Month=0&OpponentTeamID=0&Outcome=&PORound=0&PaceAdjust=N&PerMode=Totals&Period=0&PlusMinus=N&Rank=N&Season={season}&SeasonSegment=&SeasonType={season_type}&ShotClockRange=&VsConference=&VsDivision='
+    BOXSCORES_NBACOM = 'https://stats.nba.com/stats/{player_or_team}gamelogs?DateFrom={date_from}&DateTo=&GameSegment=&LastNGames=0&LeagueID=00&Location=&MeasureType={measure_type}&Month=0&OpponentTeamID=0&Outcome=&PORound=0&PaceAdjust=N&PerMode=Totals&Period=0&PlusMinus=N&Rank=N&Season={season}&SeasonSegment=&SeasonType={season_type}&ShotClockRange=&VsConference=&VsDivision='
+    BOXSCORES_NBACOM2 = 'https://stats.nba.com/stats/leaguegamelog?Counter=1000&DateFrom={date_from}&DateTo=&Direction=DESC&ISTRound=&LeagueID=00&PlayerOrTeam={player_or_team}&Season={season_str}&SeasonType={season_type}&Sorter=DATE'
+    BOXSCORES_NBACOM_TEAM = 'https://stats.nba.com/stats/teamgamelogs?DateFrom={date_from}&DateTo=&GameSegment=&ISTRound=&LastNGames=0&LeagueID=00&Location=&MeasureType={measure_type}&Month=0&OpponentTeamID=0&Outcome=&PORound=0&PaceAdjust=N&PerMode=Totals&Period=0&PlusMinus=N&Rank=N&Season={season}&SeasonSegment=&SeasonType={season_type}&ShotClockRange=&VsConference=&VsDivision='
     GAMES_SCOREBOARD_NBACOM = 'https://stats.nba.com/stats/scoreboardv3?GameDate={date}&LeagueID=00'
     SINGLE_BOXSCORES_NBACOM = 'https://stats.nba.com/stats/boxscoretraditionalv3?EndPeriod=1&EndRange=0&GameID={gid}&RangeType=0&StartPeriod=1&StartRange=0'
     PLAYERS_LIST_NBACOM = 'https://stats.nba.com/stats/playerindex?College=&Country=&DraftPick=&DraftRound=&DraftYear=&Height=&Historical=1&LeagueID=00&Season={season_str}&SeasonType=Regular%20Season&TeamID=0&Weight='
@@ -50,22 +51,24 @@ class URLS:
         return season
 
     def boxscores_nbacom(self, player_or_team: str, measure_type: str, season: Union[int, str],
-                         season_type: str = 'Regular Season'):
+                         season_type: str = 'Regular Season', date_from: str = ''):
         return self.BOXSCORES_NBACOM.format(player_or_team=player_or_team, measure_type=measure_type,
-                                            season=self._season_int_to_str(season), season_type=season_type)
+                                            season=self._season_int_to_str(season), season_type=season_type,
+                                            date_from=quote(date_from, safe=''))
 
     def boxscores_nbacom2(self, player_or_team: str, season: Union[int, str],
-                         season_type: str = 'Regular Season'):
+                         season_type: str = 'Regular Season', date_from: str = ''):
         return self.BOXSCORES_NBACOM2.format(player_or_team=player_or_team, season_str=self._season_int_to_str(season),
-                                             season_type=season_type)
+                                             season_type=season_type, date_from=quote(date_from, safe=''))
 
     def boxscores_nbacom_team(self, measure_type: str, season: Union[int, str],
-                              season_type: str = 'Regular Season') -> str:
+                              season_type: str = 'Regular Season', date_from: str = '') -> str:
         if season_type == 'Regular Season':
             season_type = 'Regular%20Season'
         return self.BOXSCORES_NBACOM_TEAM.format(measure_type=measure_type,
                                                  season=self._season_int_to_str(season),
-                                                 season_type=season_type)
+                                                 season_type=season_type,
+                                                 date_from=quote(date_from, safe=''))
 
     def games_scoreboard_nbacom(self, date: str):
         return self.GAMES_SCOREBOARD_NBACOM.format(date=date)

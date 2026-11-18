@@ -11,6 +11,7 @@ import data_collectors
 from constants import URLS, SCORING, TEAM_NAME_TO_ID, TEAM_ID_TO_NAME
 from enums import StatsTypes, BoxscoreTypes, Sites
 from utils import (
+    UnableToLoadWebsiteException,
     downcast_df,
     load_and_cache_players_list,
     season_int_to_str,
@@ -25,6 +26,7 @@ from utils import (
     get_current_date,
     FixPlayerNames,
     get_header,
+    retry,
     update_dir_name,
     get_current_season,
     define_logger,
@@ -121,6 +123,19 @@ class StatsLoader:
             return self.df
         return None
 
+    def _get_scrape_date_from(self) -> str:
+        if self.latest_date_with_data is not None and self.latest_date_with_data > datetime.date(2000, 1, 1):
+            return (self.latest_date_with_data + datetime.timedelta(days=1)).strftime('%m/%d/%Y')
+        return ''
+
+    @staticmethod
+    @retry(exceptions=(requests.exceptions.RequestException, KeyError), max_retries=3, delay_seconds=3,
+           return_on_fail=pd.DataFrame())
+    def _fetch_nba_api_gamelogs(endpoint_cls, player_or_team: bool, **kwargs) -> pd.DataFrame:
+        endpoint = endpoint_cls(headers=get_header(player_or_team=player_or_team), timeout=25, **kwargs)
+        dfs = endpoint.get_data_frames()
+        return dfs[0] if dfs else pd.DataFrame()
+
     def scrape_single_boxscore_type_from_nbacom(self, boxscore_type: BoxscoreTypes,
                                                 season_type: str = 'Regular Season') -> pd.DataFrame:
         raise NotImplementedError
@@ -138,7 +153,11 @@ class StatsLoader:
                 curr_df = self.scrape_single_boxscore_type_from_nbacom(boxscore_type=boxscore_type,
                                                                        season_type=season_type)
 
+                if curr_df is None or ('DATE' not in curr_df.columns and 'GAME_DATE' not in curr_df.columns):
+                    raise UnableToLoadWebsiteException(site=f'stats.nba.com ({self.LOADER_TYPE.name} boxscores)')
                 curr_df.rename(columns=self.REPLACE_COLUMN_NAMES, inplace=True)
+                if curr_df.empty:
+                    break
                 curr_df['DATE'] = pd.to_datetime(curr_df['DATE']).dt.date
 
                 # only save new data that we don't have already
@@ -324,10 +343,12 @@ class StatsLoaderPlayers(StatsLoader):
 
     def scrape_single_boxscore_type_from_nbacom(self, boxscore_type: BoxscoreTypes,
                                                 season_type: str = 'Regular Season') -> pd.DataFrame:
+        date_from = self._get_scrape_date_from()
         try:
             curr_url = URLS().boxscores_nbacom2(player_or_team=self.LOADER_TYPE.name.upper()[0],
                                                 season=self.season_str,
-                                                season_type=season_type)
+                                                season_type=season_type,
+                                                date_from=date_from)
             curr_df = load_nbacom_data(curr_url)
             if curr_df is None or curr_df.empty:
                 raise requests.exceptions.RequestException('Empty data from boxscores_nbacom2')
@@ -339,27 +360,25 @@ class StatsLoaderPlayers(StatsLoader):
             double_digits = (curr_df[['PTS', 'REB', 'AST', 'STL', 'BLK']] >= 10).sum(axis=1)
             curr_df['DOUBLE_DOUBLE'] = double_digits == 2
             curr_df['TRIPLE_DOUBLE'] = double_digits >= 3
-        except (requests.exceptions.RequestException, KeyError):
+        except (requests.exceptions.RequestException, KeyError, UnableToLoadWebsiteException):
             try:
                 curr_url = URLS().boxscores_nbacom(player_or_team=self.LOADER_TYPE.name,
                                                    measure_type=boxscore_type.name,
                                                    season=self.season_str,
-                                                   season_type=season_type)
+                                                   season_type=season_type,
+                                                   date_from=date_from)
                 curr_df = load_nbacom_data(curr_url)
                 if curr_df is None or curr_df.empty:
                     raise requests.exceptions.RequestException('Empty data from boxscores_nbacom')
-            except (requests.exceptions.RequestException, KeyError):
-                try:
-                    player_game_logs = playergamelogs.PlayerGameLogs(season_nullable=self.season_str,
-                                                                     measure_type_player_game_logs_nullable=boxscore_type.name,
-                                                                     season_type_nullable=season_type,
-                                                                     headers=get_header(),
-                                                                     timeout=60)
-                    dfs = player_game_logs.get_data_frames()
-                    curr_df = dfs[0] if dfs else pd.DataFrame()
-                except Exception as e:
-                    logging.warning(f"PlayerGameLogs fallback failed: {e}")
-                    curr_df = pd.DataFrame()
+            except (requests.exceptions.RequestException, KeyError, UnableToLoadWebsiteException):
+                curr_df = self._fetch_nba_api_gamelogs(
+                    playergamelogs.PlayerGameLogs,
+                    player_or_team=True,
+                    season_nullable=self.season_str,
+                    measure_type_player_game_logs_nullable=boxscore_type.name,
+                    season_type_nullable=season_type,
+                    date_from_nullable=date_from,
+                )
         return curr_df if curr_df is not None else pd.DataFrame()
 
     def get_player_name_to_id(self) -> dict[str, int]:
@@ -594,13 +613,27 @@ class StatsLoaderPlayers(StatsLoader):
 
         team_df = self._get_team_boxscores_df()
         if team_df is not None and not df.empty and 'GAME_ID' in df.columns:
+            reconcile_df = df
+            if (
+                not is_incremental
+                and (not hasattr(self, 'updates_df') or self.updates_df is None or self.updates_df.empty)
+                and {'DATE', 'MIN'}.issubset(df.columns)
+            ):
+                # Saved data may retain unplayed upcoming-game placeholder rows (all MIN == 0)
+                # from a prior add_upcoming_games=True run after team_boxscores has already updated.
+                dates = pd.to_datetime(df['DATE']).dt.date
+                played_dates = dates[df['MIN'] > 0]
+                if not played_dates.empty:
+                    latest_played = played_dates.max()
+                    game_min = df.groupby('GAME_ID')['MIN'].transform('sum')
+                    reconcile_df = df.loc[~((dates >= latest_played) & (game_min == 0))]
             if is_incremental:
-                gids = df['GAME_ID'].dropna().unique()
+                gids = reconcile_df['GAME_ID'].dropna().unique()
             elif hasattr(self, 'updates_df') and self.updates_df is not None and not self.updates_df.empty:
                 gids = self.updates_df['GAME_ID'].dropna().unique()
             else:
                 gids = None
-            assert_reconciled_player_team_stats(df, team_df, game_ids=gids)
+            assert_reconciled_player_team_stats(reconcile_df, team_df, game_ids=gids)
 
     def _postprocessing(self):
         """process the data in updates_df"""
@@ -675,47 +708,45 @@ class StatsLoaderTeams(StatsLoader):
         boxscore_type_name = boxscore_type.name
         if boxscore_type_name == 'FourFactors':
             boxscore_type_name = 'Four Factors'
+        date_from = self._get_scrape_date_from()
 
         try:
             res = load_nbacom_data(
                 url=URLS().boxscores_nbacom_team(
                     measure_type=boxscore_type_name,
                     season=self.season_str,
-                    season_type=season_type
+                    season_type=season_type,
+                    date_from=date_from,
                 ),
                 player_or_team=False
             )
             if res is None or res.empty:
                 raise requests.exceptions.RequestException('Empty data from boxscores_nbacom_team')
             return res
-        except (requests.exceptions.RequestException, KeyError):
+        except (requests.exceptions.RequestException, KeyError, UnableToLoadWebsiteException):
             try:
                 res = load_nbacom_data(
-                    url=URLS().BOXSCORES_NBACOM.format(
+                    url=URLS().boxscores_nbacom(
                         player_or_team='team',
                         measure_type=boxscore_type_name,
                         season=self.season_str,
-                        season_type=season_type
+                        season_type=season_type,
+                        date_from=date_from,
                     ),
                     player_or_team=False
                 )
                 if res is None or res.empty:
                     raise requests.exceptions.RequestException('Empty data from BOXSCORES_NBACOM')
                 return res
-            except (requests.exceptions.RequestException, KeyError):
-                try:
-                    team_game_logs = teamgamelogs.TeamGameLogs(
-                        season_nullable=self.season_str,
-                        measure_type_player_game_logs_nullable=boxscore_type_name,
-                        season_type_nullable=season_type,
-                        headers=get_header(),
-                        timeout=60
-                    )
-                    dfs = team_game_logs.get_data_frames()
-                    return dfs[0] if dfs else pd.DataFrame()
-                except Exception as e:
-                    logging.warning(f"TeamGameLogs fallback failed: {e}")
-                    return pd.DataFrame()
+            except (requests.exceptions.RequestException, KeyError, UnableToLoadWebsiteException):
+                return self._fetch_nba_api_gamelogs(
+                    teamgamelogs.TeamGameLogs,
+                    player_or_team=False,
+                    season_nullable=self.season_str,
+                    measure_type_player_game_logs_nullable=boxscore_type_name,
+                    season_type_nullable=season_type,
+                    date_from_nullable=date_from,
+                )
 
 
 if __name__ == '__main__':
